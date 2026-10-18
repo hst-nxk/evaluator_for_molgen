@@ -1,0 +1,125 @@
+{
+  "paths": {
+    "raw_chembl_dir": "raw/chembl37",
+    "raw_bindingdb_dir": "raw/bindingdb202610",
+    "chembl_db": "work/chembl_37/chembl_37_sqlite/chembl_37.db",
+    "observations_dir": "data/observations",
+    "runs_dir": "runs/observations"
+  },
+  "releases": {
+    "chembl": "37",
+    "bindingdb": "202610"
+  },
+  "endpoints": [
+    "Ki",
+    "Kd",
+    "IC50",
+    "EC50"
+  ],
+  "unit_to_molar": {
+    "M": 1.0,
+    "mM": 0.001,
+    "uM": 1e-06,
+    "µM": 1e-06,
+    "μM": 1e-06,
+    "nM": 1e-09,
+    "pM": 1e-12,
+    "fM": 1e-15
+  },
+  "qualifiers": {
+    "exact": [
+      "="
+    ],
+    "censored": [
+      "<",
+      ">",
+      "<=",
+      ">=",
+      "<<",
+      ">>"
+    ]
+  },
+  "bindingdb": {
+    "all_zip": "BindingDB_All_202610_tsv.zip",
+    "rsid_eaids_zip": "BindingDB_rsid_eaids_202610_tsv.zip",
+    "assays_zip": "BindingDB_Assays_202610_tsv.zip",
+    "sdf_zip_not_read": "BindingDB_All_2D_202610_sdf.zip",
+    "encoding": "utf-8",
+    "endpoint_columns": {
+      "Ki": {
+        "column": "Ki (nM)",
+        "unit": "nM"
+      },
+      "Kd": {
+        "column": "Kd (nM)",
+        "unit": "nM"
+      },
+      "IC50": {
+        "column": "IC50 (nM)",
+        "unit": "nM"
+      },
+      "EC50": {
+        "column": "EC50 (nM)",
+        "unit": "nM"
+      }
+    },
+    "all_columns": {
+      "reactant_set_id": "BindingDB Reactant_set_id",
+      "ligand_smiles": "Ligand SMILES",
+      "ligand_inchikey": "Ligand InChI Key",
+      "monomer_id": "BindingDB MonomerID",
+      "target_name": "Target Name",
+      "target_organism": "Target Source Organism According to Curator or DataSource",
+      "ph": "pH",
+      "temperature_c": "Temp (C)",
+      "curation_source": "Curation/DataSource",
+      "article_doi": "Article DOI",
+      "entry_doi": "BindingDB Entry DOI",
+      "pmid": "PMID",
+      "pubchem_aid": "PubChem AID",
+      "patent_number": "Patent Number",
+      "chain_count": "Number of Protein Chains in Target (>1 implies a multichain complex)",
+      "chain_1_sequence": "BindingDB Target Chain Sequence 1",
+      "chain_1_pdb_ids": "PDB ID(s) of Target Chain 1",
+      "chain_1_swissprot_id": "UniProt (SwissProt) Primary ID of Target Chain 1",
+      "chain_1_trembl_id": "UniProt (TrEMBL) Primary ID of Target Chain 1"
+    },
+    "rsid_eaids_columns": {
+      "reactant_set_id": "REACTANT_SET_ID",
+      "entry_assay_id": "ENTRYID_ASSAYID"
+    },
+    "assays_columns": {
+      "entry_id": "ENTRYID",
+      "assay_id": "ASSAYID",
+      "assay_name": "ASSAY_NAME",
+      "description": "DESCRIPTION"
+    },
+    "key_check_rows": 20000,
+    "implicit_qualifier": "=",
+    "entry_assay_separator": "_",
+    "entry_assay_separator_TODO": "Separator inside ENTRYID_ASSAYID is NOT confirmed (inspect reads header lines only). The reader fails loudly on any value that does not split into exactly two integer parts.",
+    "csv_field_size_limit": 2147483647
+  },
+  "chembl": {
+    "sdf_not_read": "chembl_37.sdf.gz",
+    "fetch_size": 20000,
+    "id_batch_size": 10000,
+    "id_batch_size_note": "Must stay below SQLite's bound-parameter limit (32766 for SQLite >= 3.32)."
+  },
+  "run": {
+    "chunk_rows": 100000,
+    "progress_every_rows": 500000,
+    "smoke_rows_per_source": 5000,
+    "verify_sample_rows": 5000,
+    "verify_seed": 20261018
+  },
+  "regression": {
+    "accession_construct_check": "P03367",
+    "bindingdb_monomer_enhanced_stereo": "13590",
+    "enhanced_stereo_marker": "|r|"
+  },
+  "output": {
+    "chembl_file": "chembl37_observations.parquet",
+    "bindingdb_file": "bindingdb202610_observations.parquet"
+  }
+}
