@@ -17,6 +17,7 @@ Vị trí trong luồng raw -> observations:
 
 from __future__ import annotations
 
+# Chỉ dùng thư viện chuẩn: SQLite, array.
 import json
 import logging
 import sqlite3
@@ -27,6 +28,7 @@ from typing import Any, NamedTuple
 
 LOGGER = logging.getLogger(__name__)
 
+# Tên nguồn, dùng trong observation_id.
 SOURCE_DATABASE = "chembl"
 # Giá trị của cột protein_sequence_origin: chuỗi protein lấy từ bảng nào.
 SEQUENCE_ORIGIN_VARIANT = "chembl_variant_sequences"
@@ -37,6 +39,7 @@ RESOLVED = "resolved"
 UNRESOLVED = "unresolved"
 
 # Every column the extraction query reads; checked against the real schema before use.
+# Các cột câu SQL cần; thiếu cột nào thì dừng trước khi đọc dữ liệu.
 REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
     "activities": ("activity_id", "assay_id", "doc_id", "record_id", "molregno",
                    "standard_relation", "standard_value", "standard_units", "standard_flag",
@@ -60,6 +63,7 @@ REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
 }
 
 # Điều kiện chọn activity theo endpoint (standard_type), dùng tham số "?" cho từng endpoint.
+# Vd. 'act.standard_type IN (?, ?, ?, ?)'.
 ENDPOINT_FILTER = "act.standard_type IN ({placeholders})"
 
 # Câu truy vấn chính: mỗi dòng activities -> một dòng kết quả.
@@ -72,6 +76,8 @@ ENDPOINT_FILTER = "act.standard_type IN ({placeholders})"
 # - Lấy bộ giá trị đã chuẩn hóa của ChEMBL (standard_*); bộ giá trị gốc (value, units,
 #   relation) được giữ trong activity_context.
 # - "{id_placeholders}" được thay bằng một lô activity_id (xem iter_records).
+# Không nhân đôi dòng: mọi bảng bên phải join theo khóa chính; tc gom mỗi target còn một
+# dòng.
 EXTRACTION_QUERY = """
 SELECT
     act.activity_id, act.record_id, act.standard_type, act.standard_relation,
@@ -143,6 +149,7 @@ def open_chembl_readonly(db_path: Path) -> sqlite3.Connection:
     vào cơ sở dữ liệu dù có lỗi lập trình.
     """
     # Pipeline không bao giờ tự giải nén file .tar.gz trong raw/; thiếu file thì dừng.
+    # Không kiểm tra thì SQLite sẽ tự tạo một database rỗng.
     if not db_path.is_file():
         raise FileNotFoundError(
             f"ChEMBL SQLite not found at {db_path}. This pipeline never extracts archives; "
@@ -220,6 +227,7 @@ def text_or_none(value: object) -> str | None:
     Vì sao cần: mọi cột *_source trong output là kiểu chuỗi để giữ nguyên giá trị nguồn;
     số được chuyển thành chuỗi chứ không làm tròn hay định dạng lại.
     """
+    # NULL hoặc chuỗi trắng -> None; số -> str(), không làm tròn.
     if value is None:
         return None
     text = value if isinstance(value, str) else str(value)
@@ -251,7 +259,9 @@ def resolve_protein(
       một component: với phức hợp/họ protein không biết phân tử gắn vào chuỗi nào.
     """
     # --- Nhánh 1: assay khai báo variant -> chỉ dùng chuỗi variant.
+    # Rẽ nhánh theo việc assay CÓ KHAI BÁO variant, không theo việc có chuỗi.
     if variant_id is not None:
+        # Không có chuỗi -> dừng ở đây, không lấy wild type.
         if not variant_sequence:
             return ProteinResolution(None, None, None, UNRESOLVED,
                                      "variant_declared_but_sequence_missing")
@@ -259,6 +269,7 @@ def resolve_protein(
                                  RESOLVED, None)
     # --- Nhánh 2: không có variant -> dùng component của target, nếu xác định được.
     # Target không có component nào (cell line, organism, ...): không có protein.
+    # NULL (target không có component) hoặc 0.
     if not component_count:
         return ProteinResolution(None, None, None, UNRESOLVED, "target_has_no_protein_component")
     # Target nhiều component: không chọn bừa một chuỗi.
@@ -297,18 +308,22 @@ def build_record(row: sqlite3.Row, release: str) -> dict[str, Any]:
         "data_validity_comment", "potential_duplicate", "pchembl_value")}
     # --- Bản ghi: tên cột thống nhất với BindingDB.
     return {
+        # Nguồn và ID.
         "source_database": SOURCE_DATABASE,
         "source_release": release,
         "native_measurement_id": str(row["activity_id"]),
         "source_curation": row["src_short_name"],
+        # Tài liệu.
         "document_id": row["doc_chembl_id"],
         "document_pmid_source": text_or_none(row["pubmed_id"]),
         "document_doi": row["doi"],
         "document_patent_number": row["patent_id"],
+        # Phân tử.
         "molecule_source_id": row["molecule_chembl_id"],
         "molecule_source_smiles": row["canonical_smiles"],
         "molecule_source_inchikey": row["standard_inchi_key"],
         "molecule_source_chirality": text_or_none(row["chirality"]),
+        # Protein.
         "protein_sequence": protein.sequence,
         "protein_sequence_origin": protein.origin,
         "protein_accession": protein.accession,
@@ -324,6 +339,7 @@ def build_record(row: sqlite3.Row, release: str) -> dict[str, Any]:
         "protein_pdb_ids": None,
         "protein_status": protein.status,
         "protein_reason": protein.reason,
+        # Assay.
         "assay_native_id": row["assay_chembl_id"],
         "assay_entry_id": None,
         "assay_name": None,
@@ -332,6 +348,7 @@ def build_record(row: sqlite3.Row, release: str) -> dict[str, Any]:
         "assay_context": json.dumps(assay_context, ensure_ascii=False),
         "assay_status": RESOLVED if assay_found else UNRESOLVED,
         "assay_reason": None if assay_found else "assay_row_missing",
+        # Giá trị đo (bộ standard_* của ChEMBL).
         "endpoint": row["standard_type"],
         "activity_value_source": text_or_none(row["standard_value"]),
         "activity_unit_source": text_or_none(row["standard_units"]),
@@ -353,6 +370,7 @@ def selected_activity_ids(connection: sqlite3.Connection, endpoints: Sequence[st
     Vì sao cần: đây là bước 1 của cách đọc theo lô. Chỉ sắp xếp danh sách id (số nguyên,
     vài chục MB) thay vì sắp xếp toàn bộ kết quả join (nhiều GB).
     """
+    # Chỉ sắp xếp id (số nguyên), rất nhẹ.
     query = SELECTED_IDS_QUERY.format(endpoint_filter=endpoint_filter(endpoints))
     parameters: list[Any] = list(endpoints)
     # Smoke: chỉ lấy `limit` id nhỏ nhất.
@@ -360,6 +378,7 @@ def selected_activity_ids(connection: sqlite3.Connection, endpoints: Sequence[st
         query += " LIMIT ?"
         parameters.append(limit)
     # Đọc từng phần (fetchmany) vào array gọn bộ nhớ thay vì list các tuple Python.
+    # 8 byte mỗi id; đọc 20.000 dòng mỗi lần.
     ids = array(SIGNED_64_BIT)
     cursor = connection.execute(query, parameters)
     while rows := cursor.fetchmany(fetch_size):
@@ -394,8 +413,10 @@ def iter_records(config: Mapping[str, Any], root: Path, limit: int | None) -> It
         # --- Bước 2: chạy câu join cho từng lô id. Kích thước lô (10.000) phải nhỏ hơn
         # giới hạn số tham số "?" của một câu SQLite (32.766).
         batch_size = settings["id_batch_size"]
+        # Lô 10.000 id (5,34 triệu id -> 534 lô).
         for start in range(0, len(ids), batch_size):
             batch = ids[start:start + batch_size].tolist()
+            # Mỗi id một dấu '?', truyền vào như tham số.
             query = EXTRACTION_QUERY.format(id_placeholders=", ".join("?" for _ in batch))
             for row in connection.execute(query, batch):
                 yield build_record(row, release)

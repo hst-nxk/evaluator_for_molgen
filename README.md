@@ -24,7 +24,8 @@ hóa, schema đầy đủ, ví dụ lần theo từng dòng) nằm trong
 
 ```
 .
-├── run_observations.py          # điểm vào: --mode inspect | smoke | full | verify
+├── run_observations.py          # điểm vào Stage 1: --mode inspect | smoke | full | verify
+├── run_dataset.py               # điểm vào Stage 2b: --mode smoke | full | split | export | verify
 ├── config.json                  # đường dẫn, tên cột, bảng đơn vị, kích thước lô
 ├── requirements.txt
 ├── src/molopt/observations/
@@ -32,14 +33,27 @@ hóa, schema đầy đủ, ví dụ lần theo từng dòng) nằm trong
 │   ├── bindingdb.py             # đọc BindingDB (TSV đọc thẳng từ ZIP)
 │   ├── normalize.py             # chuẩn hóa dùng chung: đơn vị, pActivity, RDKit, ID
 │   └── pipeline.py              # ghép cột, ghi Parquet, verify
+├── src/molopt/dataset/          # Stage 2b: cặp MMP và Δp
+│   ├── aggregate.py             # gộp replicate trong assay; gộp Δp giữa assay + QC
+│   ├── mmp.py                   # khóa định danh, cắt phân tử (RDKit), tạo cặp
+│   ├── delta.py                 # pair_id, chiều của cặp, Δp trong assay
+│   ├── split.py                 # split protein theo nhóm chuỗi, 80/10/10 theo số cặp
+│   └── pipeline.py              # I/O, song song hóa, báo cáo, năm chế độ chạy
 ├── tests/                       # unit test (pytest), không cần dữ liệu thật
-├── scripts/                     # script chẩn đoán chỉ đọc, chạy tay khi cần
+├── scripts/
+│   ├── check_*.py, summarize_smoke.py   # script chẩn đoán chỉ đọc của Stage 1
+│   ├── dedup_cross_source.py    # Stage 2a: đánh dấu observation trùng giữa hai nguồn
+│   ├── audit_noise.py           # Stage 2a: audit độ nhiễu (chỉ đọc, chỉ báo cáo)
+│   └── diagnose_noise.py        # Stage 2a: chẩn đoán thêm cho audit (chỉ đọc, chỉ báo cáo)
 ├── docs/OBSERVATIONS_PIPELINE.md
+├── docs/STAGE2A_DEDUP_AUDIT.md
+├── docs/STAGE2B_DATASET.md
 │
 ├── raw/      (không có trong repo)  dữ liệu gốc tải về
 ├── work/     (không có trong repo)  ChEMBL SQLite đã giải nén
-├── data/     (không có trong repo)  output Parquet của mode full
-└── runs/     (không có trong repo)  log, output smoke, báo cáo verify
+├── data/     (không có trong repo)  output Parquet: observations/ (Stage 1), dedup/ (Stage 2a),
+│                                   dataset/ (Stage 2b)
+└── runs/     (không có trong repo)  log và báo cáo: observations/, stage2a/, dataset/
 ```
 
 Bốn thư mục `raw/`, `work/`, `data/` và `runs/` được loại khỏi repo bằng `.gitignore`,
@@ -51,8 +65,10 @@ vì chúng là dữ liệu chứ không phải code, và quá lớn để đưa 
 
 Ai cần chạy lại có thể tự tạo các thư mục này theo hướng dẫn bên dưới.
 
-Các script trong `scripts/` đang ghi cứng đường dẫn tuyệt đối `E:\eval_training\...`.
-Muốn chạy chúng trên máy khác thì phải sửa đường dẫn ở đầu mỗi file.
+Các script chẩn đoán của Stage 1 trong `scripts/` đang ghi cứng đường dẫn tuyệt đối
+`E:\eval_training\...`. Muốn chạy chúng trên máy khác thì phải sửa đường dẫn ở đầu mỗi
+file. Hai script của Stage 2a lấy đường dẫn từ `config.json`, tính từ thư mục gốc của
+repo.
 
 ## Yêu cầu môi trường
 
@@ -61,6 +77,7 @@ trong `requirements.txt`:
 - `rdkit==2026.9.1`
 - `pyarrow==25.0.1`
 - `pytest==8.4.2`
+- `numpy==2.2.6` (hai script Stage 2a dùng trực tiếp; cài kèm rdkit nhưng vẫn ghi rõ phiên bản)
 
 Cài bằng lệnh:
 
@@ -159,3 +176,60 @@ Hai nguồn được ghi ra hai file riêng, cùng schema, không gộp. Lý do:
 nhiều dữ liệu nhập lại từ ChEMBL, nên việc khử trùng lặp để dành cho bước sau. Số liệu
 chi tiết theo trạng thái và các giới hạn đã biết có trong mục 8 và mục 9 của
 [`docs/OBSERVATIONS_PIPELINE.md`](docs/OBSERVATIONS_PIPELINE.md).
+
+## Stage 2a: Dedup giữa hai nguồn và audit độ nhiễu
+
+Stage 2a đọc hai file observations ở trên, nhưng không sửa chúng. Stage này làm hai
+việc:
+- đánh dấu những observation của ChEMBL và BindingDB thực chất là cùng một phép đo
+  (đánh dấu, không xóa);
+- đo độ nhiễu của dữ liệu, để làm căn cứ chốt ngưỡng QC ở bước sau.
+
+Stage 2a chưa ghép cặp MMP, chưa tính Δp và chưa train.
+
+Chạy từ thư mục gốc của repo, **sau khi** Stage 1 đã có hai file trong
+`data/observations/`:
+
+```powershell
+# 1. Dedup -> data/dedup/ (file ánh xạ + hai bản sao có cột dedup_*) và runs/stage2a/dedup_*
+python scripts\dedup_cross_source.py            # thêm --force để ghi đè output cũ
+
+# 2. Audit độ nhiễu, đọc hai bản sao của bước 1 -> runs/stage2a/noise_audit_*
+python scripts\audit_noise.py
+
+# 3. Chẩn đoán thêm (bản sao trong cùng nguồn, publication lớn, cờ |r|) -> runs/stage2a/noise_diagnose_*
+python scripts\diagnose_noise.py
+```
+
+Hai script đầu in báo cáo ra màn hình, có phần tóm tắt ở cuối; script thứ ba chỉ in
+đường dẫn báo cáo. Báo cáo đầy đủ (`.txt`) và
+số liệu (`.json`) nằm trong `runs/stage2a/`. Thời gian chạy (21/10/2026): dedup 5,8 phút, audit 0,7 phút,
+chẩn đoán 0,6 phút. Cách hoạt
+động, cách đọc kết quả và các quyết định thiết kế được mô tả trong
+[`docs/STAGE2A_DEDUP_AUDIT.md`](docs/STAGE2A_DEDUP_AUDIT.md).
+
+## Stage 2b: Dataset cặp MMP có Δp
+
+Stage 2b đọc hai bản sao dedup của Stage 2a (chỉ đọc) và dựng dataset cặp matched
+molecular pair: gộp replicate trong assay → ghép cặp MMP một lần cắt → Δp trong từng assay
+→ gộp Δp giữa các assay kèm QC → dựng split protein → xuất hai file training và một file
+evidence.
+
+Trạng thái 22/10/2026: **đã chạy xong cả năm chế độ, verify 7/7 PASS.** Dataset cuối:
+2.972.507 dòng đã lọc → 13.302.366 Δp trong assay → **10.546.330 bản ghi cặp MMP có Δp**
+(17,6 % có ≥ 2 assay nên đo được phân tán), split protein 80/10/10 theo số cặp trên 2.782
+nhóm MMseqs2 ở ngưỡng 50 % identity, và ba file xuất: evidence 10.546.330 dòng, evaluator
+10.522.759, generator 6.414.841 — mỗi file kèm ba cờ mô tả (`unseen_pair`,
+`plausible_range`, `short_protein`), không lọc dòng nào. Pipeline đã chứng minh tính xác
+định: hai lần `smoke` độc lập cho 322/322 file dữ liệu trùng SHA-256. Số đo chi tiết ở
+`docs/STAGE2B_DATASET.md` mục 11.
+
+```powershell
+python run_dataset.py --mode smoke     # ~1/200 số assay -> runs/dataset/smoke_<thời điểm>/
+python run_dataset.py --mode full      # toàn bộ -> data/dataset/full/   (thêm --force để ghi đè)
+python run_dataset.py --mode split     # ghi FASTA đầu vào; cần --clusters để dựng split
+python run_dataset.py --mode export    # training + evidence -> data/dataset/
+python run_dataset.py --mode verify    # kiểm tra -> runs/dataset/verify_<thời điểm>.json
+```
+
+Tham số, quy tắc QC, giả định và những điểm chưa làm: [`docs/STAGE2B_DATASET.md`](docs/STAGE2B_DATASET.md).

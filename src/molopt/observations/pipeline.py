@@ -11,6 +11,7 @@ Vị trí trong luồng raw -> observations: đây là phần điều phối.
 
 from __future__ import annotations
 
+# Thư viện chuẩn, cộng pyarrow để dựng bảng và đọc/ghi Parquet.
 import json
 import logging
 import math
@@ -26,6 +27,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+# Hai reader và phần chuẩn hóa dùng chung.
 from molopt.observations import bindingdb, chembl, normalize
 
 LOGGER = logging.getLogger(__name__)
@@ -37,29 +39,37 @@ RecordSource = Callable[[Mapping[str, Any], Path, "int | None"], Iterator[dict]]
 STATUS_COLUMNS = ("protein_status", "assay_status", "structure_status", "activity_status")
 # Số SMILES khác nhau được nhớ kết quả RDKit (cùng phân tử xuất hiện ở nhiều phép đo).
 STRUCTURE_CACHE_SIZE = 200_000
+# Đuôi file tạm khi đang ghi; dạng mốc thời gian, vd. 20261018_205349.
 PARTIAL_SUFFIX = ".partial"
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+# Sai số khi so số thực; số ví dụ sai lệch tối đa; dạng PMID hợp lệ.
 FLOAT_RELATIVE_TOLERANCE = 1e-12
 MAX_REPORTED_MISMATCHES = 50
 PMID_PATTERN = re.compile(r"^\d+$")
 
 # Sources whose activity cell carries its own qualifier prefix (e.g. '>10000').
+# Chỉ BindingDB có dấu so sánh dính trong ô giá trị, vd. '>10000'.
 EMBEDDED_QUALIFIER_SOURCES = frozenset({bindingdb.SOURCE_DATABASE})
 
 # Columns supplied by the readers (raw values, resolved per measurement).
+# 40 cột mà mọi reader phải trả về: đúng tên, không thừa, không thiếu.
 SOURCE_FIELDS: list[tuple[str, pa.DataType]] = [
+    # Nguồn và ID phép đo.
     ("source_database", pa.string()),
     ("source_release", pa.string()),
     ("native_measurement_id", pa.string()),
     ("source_curation", pa.string()),
+    # Tài liệu.
     ("document_id", pa.string()),
     ("document_pmid_source", pa.string()),
     ("document_doi", pa.string()),
     ("document_patent_number", pa.string()),
+    # Phân tử, theo đúng nguồn ghi.
     ("molecule_source_id", pa.string()),
     ("molecule_source_smiles", pa.string()),
     ("molecule_source_inchikey", pa.string()),
     ("molecule_source_chirality", pa.string()),
+    # Protein của đúng phép đo này.
     ("protein_sequence", pa.string()),
     ("protein_sequence_origin", pa.string()),
     ("protein_accession", pa.string()),
@@ -75,6 +85,7 @@ SOURCE_FIELDS: list[tuple[str, pa.DataType]] = [
     ("protein_pdb_ids", pa.string()),
     ("protein_status", pa.string()),
     ("protein_reason", pa.string()),
+    # Assay.
     ("assay_native_id", pa.string()),
     ("assay_entry_id", pa.string()),
     ("assay_name", pa.string()),
@@ -83,6 +94,7 @@ SOURCE_FIELDS: list[tuple[str, pa.DataType]] = [
     ("assay_context", pa.string()),
     ("assay_status", pa.string()),
     ("assay_reason", pa.string()),
+    # Giá trị đo nguyên văn.
     ("endpoint", pa.string()),
     ("activity_value_source", pa.string()),
     ("activity_unit_source", pa.string()),
@@ -91,10 +103,13 @@ SOURCE_FIELDS: list[tuple[str, pa.DataType]] = [
 ]
 
 # Columns computed here from the source columns (never written back over them).
+# 17 cột pipeline tự tính bằng normalize.py.
 DERIVED_FIELDS: list[tuple[str, pa.DataType]] = [
+    # ID, PMID đã chuẩn hóa, hash chuỗi protein.
     ("observation_id", pa.string()),
     ("document_pmid", pa.string()),
     ("protein_sequence_hash", pa.string()),
+    # Cấu trúc phân tử (RDKit).
     ("molecule_canonical_smiles", pa.string()),
     ("molecule_inchikey", pa.string()),
     ("molecule_cx_extension", pa.string()),
@@ -103,6 +118,7 @@ DERIVED_FIELDS: list[tuple[str, pa.DataType]] = [
     ("molecule_unspecified_stereo_centers", pa.int32()),
     ("structure_status", pa.string()),
     ("structure_reason", pa.string()),
+    # Giá trị đo đã quy đổi.
     ("activity_qualifier", pa.string()),
     ("activity_concentration_molar", pa.float64()),
     ("activity_p_activity", pa.float64()),
@@ -114,9 +130,11 @@ DERIVED_FIELDS: list[tuple[str, pa.DataType]] = [
 # Schema chung của cả hai file output: observation_id đứng đầu, rồi các cột nguồn, rồi
 # các cột suy ra còn lại. Hai nguồn dùng đúng schema này (cột nguồn không có -> null).
 OBSERVATION_SCHEMA = pa.schema(DERIVED_FIELDS[:1] + SOURCE_FIELDS + DERIVED_FIELDS[1:])
+# Tên 40 cột nguồn, dùng để kiểm tra bản ghi. 40 + 17 = 57 cột.
 SOURCE_COLUMN_NAMES = frozenset(name for name, _ in SOURCE_FIELDS)
 
 # RDKit là bước chậm nhất; cache theo chuỗi SMILES để mỗi phân tử chỉ tính một lần.
+# Cùng một chuỗi SMILES chỉ chạy RDKit một lần.
 describe_structure_cached = lru_cache(maxsize=STRUCTURE_CACHE_SIZE)(normalize.describe_structure)
 
 
@@ -137,16 +155,20 @@ def derive_activity(
     Vì sao cần: hai nguồn ghi qualifier theo hai cách khác nhau. Hàm này đưa chúng về
     cùng một dạng (qualifier riêng + chuỗi số) rồi dùng chung một hàm quy đổi.
     """
+    # exact = ['=']; censored = ['<', '>', '<=', '>=', '<<', '>>'].
     exact = config["qualifiers"]["exact"]
     censored = config["qualifiers"]["censored"]
     # ChEMBL: qualifier có cột riêng (standard_relation), dùng nguyên.
+    # Mặc định (ChEMBL): dùng nguyên qualifier và giá trị.
     qualifier, number_text = qualifier_source, value_text
     # BindingDB: qualifier dính trong ô giá trị (">10000") -> tách ra; không có tiền tố
     # thì coi là "=" (implicit_qualifier trong config).
+    # BindingDB: ' 2' -> ('=', '2'); '<10' -> ('<', '10').
     if source_database in EMBEDDED_QUALIFIER_SOURCES and value_text is not None:
         qualifier, number_text = normalize.split_embedded_qualifier(
             value_text, [*exact, *censored], config["bindingdb"]["implicit_qualifier"])
     # Quy đổi đơn vị qua bảng tường minh, tính pActivity, quyết định status.
+    # Từ đây hai nguồn dùng chung một quy tắc.
     return normalize.parse_activity(number_text, unit, qualifier, config["unit_to_molar"],
                                     exact, censored)
 
@@ -161,6 +183,7 @@ def build_observation(record: Mapping[str, Any], config: Mapping[str, Any]) -> d
     """
     # --- Bản ghi phải có đúng tập cột nguồn: thiếu hoặc thừa cột là lỗi lập trình ở
     # reader, phải dừng ngay thay vì ghi ra dòng lệch schema.
+    # Thiếu hoặc thừa cột -> dừng (pyarrow sẽ không tự báo lỗi).
     keys = set(record)
     if keys != SOURCE_COLUMN_NAMES:
         raise ValueError(
@@ -168,20 +191,26 @@ def build_observation(record: Mapping[str, Any], config: Mapping[str, Any]) -> d
             f"has unexpected keys {sorted(keys - SOURCE_COLUMN_NAMES)} / "
             f"missing keys {sorted(SOURCE_COLUMN_NAMES - keys)}")
     # --- Giá trị hoạt tính: qualifier, mol/L, pActivity, activity_status.
+    # Qualifier, mol/L, pActivity, status.
     activity = derive_activity(record["source_database"], record["activity_value_source"],
                                record["activity_unit_source"],
                                record["activity_qualifier_source"], config)
     # --- Cấu trúc phân tử (RDKit, có cache): canonical SMILES, InChIKey, structure_status.
+    # Canonical SMILES, InChIKey, lập thể, status.
     structure = describe_structure_cached(record["molecule_source_smiles"])
     # --- Ghép cột nguồn + cột suy ra.
+    # Cột nguồn giữ nguyên; cột suy ra thêm bên cạnh.
     return {
         **record,
         # observation_id chỉ từ nguồn + ID phép đo + endpoint; không dùng chuỗi protein
         # (lý do: xem normalize.make_observation_id).
         "observation_id": normalize.make_observation_id(
             record["source_database"], record["native_measurement_id"], record["endpoint"]),
+        # '12345.0' -> '12345'.
         "document_pmid": normalize.normalize_integer_id(record["document_pmid_source"]),
+        # SHA-256 của chuỗi protein.
         "protein_sequence_hash": normalize.sequence_hash(record["protein_sequence"]),
+        # Lấy từ kết quả RDKit.
         "molecule_canonical_smiles": structure.canonical_smiles,
         "molecule_inchikey": structure.inchikey,
         "molecule_cx_extension": structure.cx_extension,
@@ -190,6 +219,7 @@ def build_observation(record: Mapping[str, Any], config: Mapping[str, Any]) -> d
         "molecule_unspecified_stereo_centers": structure.unspecified_stereo_centers,
         "structure_status": structure.status,
         "structure_reason": structure.reason,
+        # Lấy từ kết quả derive_activity.
         "activity_qualifier": activity.qualifier,
         "activity_concentration_molar": activity.concentration_molar,
         "activity_p_activity": activity.p_activity,
@@ -217,22 +247,28 @@ def write_observations(
     - Ghi vào file ".partial" rồi mới đổi tên: một file tên chính thức luôn là file hoàn
       chỉnh. Nếu chạy hỏng giữa chừng, file .partial bị xóa và không để lại output dở.
     """
+    # 100.000 dòng mỗi khối; ghi log mỗi 500.000 dòng.
     chunk_rows = config["run"]["chunk_rows"]
     progress_every = config["run"]["progress_every_rows"]
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Ghi vào file .partial trước, xong hẳn mới đổi tên.
     partial_path = output_path.with_name(output_path.name + PARTIAL_SUFFIX)
     written = 0
     buffer: list[dict[str, Any]] = []
+    # Schema cố định 57 cột cho mọi khối.
     writer = pq.ParquetWriter(partial_path, OBSERVATION_SCHEMA)
     try:
         # --- Dựng từng dòng observation, gom thành khối, ghi khối khi đủ kích thước.
         for record in records:
+            # Bản ghi -> một dòng observation đủ 57 cột.
             buffer.append(build_observation(record, config))
+            # Đủ một khối: ghi xuống file rồi làm rỗng buffer.
             if len(buffer) >= chunk_rows:
                 writer.write_table(pa.Table.from_pylist(buffer, schema=OBSERVATION_SCHEMA))
                 written += len(buffer)
                 buffer.clear()
                 # Ghi log tiến độ mỗi khi vượt qua một mốc progress_every (500.000 dòng).
+                # Chỉ đúng tại 500.000, 1.000.000, ...
                 if written % progress_every < chunk_rows:
                     LOGGER.info("[%s] %s rows written", label, f"{written:,}")
         # --- Ghi khối cuối (chưa đủ chunk_rows).
@@ -241,11 +277,14 @@ def write_observations(
             written += len(buffer)
     except Exception:
         # --- Lỗi bất kỳ: đóng writer, xóa file dở, rồi ném lại lỗi gốc (không nuốt lỗi).
+        # Ctrl+C không vào nhánh này; file .partial có thể còn lại nhưng vô hại.
         writer.close()
         partial_path.unlink(missing_ok=True)
         raise
     # --- Thành công: đóng file rồi đổi tên .partial -> tên chính thức.
+    # close() ghi footer; phải close xong thì file mới đọc được.
     writer.close()
+    # Đổi tên .partial -> tên chính thức.
     partial_path.replace(output_path)
     LOGGER.info("[%s] done: %s rows -> %s", label, f"{written:,}", output_path)
     return written
@@ -259,6 +298,7 @@ def source_outputs(config: Mapping[str, Any]) -> list[tuple[str, RecordSource, s
     nhập lại từ ChEMBL; khử trùng lặp giữa hai nguồn để bước sau, khi đã đủ căn cứ xác
     định hai bản ghi có phải cùng một thí nghiệm hay không.
     """
+    # ChEMBL chạy trước, BindingDB sau.
     return [
         (chembl.SOURCE_DATABASE, chembl.iter_records, config["output"]["chembl_file"]),
         (bindingdb.SOURCE_DATABASE, bindingdb.iter_records, config["output"]["bindingdb_file"]),
@@ -280,9 +320,11 @@ def run_extract(config: Mapping[str, Any], root: Path, output_dir: Path,
     để không bao giờ trộn output của hai phiên bản code trong cùng một file.
     """
     counts = {}
+    # Mỗi nguồn: (tên, hàm đọc nguồn, tên file output).
     for label, iter_records, file_name in source_outputs(config):
         output_path = output_dir / file_name
         # --- File hoàn chỉnh đã có và không --force: bỏ qua, chỉ đọc số dòng để báo cáo.
+        # Chỉ xét file tên chính thức; sửa code thì chạy lại với --force.
         if output_path.is_file() and not force:
             counts[label] = pq.ParquetFile(output_path).metadata.num_rows
             LOGGER.info("[%s] skipped: %s already exists (%s rows); use --force to rebuild",
@@ -290,6 +332,7 @@ def run_extract(config: Mapping[str, Any], root: Path, output_dir: Path,
             continue
         # --- Chạy nguồn: đọc raw -> dựng observation -> ghi Parquet.
         LOGGER.info("[%s] stage: extract (limit=%s)", label, limit)
+        # Generator: raw được đọc dần khi write_observations lặp qua.
         counts[label] = write_observations(iter_records(config, root, limit),
                                            output_path, config, label)
     return counts
@@ -303,6 +346,7 @@ def run_smoke(config: Mapping[str, Any], root: Path) -> dict[str, int]:
     trước khi chạy full. Luôn ghi vào thư mục mới và luôn force, nên không đụng tới output
     của full.
     """
+    # Thư mục smoke mới, 5.000 bản ghi mỗi nguồn.
     stamp = datetime.now().strftime(TIMESTAMP_FORMAT)
     output_dir = root / config["paths"]["runs_dir"] / f"smoke_{stamp}"
     return run_extract(config, root, output_dir, config["run"]["smoke_rows_per_source"],
@@ -314,6 +358,7 @@ def run_full(config: Mapping[str, Any], root: Path, force: bool) -> dict[str, in
 
     Nhận: config, thư mục gốc, cờ force. Trả về: {tên nguồn: số dòng}.
     """
+    # Toàn bộ dữ liệu, ghi vào data/observations/.
     return run_extract(config, root, root / config["paths"]["observations_dir"], None, force)
 
 
@@ -325,6 +370,7 @@ def iter_output_rows(path: Path, batch_rows: int) -> Iterator[dict[str, Any]]:
 
     Nhận: đường dẫn file Parquet, số dòng mỗi lô. Trả về: iterator các dòng dạng dict.
     """
+    # Đọc theo lô để không giữ cả file trong RAM.
     for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_rows):
         yield from batch.to_pylist()
 
@@ -339,19 +385,23 @@ def scan_outputs(paths: list[Path], config: Mapping[str, Any]) -> dict[str, Any]
     Vì sao gom vào một lượt đọc: output có hơn 8 triệu dòng; đọc một lần cho mọi phép
     kiểm tra thay vì đọc lại cho từng phép.
     """
+    # Các ca hồi quy trong config: P03367, monomer 13590, '|r|'.
     regression = config["regression"]
     # --- Chọn trước vị trí mẫu ngẫu nhiên (hạt giống cố định -> lần verify nào cũng ra
     # cùng một mẫu, kết quả tái lập được).
+    # Seed cố định: lần verify nào cũng ra cùng một mẫu.
     total = sum(pq.ParquetFile(path).metadata.num_rows for path in paths)
     sample_size = min(config["run"]["verify_sample_rows"], total)
     sample_positions = set(random.Random(config["run"]["verify_seed"])
                            .sample(range(total), sample_size))
+    # ID đã gặp, để phát hiện ID trùng.
     seen_ids: set[str] = set()
     scan: dict[str, Any] = {
         "rows_by_source": Counter(), "rows_by_source_endpoint": Counter(),
         "status_reasons": Counter(), "duplicate_ids": 0, "bad_pmids": [],
         "sample": [], "accession_rows": [], "monomer_rows": [],
     }
+    # Số thứ tự dòng, tính liền qua cả hai file.
     position = 0
     for path in paths:
         LOGGER.info("[verify] scanning %s", path)
@@ -360,6 +410,7 @@ def scan_outputs(paths: list[Path], config: Mapping[str, Any]) -> dict[str, Any]
             source = row["source_database"]
             scan["rows_by_source"][source] += 1
             scan["rows_by_source_endpoint"][f"{source}|{row['endpoint']}"] += 1
+            # Đếm theo nguồn | cột status | status | lý do.
             for column in STATUS_COLUMNS:
                 reason_column = column.replace("_status", "_reason")
                 scan["status_reasons"][
@@ -373,6 +424,7 @@ def scan_outputs(paths: list[Path], config: Mapping[str, Any]) -> dict[str, Any]
             if pmid is not None and not PMID_PATTERN.match(pmid):
                 scan["bad_pmids"].append(f"{row['observation_id']}={pmid}")
             # --- Gom mẫu ngẫu nhiên và các dòng cho kiểm tra hồi quy.
+            # Giữ dòng cho mẫu ngẫu nhiên và cho các ca hồi quy.
             if position in sample_positions:
                 scan["sample"].append(row)
             if row["protein_accession"] == regression["accession_construct_check"]:
@@ -400,6 +452,7 @@ def read_bindingdb_raw(config: Mapping[str, Any], root: Path,
     settings = config["bindingdb"]
     raw_dir = root / config["paths"]["raw_bindingdb_dir"]
     all_zip = raw_dir / settings["all_zip"]
+    # Đọc lại raw bằng đường riêng, không dùng code extract.
     rows = bindingdb.iter_tsv_rows(all_zip, settings["encoding"])
     _, header = next(rows)
     roles = {**settings["all_columns"],
@@ -413,9 +466,11 @@ def read_bindingdb_raw(config: Mapping[str, Any], root: Path,
     selected_cells = 0
     raw_rows: dict[str, dict[str, str | None]] = {}
     for line_number, fields in rows:
+        # Đếm ô endpoint không rỗng; phải bằng số dòng đã ghi.
         selected_cells += sum(bindingdb.field(fields, index) is not None
                               for index in endpoint_indexes)
         reactant_set_id = (bindingdb.field(fields, columns["reactant_set_id"]) or "").strip()
+        # Giữ dòng raw của các id cần đối chiếu.
         if reactant_set_id in wanted_ids:
             raw_rows[reactant_set_id] = {role: bindingdb.field(fields, index)
                                          for role, index in columns.items()}
@@ -428,6 +483,7 @@ def read_bindingdb_raw(config: Mapping[str, Any], root: Path,
     _, link_header = next(link_rows)
     link_columns = bindingdb.column_indexes(link_header, settings["rsid_eaids_columns"],
                                             settings["rsid_eaids_zip"])
+    # Reactant_set_id -> cặp (ENTRYID, ASSAYID), chỉ cho id cần đối chiếu.
     for line_number, fields in link_rows:
         reactant_set_id = (bindingdb.field(fields, link_columns["reactant_set_id"]) or "").strip()
         if reactant_set_id in wanted_ids:
@@ -445,6 +501,7 @@ def read_bindingdb_raw(config: Mapping[str, Any], root: Path,
     _, assay_header = next(assay_rows)
     assay_columns = bindingdb.column_indexes(assay_header, settings["assays_columns"],
                                              settings["assays_zip"])
+    # Cặp -> danh sách tên assay (hai tên = không xác định).
     for _, fields in assay_rows:
         pair = ((bindingdb.field(fields, assay_columns["entry_id"]) or "").strip(),
                 (bindingdb.field(fields, assay_columns["assay_id"]) or "").strip())
@@ -466,14 +523,17 @@ def expected_bindingdb(observation: Mapping[str, Any], raw: Mapping[str, Any]) -
     if raw_row is None:
         return {"native_measurement_id": f"<absent from raw: {native_id}>"}
     # --- Protein: chỉ khi target một chain; accession SwissProt trước, rồi TrEMBL.
+    # Viết lại quy tắc protein độc lập, không gọi resolve_protein.
     single_chain = (raw_row["chain_count"] or "").strip() == str(bindingdb.SINGLE_CHAIN)
     sequence = raw_row["chain_1_sequence"] if single_chain else None
     accession = (raw_row["chain_1_swissprot_id"] or raw_row["chain_1_trembl_id"]
                  if sequence else None)
     # --- Assay: chỉ khi có đúng một cặp liên kết và đúng một tên assay.
+    # Assay chỉ xác định khi có đúng một cặp.
     pairs = raw["links"].get(native_id, [])
     entry_id, assay_id = pairs[0] if len(pairs) == 1 else (None, None)
     names = raw["assay_names"].get((entry_id, assay_id), [])
+    # Giá trị nguồn đáng lẽ phải có, đọc thẳng từ raw.
     return {
         "native_measurement_id": native_id,
         "molecule_source_id": raw_row["monomer_id"],
@@ -492,6 +552,7 @@ def expected_bindingdb(observation: Mapping[str, Any], raw: Mapping[str, Any]) -
 
 # Truy vấn riêng từng bảng ChEMBL cho verify. Cố ý KHÔNG dùng lại EXTRACTION_QUERY, để
 # lỗi trong câu join lúc extract không được "xác nhận" bởi chính câu join đó.
+# Mỗi truy vấn đọc một bảng theo khóa chính.
 CHEMBL_LOOKUPS = {
     "activity": "SELECT assay_id, doc_id, molregno, standard_type, standard_relation, "
                 "standard_value, standard_units FROM activities WHERE activity_id = ?",
@@ -527,17 +588,20 @@ def expected_chembl(observation: Mapping[str, Any], connection: Any) -> dict[str
     activity = lookup_one(connection, "activity", activity_id)
     if activity is None:
         return {"native_measurement_id": f"<absent from raw: {activity_id}>"}
+    # Tra assay của activity.
     assay_id, doc_id, molregno, standard_type, relation, value, units = activity
     assay = lookup_one(connection, "assay", assay_id) or (None, None, None)
     assay_chembl_id, tid, variant_id = assay
     # --- Protein, viết lại độc lập cùng quy tắc: có variant -> chuỗi variant (không thay
     # bằng wild type); không variant -> chuỗi component khi target có đúng một component.
     sequence = accession = None
+    # Có variant: chỉ dùng chuỗi variant.
     if variant_id is not None:
         sequence, accession = lookup_one(connection, "variant", variant_id) or (None, None)
         sequence = sequence or None
         accession = accession if sequence else None
     else:
+        # Không variant: chỉ khi target có đúng 1 component.
         components = connection.execute(CHEMBL_LOOKUPS["components"], (tid,)).fetchall()
         if len(components) == 1:
             sequence, accession = (lookup_one(connection, "component", components[0][0])
@@ -574,6 +638,7 @@ def expected_derived(observation: Mapping[str, Any], expected: Mapping[str, Any]
     Vì sao cần: kiểm tra rằng cột suy ra trong output đúng là kết quả của giá trị raw thật
     (không chỉ của giá trị đã lưu trong output).
     """
+    # Tính lại cột suy ra từ giá trị raw, bằng hàm của normalize.py.
     source = observation["source_database"]
 
     def raw_value(column: str) -> Any:
@@ -607,6 +672,7 @@ def values_match(stored: Any, expected: Any) -> bool:
     Nhận: giá trị đã lưu và giá trị kỳ vọng. Trả về: True nếu khớp.
     Số thực so với sai số tương đối 1e-12 để bỏ qua sai khác làm tròn ở bit cuối.
     """
+    # Số thực so gần đúng; kiểu khác so bằng tuyệt đối.
     if isinstance(stored, float) and isinstance(expected, float):
         return math.isclose(stored, expected, rel_tol=FLOAT_RELATIVE_TOLERANCE)
     return stored == expected
@@ -618,6 +684,7 @@ def compare_row(observation: Mapping[str, Any], expected: Mapping[str, Any]) -> 
     Nhận: dòng observation và dict giá trị kỳ vọng. Trả về: danh sách mô tả các cột lệch
     (rỗng nếu khớp hết).
     """
+    # Mỗi cột lệch -> một dòng mô tả; danh sách rỗng = khớp.
     return [f"{observation['observation_id']}.{column}: stored={observation.get(column)!r} "
             f"raw={value!r}"
             for column, value in expected.items()
@@ -641,8 +708,10 @@ def reconcile_sample(scan: Mapping[str, Any], bindingdb_raw: Mapping[str, Any],
             expected = expected_chembl(observation, connection)
         else:
             expected = expected_bindingdb(observation, bindingdb_raw)
+        # Gộp giá trị nguồn và cột suy ra kỳ vọng.
         expected = {**expected, **expected_derived(observation, expected, config)}
         mismatches += compare_row(observation, expected)
+    # Mẫu rỗng không được tính là đạt.
     return {"rows_checked": len(scan["sample"]), "mismatch_count": len(mismatches),
             "mismatch_examples": mismatches[:MAX_REPORTED_MISMATCHES],
             "passed": bool(scan["sample"]) and not mismatches}
@@ -659,6 +728,7 @@ def check_accession_constructs(scan: Mapping[str, Any], bindingdb_raw: Mapping[s
     """
     mismatches = []
     stored_lengths: Counter = Counter()
+    # So chuỗi đã lưu với chuỗi raw của chính phép đo đó.
     for observation in scan["accession_rows"]:
         if observation["source_database"] == chembl.SOURCE_DATABASE:
             expected = expected_chembl(observation, connection)
@@ -691,6 +761,7 @@ def check_enhanced_stereo(scan: Mapping[str, Any],
     """
     marker = config["regression"]["enhanced_stereo_marker"]
     problems = []
+    # Phải còn '|r|' và giống hệt raw.
     for observation in scan["monomer_rows"]:
         stored = observation["molecule_source_smiles"] or ""
         raw_row = bindingdb_raw["rows"].get(observation["native_measurement_id"]) or {}
@@ -724,6 +795,7 @@ def run_verify(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     LOGGER.info("[verify] stage: scan outputs")
     scan = scan_outputs(paths, config)
     # --- Một lượt đọc raw BindingDB cho những id cần đối chiếu.
+    # Chỉ giữ dòng raw của các id cần đối chiếu.
     wanted_bindingdb_ids = {row["native_measurement_id"]
                             for row in scan["sample"] + scan["accession_rows"]
                             + scan["monomer_rows"]
@@ -733,6 +805,7 @@ def run_verify(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
 
     # --- Tra cứu ChEMBL và các phép đối chiếu.
     LOGGER.info("[verify] stage: ChEMBL lookups and comparisons")
+    # COUNT(*) số activity Ki/Kd/IC50/EC50 trong raw.
     connection = chembl.open_chembl_readonly(root / config["paths"]["chembl_db"])
     try:
         chembl_selected = chembl.count_selected_activities(connection, config["endpoints"])
@@ -743,6 +816,7 @@ def run_verify(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
 
     # --- Bảo toàn: số dòng chọn từ raw phải bằng số dòng đã ghi, ở cả hai nguồn, và
     # không có observation_id trùng.
+    # Số dòng chọn từ raw phải bằng số dòng đã ghi.
     rows_by_source = scan["rows_by_source"]
     conservation = {
         chembl.SOURCE_DATABASE: {"selected_from_raw": chembl_selected,
@@ -768,6 +842,7 @@ def run_verify(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
         "counts_by_source_endpoint": dict(scan["rows_by_source_endpoint"]),
         "counts_by_source_status_reason": dict(scan["status_reasons"]),
     }
+    # Chỉ đạt khi cả năm phép đều đạt.
     report["passed"] = all(report[key]["passed"] for key in (
         "conservation", "sample_reconciliation", "regression_accession_construct",
         "regression_enhanced_stereo", "regression_pmid_integer_form"))

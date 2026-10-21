@@ -569,11 +569,16 @@ với ChEMBL. Các file molfile/SDF có thể chứa thông tin này không đư
 
 **RDKit bỏ qua marker `|r|` của BindingDB.** RDKit 2026.09.1 đọc được các nhóm lập
 thể nâng cao viết tường minh như `|&1:1|` hay `|o1:1|`, nhưng bỏ qua cờ `|r|` (mọi
-tâm lập thể đều là tương đối). Vì vậy có 421.184 dòng BindingDB mang `|r|` mà:
+tâm lập thể đều là tương đối). Vì vậy có 429.320 dòng BindingDB mang cờ `r` mà:
 - canonical SMILES và InChIKey mã hóa lập thể như thể là tuyệt đối;
 - `molecule_stereo_groups` trống và `structure_reason` trống;
 - chỉ cột `molecule_cx_extension` (cùng chuỗi nguồn trong `molecule_source_smiles`)
   còn giữ dấu `|r|`.
+
+Cách đếm: 429.320 là số dòng có `r` là một trường riêng trong khối CX (regex
+`[|,]r[|,]`, đếm ngày 21/10/2026), gồm 421.184 dòng có khối CX đúng bằng `|r|` và 8.136
+dòng có `r` đi kèm trường khác (vd. `|r,c:4|`). Bản trước của tài liệu ghi 421.184 vì
+chỉ đếm khối CX đúng bằng `|r|`, tức là đếm thiếu. ChEMBL có 0 dòng (không có CXSMILES).
 
 Ở bước MMP, đây là chỗ một hợp chất racemic hoặc có lập thể tương đối có thể bị coi
 là một đồng phân đối quang xác định. Nó có thể bị ghép cặp hay khử trùng lặp nhầm với

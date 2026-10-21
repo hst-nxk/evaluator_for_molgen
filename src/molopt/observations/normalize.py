@@ -18,6 +18,7 @@ kiểm thử bằng unit test mà không cần dữ liệu raw.
 
 from __future__ import annotations
 
+# Hash, toán, regex; RDKit để xử lý phân tử.
 import hashlib
 import math
 import re
@@ -48,9 +49,11 @@ INTEGER_PATTERN = re.compile(r"^\d+$")
 INTEGER_WITH_ZERO_FRACTION_PATTERN = re.compile(r"^(\d+)\.0+$")
 # RDKit trả nhãn "?" cho tâm lập thể chưa xác định cấu hình.
 UNASSIGNED_CENTER_LABEL = "?"
+# Nhóm lập thể tuyệt đối; khác loại này là tương đối/racemic.
 ABSOLUTE_STEREO_GROUP = Chem.StereoGroupType.STEREO_ABSOLUTE
 # RDKit raises these for molecules it cannot process (e.g. CIP digraph > 100000 nodes).
 RDKIT_ERRORS = (RuntimeError, ValueError)
+# Lý do lỗi tối đa 80 ký tự; nhiều lý do nối bằng ';'.
 MAX_ERROR_DETAIL_CHARS = 80
 REASON_SEPARATOR = ";"
 
@@ -92,6 +95,7 @@ def make_observation_id(source_database: str, native_measurement_id: str, endpoi
       chạy và mọi tham chiếu phía sau bị gãy. Chuỗi protein được hash riêng vào cột
       protein_sequence_hash.
     """
+    # Vd. 'bindingdb:13888:Ki'.
     return f"{source_database}:{native_measurement_id}:{endpoint}"
 
 
@@ -114,6 +118,7 @@ def normalize_integer_id(value: object) -> str | None:
         return str(int(value)) if math.isfinite(value) and value.is_integer() else None
     # Chuỗi: chấp nhận "12345" hoặc "12345.000"; mọi dạng khác trả None, không đoán.
     text = str(value).strip()
+    # Nhận '12345' hoặc '12345.000'; dạng khác -> None.
     if INTEGER_PATTERN.match(text):
         return text
     zero_fraction = INTEGER_WITH_ZERO_FRACTION_PATTERN.match(text)
@@ -131,7 +136,9 @@ def sequence_hash(sequence: str | None) -> str | None:
     """
     if not sequence:
         return None
+    # Bỏ khoảng trắng, viết hoa trước khi hash.
     cleaned = "".join(sequence.split()).upper()
+    # Lưu ý: ký tự ngoài ASCII sẽ gây lỗi.
     return hashlib.sha256(cleaned.encode("ascii")).hexdigest() if cleaned else None
 
 
@@ -148,8 +155,10 @@ def split_embedded_qualifier(
     stripped = value_text.strip()
     # Thử qualifier dài trước, để ">=" không bị nhận nhầm thành ">" + "=5".
     for qualifier in sorted(known_qualifiers, key=len, reverse=True):
+        # Vd. '<10' -> ('<', '10').
         if stripped.startswith(qualifier):
             return qualifier, stripped[len(qualifier):].strip()
+    # Không có tiền tố -> '='.
     return implicit_qualifier, stripped
 
 
@@ -164,6 +173,7 @@ def to_molar(value: float, unit: str, unit_to_molar: Mapping[str, float]) -> flo
     nồng độ. Đoán sẽ tạo ra pActivity sai mà không ai biết; trả None để dòng được đánh
     dấu unresolved với lý do unit_not_in_table.
     """
+    # Đơn vị ngoài bảng -> None, không đoán.
     factor = unit_to_molar.get(unit)
     return None if factor is None else value * factor
 
@@ -174,6 +184,7 @@ def p_activity(concentration_molar: float) -> float:
     Nhận: nồng độ mol/L (> 0, đã được parse_activity kiểm tra).
     Trả về: pActivity, ví dụ 1 nM = 1e-9 M -> 9.0.
     """
+    # Vd. 300 nM = 3e-7 M -> 6,52.
     return -math.log10(concentration_molar)
 
 
@@ -215,6 +226,7 @@ def parse_activity(
     if censored is None:
         return failed(UNRESOLVED, f"qualifier_not_in_table:{qualifier}")
     # --- Bước 4-6: giá trị có mặt nhưng không dùng được -> invalid.
+    # Lưu ý: float('nan') không lỗi, nên cần isfinite ở dưới.
     try:
         value = float(value_text)
     except ValueError:
@@ -248,6 +260,7 @@ def cx_extension(source_smiles: str) -> str | None:
     Vì sao cần: canonical SMILES và InChIKey làm mất thông tin lập thể nâng cao trong
     phần CX (ví dụ "|r|" = lập thể tương đối); giữ riêng phần này để không mất dấu.
     """
+    # Cắt tại ' |': '... |r|' -> '|r|'.
     _, separator, extension = source_smiles.partition(CXSMILES_SEPARATOR)
     return (CX_BLOCK_START + extension).strip() if separator else None
 
@@ -259,6 +272,7 @@ def describe_stereo_groups(molecule: Chem.Mol) -> str | None:
     Trả về: chuỗi mô tả các nhóm lập thể nâng cao mà RDKit đọc được (ABSOLUTE/OR/AND),
     hoặc None nếu không có nhóm nào.
     """
+    # Vd. 'STEREO_OR:1'. RDKit 2026.09.1 không tạo nhóm cho '|r|'.
     groups = [
         f"{group.GetGroupType().name}:{','.join(str(atom.GetIdx()) for atom in group.GetAtoms())}"
         for group in molecule.GetStereoGroups()
@@ -274,6 +288,7 @@ def has_relative_stereo(molecule: Chem.Mol) -> bool:
     Vì sao cần: canonical SMILES/InChIKey không mã hóa các nhóm này, nên cần gắn cờ để
     người dùng biết hai định danh đó đang biểu diễn lập thể "chắc chắn" hơn thực tế.
     """
+    # Vì vậy '|r|' không bật cờ này.
     return any(group.GetGroupType() != ABSOLUTE_STEREO_GROUP
                for group in molecule.GetStereoGroups())
 
@@ -302,6 +317,7 @@ def count_stereo_centers(molecule: Chem.Mol) -> tuple[int, int]:
     # rất lớn có thể ném RuntimeError "Digraph generation failed: more than 100000 nodes".
     centers = Chem.FindMolChiralCenters(molecule, includeUnassigned=True,
                                         useLegacyImplementation=False)
+    # Nhãn '?' = tâm chưa xác định cấu hình.
     unspecified = sum(1 for _, label in centers if label == UNASSIGNED_CENTER_LABEL)
     return len(centers), unspecified
 
@@ -344,6 +360,7 @@ def describe_structure(source_smiles: str | None) -> StructureResult:
         return failed(INVALID, "rdkit_parse_failed", extension)
     # --- Bước bắt buộc 2: canonical SMILES có lập thể (isomeric).
     try:
+        # Giữ ký hiệu lập thể trong SMILES.
         canonical_smiles = Chem.MolToSmiles(molecule, isomericSmiles=True)
     except RDKIT_ERRORS as error:
         return failed(UNRESOLVED, f"canonical_smiles_failed:{short_error(error)}", extension)
@@ -362,6 +379,7 @@ def describe_structure(source_smiles: str | None) -> StructureResult:
     # --- Bước phụ: đếm tâm lập thể, bọc riêng. Chỉ bắt RuntimeError/ValueError (không
     # bắt mọi exception), để lỗi lập trình khác vẫn làm chương trình dừng. Ở lần chạy
     # 18/10/2026 có 31 dòng rơi vào nhánh này (phân tử SMILES 215-298 ký tự).
+    # Ghi chú phụ; dòng vẫn resolved.
     reasons = []
     try:
         stereo_centers, unspecified = count_stereo_centers(molecule)

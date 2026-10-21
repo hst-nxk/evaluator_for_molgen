@@ -121,5 +121,257 @@
   "output": {
     "chembl_file": "chembl37_observations.parquet",
     "bindingdb_file": "bindingdb202610_observations.parquet"
+  },
+  "stage2a": {
+    "paths": {
+      "dedup_dir": "data/dedup",
+      "runs_dir": "runs/stage2a"
+    },
+    "columns": {
+      "observation_id": "observation_id",
+      "source": "source_database",
+      "native_id": "native_measurement_id",
+      "curation": "source_curation",
+      "pmid": "document_pmid",
+      "doi": "document_doi",
+      "patent": "document_patent_number",
+      "inchikey": "molecule_inchikey",
+      "protein_hash": "protein_sequence_hash",
+      "protein_accession": "protein_accession",
+      "protein_name": "protein_target_name",
+      "endpoint": "endpoint",
+      "qualifier": "activity_qualifier",
+      "molar": "activity_concentration_molar",
+      "p_activity": "activity_p_activity",
+      "value_source": "activity_value_source",
+      "unit_source": "activity_unit_source",
+      "qualifier_source": "activity_qualifier_source",
+      "activity_context": "activity_context",
+      "assay_id": "assay_native_id",
+      "assay_entry_id": "assay_entry_id",
+      "protein_status": "protein_status",
+      "assay_status": "assay_status",
+      "cx_extension": "molecule_cx_extension",
+      "document_id": "document_id",
+      "molecule_source_id": "molecule_source_id",
+      "unspecified_stereo_centers": "molecule_unspecified_stereo_centers"
+    },
+    "dedup_columns": {
+      "group_id": "dedup_group_id",
+      "level": "dedup_evidence_level",
+      "status": "dedup_status",
+      "keep": "dedup_keep",
+      "reason": "dedup_reason"
+    },
+    "dedup": {
+      "mapping_file": "cross_source_duplicates.parquet",
+      "copy_files": {
+        "chembl": "chembl37_observations_dedup.parquet",
+        "bindingdb": "bindingdb202610_observations_dedup.parquet"
+      },
+      "keep_source": "chembl",
+      "provenance_markers": {
+        "bindingdb": ["chembl"],
+        "chembl": ["bindingdb"]
+      },
+      "provenance_markers_note": "Substring, case-insensitive, of source_curation. bindingdb rows: Curation/DataSource; chembl rows: source.src_short_name. Values NOT confirmed against the data; the report lists every value and whether it matched.",
+      "document_keys": ["pmid", "doi", "patent"],
+      "doi_prefix_pattern": "^(https?://(dx\\.)?doi\\.org/|doi:\\s*)",
+      "patent_strip_pattern": "[^A-Z0-9]",
+      "patent_kind_code_pattern": "^([A-Z]+[0-9]+)[A-Z][0-9]?$",
+      "patent_kind_code_replacement": "\\1",
+      "value_exact_relative_tolerance": 1e-9,
+      "value_close_p_tolerance": 0.05,
+      "value_key_decimals": 6,
+      "partition_alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+      "letters_per_partition": 1,
+      "batch_rows": 200000,
+      "examples_per_level": {
+        "1": 2,
+        "2": 2,
+        "3": 1
+      },
+      "example_seed": 20261020,
+      "curation_values_shown": 15,
+      "relative_stereo_pattern": "[|,]r[|,]",
+      "relative_stereo_pattern_note": "Regex tìm cờ 'r' (mọi tâm lập thể là tương đối) như một trường riêng trong khối CXSMILES đã lưu ở molecule_cx_extension, vd. '|r|' hoặc '|r,&1:3|'. Chỉ dùng để đếm trong báo cáo, không đổi logic ghép cặp.",
+      "known_case": {
+        "bindingdb_reactant_set_ids": [50126247, 50126294],
+        "chembl_activity_ids": [1423853, 1423971]
+      }
+    },
+    "audit": {
+      "resolved_status": "resolved",
+      "scopes": ["chembl", "bindingdb", "all"],
+      "replicate_std_ddof": 1,
+      "replicate_std_thresholds": [0.3, 0.5],
+      "std_percentiles": [0, 25, 50, 75, 90, 99, 100],
+      "assay_count_buckets": [1, 2, 3],
+      "offset_percentiles": [0, 1, 25, 50, 75, 99, 100],
+      "offset_thresholds": [1.0, 2.0, 3.0],
+      "offset_histogram_bin_width": 0.001,
+      "offset_histogram_max": 30.0,
+      "offset_lists_per_chunk": 100000,
+      "p_activity_percentiles": [0, 1, 50, 99, 100],
+      "p_activity_low": 0.0,
+      "p_activity_high": 15.0,
+      "top_proteins": 20,
+      "protein_name_width": 45,
+      "original_value_relative_tolerance": 1e-9,
+      "top_unit_conversions": 10,
+      "batch_rows": 200000,
+      "diagnostic_bin_edges": [0.01, 0.1, 0.3, 0.5],
+      "zero_tolerance": 1e-9,
+      "near_zero_std": 0.01,
+      "category_percentiles": [50, 75],
+      "potential_duplicate_key": "potential_duplicate",
+      "potential_duplicate_value": 1,
+      "diagnostics_note": "Mục 7 (chẩn đoán replicate thật hay bản ghi trùng): khoảng chia STD và |Δ| (diagnostic_bin_edges); 'bằng 0' là ≤ zero_tolerance để bỏ qua sai số làm tròn của phép lấy trung bình; 'STD ≈ 0' là < near_zero_std; potential_duplicate đọc từ activity_context của ChEMBL."
+    },
+    "diagnose": {
+      "copy_min_shared_pairs": 3,
+      "copy_fraction_edges": [0.1, 0.5, 0.9],
+      "round_p_tolerance": 1e-6,
+      "top_publication_pairs": 10,
+      "publication_keys_shown": 3,
+      "top_publications": 3,
+      "top_keys": 5,
+      "note": "scripts/diagnose_noise.py. Mục A: cặp assay cùng nguồn, khác publication, xếp theo tỷ lệ |Δ| = 0 của cặp publication chứa nó (copy_fraction_edges); cặp publication chung ít hơn copy_min_shared_pairs cặp assay thì để riêng vì không đủ để phân biệt chép bảng với trùng hợp. 'p nguyên' là |p − round(p)| ≤ round_p_tolerance. Mục B: top_publications publication nhiều assay nhất, in top_keys khóa. Không có ngưỡng nào ở đây dùng để lọc dữ liệu."
+    }
+  },
+  "stage2b": {
+    "inputs": {
+      "chembl": "data/dedup/chembl37_observations_dedup.parquet",
+      "bindingdb": "data/dedup/bindingdb202610_observations_dedup.parquet"
+    },
+    "paths": {
+      "dataset_dir": "data/dataset",
+      "full_dir": "data/dataset/full",
+      "runs_dir": "runs/dataset"
+    },
+    "files": {
+      "molecules": "molecules.parquet",
+      "proteins": "proteins.parquet",
+      "shards_dir": "shards",
+      "replicates_dir": "replicates",
+      "assay_deltas_dir": "assay_deltas",
+      "lost_pairs_dir": "lost_relative_pairs",
+      "records_dir": "records",
+      "full_manifest": "full_manifest.json",
+      "split_fasta": "protein_split_input.fasta",
+      "protein_split": "protein_split.parquet",
+      "protein_split_manifest": "protein_split_manifest.json",
+      "evaluator": "evaluator_training.parquet",
+      "generator": "generator_training.parquet",
+      "evidence_records": "evidence_records.parquet",
+      "export_manifest": "export_manifest.json"
+    },
+    "columns": {
+      "observation_id": "observation_id",
+      "source": "source_database",
+      "assay_id": "assay_native_id",
+      "assay_entry_id": "assay_entry_id",
+      "protein_hash": "protein_sequence_hash",
+      "protein_sequence": "protein_sequence",
+      "protein_accession": "protein_accession",
+      "protein_name": "protein_target_name",
+      "endpoint": "endpoint",
+      "inchikey": "molecule_inchikey",
+      "smiles": "molecule_canonical_smiles",
+      "cx_extension": "molecule_cx_extension",
+      "qualifier": "activity_qualifier",
+      "p_activity": "activity_p_activity",
+      "protein_status": "protein_status",
+      "assay_status": "assay_status",
+      "keep": "dedup_keep",
+      "activity_context": "activity_context",
+      "molecule_source_id": "molecule_source_id"
+    },
+    "filter": {
+      "resolved_status": "resolved",
+      "potential_duplicate_key": "potential_duplicate",
+      "potential_duplicate_value": 1,
+      "potential_duplicate_regex": "\"potential_duplicate\"\\s*:\\s*\"?1\"?",
+      "note": "Bộ lọc dòng vào dataset: dedup_keep, qualifier thuộc qualifiers.exact, protein_status và assay_status bằng resolved_status, có pActivity, có InChIKey, có SMILES. Dòng ChEMBL có cờ potential_duplicate vẫn được giữ nhưng không tính là phép đo độc lập (n_independent) và không tính là assay độc lập. potential_duplicate_regex chỉ để chọn trước dòng cần parse JSON (giá trị 1 hoặc \"1\" luôn khớp regex); dòng khớp vẫn được parse và so bằng potential_duplicate_key/value.",
+      "multi_source_id_note": "Nhóm bước 1 có nhiều molecule_source_id khác nhau (cùng InChIKey, khác ID của nguồn) được giữ và gắn cờ multi_source_id, theo quyết định 2 ở docs/STAGE2A_DEDUP_AUDIT.md mục 5.6."
+    },
+    "replicate": {
+      "merge_tolerance": 0.01,
+      "float_slack": 1e-9,
+      "std_ddof": 1,
+      "note": "Bước 1. Giá trị pActivity trong cùng nhóm (nguồn, assay, protein, endpoint, phân tử) lệch nhau ≤ merge_tolerance được gộp làm một phép đo (quyết định ở docs/STAGE2A_DEDUP_AUDIT.md mục 5.6). float_slack bù sai số dấu phẩy động khi so với ngưỡng."
+    },
+    "identity": {
+      "relative_stereo_suffix": "-REL",
+      "note": "Bước 2. Dòng có cờ lập thể tương đối (regex stage2a.dedup.relative_stereo_pattern trên molecule_cx_extension) có khóa phân tử = InChIKey + relative_stereo_suffix, nên không trùng khóa và không ghép cặp với dòng không mang cờ."
+    },
+    "mmp": {
+      "min_cuts": 1,
+      "max_cuts": 1,
+      "max_cut_bonds": 20,
+      "min_core_fraction": 0.6,
+      "max_variable_heavy_atoms": 10,
+      "attachment_points": 1,
+      "attachment_degree": 1,
+      "workers": 8,
+      "groups_per_task": 2000,
+      "fragment_cache_size": 200000,
+      "pending_tasks_per_worker": 2,
+      "note": "Bước 2. RDKit rdMMPA.FragmentMol với min_cuts/max_cuts/max_cut_bonds. Lõi chung ≥ min_core_fraction số nguyên tử nặng của cả A và B; phần biến đổi ≤ max_variable_heavy_atoms mỗi bên; mỗi mảnh đúng attachment_points điểm nối và nguyên tử nối có bậc attachment_degree. workers: số tiến trình con; fragment_cache_size: số phân tử nhớ kết quả cắt trong mỗi tiến trình."
+    },
+    "delta": {
+      "pair_id_length": 24,
+      "protein_buckets": 16,
+      "note": "Bước 3. pair_id = 24 ký tự hex đầu của SHA-256('endpoint|protein|A|B'). Δp trong assay được ghi thành protein_buckets file theo ký tự đầu của protein_sequence_hash, để bước 4 xử lý từng phần cho vừa bộ nhớ."
+    },
+    "qc": {
+      "dispersion_thresholds": {"Ki": 1.0, "Kd": 1.0, "IC50": 1.4, "EC50": 1.4},
+      "dispersion_ddof": 1,
+      "report_levels": [0.3, 1.0],
+      "note": "Bước 4. Độ phân tán của các Δp: ≥ 3 assay là STD (ddof = dispersion_ddof); 2 assay là |Δ_X − Δ_Y|; 1 assay không tính (cờ single_assay). Vượt ngưỡng của endpoint -> cờ quarantine. Ngưỡng ≈ 2σ với σ mỗi phép đo đo ở Stage 2a (Ki 0,50; Kd 0,57; IC50/EC50 0,73). report_levels chỉ để báo cáo, đối chiếu Nelen et al. 2025, không lọc."
+    },
+    "export": {
+      "eligible_qc": ["pass", "single_assay"],
+      "generator_min_gain": 0.3,
+      "plausible_p_range": [2.0, 12.0],
+      "min_protein_length": 50,
+      "note": "Bước 5. Chỉ bản ghi có qc_status thuộc eligible_qc vào phần training; phần evidence giữ mọi bản ghi. Generator: hướng yếu -> mạnh, gain > generator_min_gain (nghiêm ngặt).",
+      "flag_note": "Ba cờ mô tả thêm ở cả ba file xuất, KHÔNG lọc dòng nào (nguyên tắc của dự án: không lọc thầm). unseen_pair: cặp (A, B) không xuất hiện trong partition train, nên dòng train luôn False; dùng để định nghĩa tập đánh giá nghiêm ngặt \"cặp chưa từng thấy\" vì split chia theo protein nên cùng một cặp phân tử có thể gặp lại ở protein khác. plausible_p_range: mọi phép đo đóng góp cho bản ghi có pActivity trong khoảng này thì plausible_range = True; p < 0 nghĩa là nồng độ trên 1 M nên là lỗi nguồn, và ChEMBL/BindingDB có 2.254 dòng p < 0 cùng 47 dòng p > 15 (đo ngày 22/10/2026) — Stage 2b chuyển tiếp nguyên trạng và chỉ gắn cờ. min_protein_length: chuỗi ngắn hơn ngưỡng này được gắn short_protein; gom chuỗi ở identity 50 % với coverage 0,8 không có nghĩa với chuỗi vài acid amin (có 21 chuỗi dưới 50 aa, ngắn nhất 9 aa)."
+    },
+    "split": {
+      "partitions": ["train", "validation", "test"],
+      "target_ratios": {"train": 0.8, "validation": 0.1, "test": 0.1},
+      "seed": 20261021,
+      "old_split_file": "E:/data/molopt_benchmark_split_candidate_v2/P50_GLOBAL_NW_50_CANDIDATE_20260910_V2/protein_to_partition.parquet",
+      "clustering": {
+        "tool": "mmseqs2",
+        "tool_install": "WSL Ubuntu-24.04, apt install mmseqs2",
+        "tool_version": "15-6f452+ds-2",
+        "command": "mmseqs easy-cluster <fasta> <prefix> <tmp> --min-seq-id 0.5 -c 0.8 --cov-mode 2 --cluster-mode 1 --single-step-clustering --max-seqs 6315 --alignment-mode 3 --seq-id-mode 0 -s 7.5",
+        "cluster_tsv": "<prefix>_cluster.tsv",
+        "min_identity": 0.5,
+        "identity_denominator": "aligned_columns",
+        "alignment_mode": 3,
+        "seq_id_mode": 0,
+        "coverage": 0.8,
+        "coverage_mode": 2,
+        "cluster_mode": 1,
+        "single_step_clustering": true,
+        "max_seqs": 6315,
+        "sensitivity": 7.5,
+        "note": "MMseqs2, chọn ngày 21/10/2026, ba tham số sửa ngày 22/10/2026 sau lần gom thử đầu tiên (xem docs/STAGE2B_DATASET.md mục 8.1). min_identity 0,5 và cluster_mode 1 (connected component) giữ đúng như split cũ (single-linkage ở 50 %). coverage 0,8 là chỗ CỐ Ý KHÁC split cũ, vì split cũ không có ràng buộc coverage nào. Lý do khoa học: không có coverage thì construct ngắn và protein đầy đủ của cùng một gene rơi vào hai partition, đó là rò rỉ thật với dữ liệu lấy protein_sequence theo construct. coverage_mode 2 = alnRes/qLen: với cặp (construct ngắn, protein đầy đủ), chiều chuỗi ngắn làm query che gần hết query nên đạt ngưỡng và hai chuỗi vẫn nối với nhau — vẫn là coverage đo trên chuỗi ngắn hơn, chỉ khác vai so với cov-mode 1. Lần đầu dùng cov-mode 1 và MMseqs2 in cảnh báo \"Combining cluster mode 1 in combination with coverage mode 1 can produce wrong results. Please use --cov-mode 2\", nên đổi theo khuyến nghị của chính công cụ; vai query/target không đi vào dataset vì ta chỉ dùng thành viên nhóm. Không dùng cov-mode 0 vì nó chia cho max(qLen, tLen), tức chuỗi dài hơn, nên loại đúng loại cặp construct/full-length cần gom. single_step_clustering: mặc định easy-cluster gom cascade 3 bước, mỗi bước chỉ xét chuỗi đại diện của bước trước, nên nhóm vụn hơn; MMseqs2 cũng nói \"Connected component clustering produces less clusters in a single step clustering\". Ít nhóm hơn = gộp nhiều hơn = an toàn hơn trước rò rỉ. max_seqs 6315: mặc định mmseqs cluster chặn ở 20 láng giềng mỗi chuỗi, và log lần đầu cho \"20 median result list length\", tức đã chạm mức chặn — protein có hơn 20 anh em cùng họ bị mất cạnh nối. Đặt bằng số chuỗi trong FASTA để bỏ hẳn giới hạn; nếu số protein có cặp thay đổi thì phải sửa con số này cho ≥ số chuỗi. alignment_mode 3 để identity là số residue giống nhau chia cho số cột alignment, cùng mẫu số với split cũ; mặc định MMseqs2 chỉ ước lượng identity từ score mỗi cột. seq_id_mode 0 cũng là mẫu số theo độ dài alignment; đã xác nhận cờ này có trong bản 15-6f452+ds-2 (`mmseqs cluster -h`: \"0: alignment length 1: shorter, 2: longer sequence [0]\"), mặc định đã là 0 nên truyền thêm chỉ để ghi rõ ý định. sensitivity 7.5 là tham số không do đề bài chốt: prefilter của MMseqs2 có thể bỏ sót cặp quanh 50 % mà global NW của split cũ không bỏ sót, với 6.315 chuỗi thì chi phí không đáng kể."
+      },
+      "note": "Split protein dựng SAU bước 4, trên protein có mặt trong dataset cuối. Tỷ lệ mục tiêu tính theo số cặp (bản ghi bước 4), không theo số protein. Mọi protein cùng nhóm nằm cùng partition; nhóm lớn xếp trước; seed phá thế hòa. old_split_file chỉ đọc cho kiểm tra đối chiếu số 5 của verify."
+    },
+    "run": {
+      "batch_rows": 200000,
+      "molecule_merge_batches": 20,
+      "smoke_assay_modulus": 200,
+      "verify_sample_rows": 50000,
+      "verify_seed": 20261021,
+      "verify_tolerance": 1e-9,
+      "delta_percentiles": [0, 1, 25, 50, 75, 99, 100],
+      "note": "smoke: chỉ lấy assay có CRC32(assay_key) chia hết cho smoke_assay_modulus (≈ 1/200 số assay), cố định giữa các lần chạy. verify: số dòng Δp trong assay lấy mẫu để tính lại từ observation gốc."
+    }
   }
 }

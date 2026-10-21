@@ -19,6 +19,7 @@ Vị trí trong luồng raw -> observations:
 
 from __future__ import annotations
 
+# Chỉ dùng thư viện chuẩn: đọc ZIP, đọc TSV.
 import csv
 import io
 import json
@@ -30,18 +31,22 @@ from typing import Any, NamedTuple
 
 LOGGER = logging.getLogger(__name__)
 
+# Tên nguồn, dùng trong observation_id.
 SOURCE_DATABASE = "bindingdb"
 TSV_SUFFIX = ".tsv"
 # Giá trị của cột protein_accession_db: accession lấy từ SwissProt hay TrEMBL.
 SWISSPROT = "swissprot"
 TREMBL = "trembl"
+# Chuỗi lấy từ chain 1; chỉ nhận target có 1 chain.
 SEQUENCE_ORIGIN_CHAIN_1 = "bindingdb_target_chain_1"
 SINGLE_CHAIN = 1
 
+# Ba giá trị của các cột *_status.
 RESOLVED = "resolved"
 UNRESOLVED = "unresolved"
 INVALID = "invalid"
 
+# Khóa assay, vd. ('1025', '1').
 AssayPair = tuple[str, str]  # (ENTRYID, ASSAYID)
 
 
@@ -74,8 +79,10 @@ def find_tsv_member(zip_path: Path) -> str:
     Vì sao cần: không viết cứng tên file bên trong ZIP; nếu ZIP chứa 0 hoặc nhiều file
     .tsv thì dừng thay vì đoán đọc file nào.
     """
+    # Tìm file .tsv bên trong ZIP.
     with zipfile.ZipFile(zip_path) as archive:
         members = [name for name in archive.namelist() if name.lower().endswith(TSV_SUFFIX)]
+    # Phải có đúng một file .tsv.
     if len(members) != 1:
         raise ValueError(f"{zip_path}: expected exactly one {TSV_SUFFIX} member, found {members}")
     return members[0]
@@ -100,6 +107,7 @@ def iter_tsv_rows(zip_path: Path, encoding: str) -> Iterator[tuple[int, list[str
         reader = csv.reader(text_stream, delimiter="\t", quoting=csv.QUOTE_NONE)
         line_number = 0
         try:
+            # Trả từng dòng một, không giữ cả file trong RAM.
             for line_number, fields in enumerate(reader, start=1):
                 yield line_number, fields
         except UnicodeDecodeError as error:
@@ -112,6 +120,7 @@ def read_header(zip_path: Path, encoding: str) -> list[str]:
 
     Nhận: đường dẫn ZIP và bảng mã. Trả về: danh sách tên cột (dòng 1).
     """
+    # Chỉ đọc dòng header.
     for _, fields in iter_tsv_rows(zip_path, encoding):
         return fields
     raise ValueError(f"{zip_path}: TSV member is empty")
@@ -128,7 +137,9 @@ def column_indexes(header: list[str], wanted: Mapping[str, str], source: str) ->
     problems = []
     indexes = {}
     for role, name in wanted.items():
+        # Tìm cột theo tên, khớp chính xác.
         positions = [index for index, column in enumerate(header) if column == name]
+        # Tên cột phải xuất hiện đúng một lần.
         if len(positions) != 1:
             problems.append(f"{role}={name!r} found {len(positions)} times")
         else:
@@ -145,8 +156,10 @@ def field(fields: list[str], index: int) -> str | None:
     Nhận: danh sách trường của một dòng và chỉ số cột.
     Trả về: chuỗi nguyên văn (không cắt khoảng trắng), hoặc None nếu ô rỗng/không tồn tại.
     """
+    # Dòng ngắn hơn header -> ô không tồn tại.
     if index >= len(fields):
         return None
+    # Giữ nguyên văn (' 2' vẫn là ' 2'); ô chỉ có khoảng trắng -> None.
     value = fields[index]
     return value if value.strip() else None
 
@@ -159,6 +172,7 @@ def check_row_width(fields: list[str], header_width: int, line_number: int, sour
     Vì sao cần: nếu một ô chứa ký tự tab thừa, mọi cột phía sau bị lệch; khi đó giá trị
     sẽ bị gán nhầm cột mà không ai biết. Dừng hẳn an toàn hơn là đoán.
     """
+    # Chỉ bắt dòng dài hơn header; dòng ngắn hơn không bị bắt.
     if len(fields) > header_width:
         raise ValueError(f"{source} line {line_number}: {len(fields)} fields but header has "
                          f"{header_width}; refusing to guess column alignment")
@@ -176,10 +190,13 @@ def parse_entry_assay_id(text: str, separator: str, line_number: int) -> AssayPa
     trong file; nếu giả định sai, mọi khóa assay đều sai. Chỉ chấp nhận đúng hai phần
     đều là số nguyên, mọi dạng khác làm chương trình dừng kèm số dòng.
     """
+    # '1025_1' -> ['1025', '1'].
     parts = text.strip().split(separator)
+    # Phải đúng 2 phần, đều là số; khác thì dừng.
     if len(parts) != 2 or not all(part.isdigit() for part in parts):
         raise ValueError(f"BindingDB_rsid_eaids line {line_number}: ENTRYID_ASSAYID {text!r} "
                          f"does not split into two integers on {separator!r}")
+    # Giữ dạng chuỗi để khớp với khóa của bảng Assays.
     return parts[0], parts[1]
 
 
@@ -196,6 +213,7 @@ def load_assay_links(zip_path: Path, settings: Mapping[str, Any]) -> dict[str, l
     rows = iter_tsv_rows(zip_path, settings["encoding"])
     _, header = next(rows)
     columns = column_indexes(header, settings["rsid_eaids_columns"], zip_path.name)
+    # Vd. '13888' -> [('1025', '1')].
     links: dict[str, list[AssayPair]] = {}
     for line_number, fields in rows:
         check_row_width(fields, len(header), line_number, zip_path.name)
@@ -228,6 +246,7 @@ def load_assays(
     rows = iter_tsv_rows(zip_path, settings["encoding"])
     _, header = next(rows)
     columns = column_indexes(header, settings["assays_columns"], zip_path.name)
+    # None = khóa bị trùng.
     assays: dict[AssayPair, tuple[str | None, str | None] | None] = {}
     for line_number, fields in rows:
         check_row_width(fields, len(header), line_number, zip_path.name)
@@ -235,6 +254,7 @@ def load_assays(
         assay_id = field(fields, columns["assay_id"])
         if entry_id is None or assay_id is None:
             raise ValueError(f"{zip_path.name} line {line_number}: empty key field {fields!r}")
+        # Khóa là cặp, vì ASSAYID được đánh số lại trong mỗi entry.
         key = (entry_id.strip(), assay_id.strip())
         value = (field(fields, columns["assay_name"]), field(fields, columns["description"]))
         # Khóa trùng -> đánh dấu None để resolve_assay báo duplicate_assay_table_rows,
@@ -255,10 +275,14 @@ def assert_domains_intersect(label: str, left: Iterable[Any], right: Container[A
     Kiểm tra này biến lỗi âm thầm đó thành lỗi dừng ngay. Lưu ý: chỉ dừng khi KHÔNG có
     khóa nào khớp; đây là kiểm tra cấu trúc, không phải đo độ phủ.
     """
+    # LƯU Ý: kiểm tra này không bắt được lỗi join Reactant_set_id vào ENTRYID (hai dãy số
+    # chồng nhau, 12.665/20.000 vẫn khớp). Lỗi đó do resolve_assay, test và verify chặn.
     checked = matched = 0
     for key in left:
         checked += 1
+        # True/False được cộng như 1/0.
         matched += key in right
+    # Không khóa nào khớp -> dừng ngay.
     if matched == 0:
         raise ValueError(f"Key domains do not intersect for {label}: 0 of {checked:,} keys "
                          "matched. The join keys are in different namespaces or misparsed.")
@@ -277,6 +301,7 @@ def first_reactant_set_ids(zip_path: Path, settings: Mapping[str, Any]) -> list[
     rows = iter_tsv_rows(zip_path, settings["encoding"])
     _, header = next(rows)
     index = column_indexes(header, settings["all_columns"], zip_path.name)["reactant_set_id"]
+    # Chỉ lấy 20.000 dòng đầu.
     ids = []
     for _, fields in rows:
         value = field(fields, index)
@@ -308,8 +333,10 @@ def resolve_protein(
     gán nhầm construct. Chuỗi trên dòng là chuỗi thực sự dùng trong phép đo đó.
     """
     # --- Số chain phải có và phải là số nguyên.
+    # Thiếu số chain -> unresolved.
     if chain_count_text is None:
         return ProteinResolution(None, None, None, UNRESOLVED, "chain_count_missing")
+    # Số chain không phải số -> invalid.
     try:
         chain_count = int(chain_count_text)
     except ValueError:
@@ -317,9 +344,11 @@ def resolve_protein(
                                  f"chain_count_not_integer:{chain_count_text}")
     # --- Chỉ xử lý target một chain: với phức hợp nhiều chain, không biết ligand gắn vào
     # chain nào, nên không chọn bừa chain 1.
+    # Nhiều chain -> unresolved, không chọn bừa chain 1.
     if chain_count != SINGLE_CHAIN:
         return ProteinResolution(None, None, None, UNRESOLVED,
                                  f"target_chain_count_not_1:{chain_count}")
+    # Có 1 chain nhưng thiếu chuỗi.
     if chain_sequence is None:
         return ProteinResolution(None, None, None, UNRESOLVED, "chain_sequence_missing")
     # --- Accession: ưu tiên SwissProt (đã được kiểm duyệt), sau đó TrEMBL.
@@ -363,6 +392,7 @@ def resolve_assay(
                                f"multiple_assay_links:{len(pairs)}")
     # --- Đúng một cặp: tra bảng assay theo cả cặp (ENTRYID, ASSAYID).
     entry_id, assay_id = pairs[0]
+    # Xét 'not in' trước, vì None trong assays nghĩa là khóa trùng.
     if (entry_id, assay_id) not in assays:
         return AssayResolution(entry_id, assay_id, None, None, UNRESOLVED,
                                "assay_pair_not_in_assay_table")
@@ -396,6 +426,7 @@ def build_records(
     nhờ phần endpoint).
     """
 
+    # Đọc ô theo tên vai trò trong config.
     def get(role: str) -> str | None:
         # Lấy giá trị theo vai trò (tên trong config.json), None nếu ô rỗng.
         return field(fields, columns[role])
@@ -412,8 +443,10 @@ def build_records(
     shared = {
         "source_database": SOURCE_DATABASE,
         "source_release": release,
+        # Reactant_set_id = ID phép đo.
         "native_measurement_id": (get("reactant_set_id") or "").strip(),
         "source_curation": get("curation_source"),
+        # ENTRYID; None nếu dòng không có liên kết assay.
         "document_id": assay.entry_id,
         "document_pmid_source": get("pmid"),
         "document_doi": get("article_doi"),
@@ -426,6 +459,7 @@ def build_records(
         "protein_sequence_origin": SEQUENCE_ORIGIN_CHAIN_1 if protein.sequence else None,
         "protein_accession": protein.accession,
         "protein_accession_db": protein.accession_db,
+        # Cột BindingDB không có -> None.
         "protein_target_id": None,
         "protein_target_name": get("target_name"),
         "protein_target_type": None,
@@ -449,11 +483,13 @@ def build_records(
         "activity_context": None,
     }
     # --- Tách theo endpoint: mỗi ô không rỗng -> một bản ghi; ô rỗng bỏ qua.
+    # Vd. Ki ' 2' và IC50 '<10' trên cùng dòng -> 2 bản ghi.
     records = []
     for endpoint, index in endpoint_columns.items():
         value_text = field(fields, index)
         if value_text is None:
             continue
+        # Phần chung + endpoint, giá trị nguyên văn, đơn vị nM.
         records.append({**shared, "endpoint": endpoint, "activity_value_source": value_text,
                         "activity_unit_source": endpoint_units[endpoint]})
     return records
@@ -488,6 +524,7 @@ def iter_records(config: Mapping[str, Any], root: Path, limit: int | None) -> It
     rows = iter_tsv_rows(all_zip, settings["encoding"])
     _, header = next(rows)
     columns = column_indexes(header, settings["all_columns"], all_zip.name)
+    # Chỉ các endpoint có trong config.
     endpoint_names = {endpoint: spec["column"]
                       for endpoint, spec in settings["endpoint_columns"].items()
                       if endpoint in config["endpoints"]}
@@ -497,6 +534,7 @@ def iter_records(config: Mapping[str, Any], root: Path, limit: int | None) -> It
     release = config["releases"]["bindingdb"]
 
     # --- Đọc tuần tự từng dòng: kiểm tra độ rộng, tìm assay, tách thành bản ghi.
+    # Đếm bản ghi (không phải dòng) cho limit.
     yielded = 0
     for line_number, fields in rows:
         check_row_width(fields, len(header), line_number, all_zip.name)
@@ -504,6 +542,7 @@ def iter_records(config: Mapping[str, Any], root: Path, limit: int | None) -> It
         # Reactant_set_id là ID phép đo (dùng trong observation_id): thiếu thì dừng.
         if reactant_set_id is None:
             raise ValueError(f"{all_zip.name} line {line_number}: empty Reactant_set_id")
+        # Assay tính một lần cho cả dòng.
         assay = resolve_assay(reactant_set_id.strip(), links, assays)
         for record in build_records(fields, columns, endpoint_columns, endpoint_units,
                                     assay, release):
