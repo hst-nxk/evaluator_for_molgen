@@ -2,3 +2,13 @@ rdkit==2026.9.1
 pyarrow==25.0.1
 pytest==8.4.2
 numpy==2.2.6
+
+# Stage 3 (evaluator). Hai thư viện này CHƯA được cài trên máy này, nên chưa pin được
+# phiên bản đã thật sự kiểm chứng; pin lại ngay sau lần cài thành công đầu tiên.
+# Bản torch phụ thuộc CUDA của máy: wheel mặc định trên PyPI không nhất thiết khớp
+# driver đang có, nên cài qua index của PyTorch đúng với CUDA của máy, ví dụ CUDA 12.1:
+#   python -m pip install --index-url https://download.pytorch.org/whl/cu121 torch
+# Chỉ cần CPU (đủ cho --mode baseline, prepare --skip-protein và smoke no_protein):
+#   python -m pip install torch
+torch
+transformers

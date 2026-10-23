@@ -335,8 +335,12 @@
       "generator_min_gain": 0.3,
       "plausible_p_range": [2.0, 12.0],
       "min_protein_length": 50,
+      "source_quality_key": "data_validity_comment",
+      "source_quality_regex": "\"data_validity_comment\"\\s*:\\s*\"",
+      "source_quality_separator": "; ",
       "note": "Bước 5. Chỉ bản ghi có qc_status thuộc eligible_qc vào phần training; phần evidence giữ mọi bản ghi. Generator: hướng yếu -> mạnh, gain > generator_min_gain (nghiêm ngặt).",
-      "flag_note": "Ba cờ mô tả thêm ở cả ba file xuất, KHÔNG lọc dòng nào (nguyên tắc của dự án: không lọc thầm). unseen_pair: cặp (A, B) không xuất hiện trong partition train, nên dòng train luôn False; dùng để định nghĩa tập đánh giá nghiêm ngặt \"cặp chưa từng thấy\" vì split chia theo protein nên cùng một cặp phân tử có thể gặp lại ở protein khác. plausible_p_range: mọi phép đo đóng góp cho bản ghi có pActivity trong khoảng này thì plausible_range = True; p < 0 nghĩa là nồng độ trên 1 M nên là lỗi nguồn, và ChEMBL/BindingDB có 2.254 dòng p < 0 cùng 47 dòng p > 15 (đo ngày 22/10/2026) — Stage 2b chuyển tiếp nguyên trạng và chỉ gắn cờ. min_protein_length: chuỗi ngắn hơn ngưỡng này được gắn short_protein; gom chuỗi ở identity 50 % với coverage 0,8 không có nghĩa với chuỗi vài acid amin (có 21 chuỗi dưới 50 aa, ngắn nhất 9 aa)."
+      "flag_note": "Ba cờ mô tả thêm ở cả ba file xuất, KHÔNG lọc dòng nào (nguyên tắc của dự án: không lọc thầm). unseen_pair: cặp (A, B) không xuất hiện trong partition train, nên dòng train luôn False; dùng để định nghĩa tập đánh giá nghiêm ngặt \"cặp chưa từng thấy\" vì split chia theo protein nên cùng một cặp phân tử có thể gặp lại ở protein khác. plausible_p_range: mọi phép đo đóng góp cho bản ghi có pActivity trong khoảng này thì plausible_range = True; p < 0 nghĩa là nồng độ trên 1 M nên là lỗi nguồn, và ChEMBL/BindingDB có 2.254 dòng p < 0 cùng 47 dòng p > 15 (đo ngày 22/10/2026) — Stage 2b chuyển tiếp nguyên trạng và chỉ gắn cờ. min_protein_length: chuỗi ngắn hơn ngưỡng này được gắn short_protein; gom chuỗi ở identity 50 % với coverage 0,8 không có nghĩa với chuỗi vài acid amin (có 21 chuỗi dưới 50 aa, ngắn nhất 9 aa).",
+      "source_quality_note": "Cột source_quality_warning: cảnh báo chất lượng do CHÍNH NGUỒN gắn, lấy nguyên văn, KHÔNG lọc dòng nào. Lấy từ khóa source_quality_key trong activity_context của ChEMBL (các giá trị thật: 'Outside typical range', 'Potential transcription error', 'Potential missing data', 'Manually validated', 'Potential author error'). source_quality_regex chỉ để chọn trước dòng cần parse JSON (khớp khi khóa có giá trị chuỗi, không khớp khi null); dòng đã chọn vẫn được parse đầy đủ. Một bản ghi gộp nhiều phép đo nên giá trị là các cảnh báo khác nhau của mọi phép đo đóng góp, sắp xếp rồi nối bằng source_quality_separator. Null nghĩa là KHÔNG có cảnh báo, hoặc nguồn không có cột tương đương — BindingDB 202610 không có cột này nên bản ghi chỉ từ BindingDB luôn null. Vì sao cần: ChEMBL tự đánh dấu dòng đáng nghi và 51.945 dòng mang cảnh báo đã vào dataset; toàn bộ 5.073 dòng ChEMBL có pActivity ngoài [2, 12] đều nằm trong số đó (đo ngày 22/10/2026), nên đây là xác nhận chéo độc lập với cờ plausible_range."
     },
     "split": {
       "partitions": ["train", "validation", "test"],
@@ -372,6 +376,92 @@
       "verify_tolerance": 1e-9,
       "delta_percentiles": [0, 1, 25, 50, 75, 99, 100],
       "note": "smoke: chỉ lấy assay có CRC32(assay_key) chia hết cho smoke_assay_modulus (≈ 1/200 số assay), cố định giữa các lần chạy. verify: số dòng Δp trong assay lấy mẫu để tính lại từ observation gốc."
+    }
+  },
+  "stage3": {
+    "inputs": {
+      "evaluator": "data/dataset/evaluator_training.parquet",
+      "proteins": "data/dataset/full/proteins.parquet"
+    },
+    "paths": {
+      "cache_dir": "work/evaluator_cache",
+      "runs_dir": "runs/evaluator"
+    },
+    "files": {
+      "molecule_fingerprints": "molecule_fingerprints.parquet",
+      "fragment_fingerprints": "fragment_fingerprints.parquet",
+      "protein_embeddings": "protein_embeddings.parquet",
+      "cache_manifest": "cache_manifest.json"
+    },
+    "fingerprint": {
+      "radius": 2,
+      "bits": 2048,
+      "fragment_bits": 1024,
+      "use_chirality": true,
+      "note": "Morgan fingerprint của RDKit. bits dùng cho phân tử đầy đủ (smiles_a, smiles_b); fragment_bits cho nhóm thế (variable_a, variable_b) vì fragment nhỏ hơn nhiều nên vector ngắn hơn là đủ. use_chirality = true vì dataset giữ lập thể trong canonical SMILES và cặp MMP có thể khác nhau chỉ ở lập thể. Fingerprint được tính MỘT LẦN cho mỗi SMILES phân biệt rồi cache, không tính trong vòng train."
+    },
+    "protein_encoder": {
+      "model": "facebook/esm2_t12_35M_UR50D",
+      "embedding_dim": null,
+      "max_residues": 1022,
+      "long_sequence": "windows",
+      "pooling": "residues_only",
+      "batch_sequences": 8,
+      "pooling_note": "CHUẨN POOLING dùng chung cho CẢ HAI cấu hình frozen và finetune: mean-pool chỉ trên token acid amin, bỏ CLS/EOS/PAD. Chọn chuẩn này vì CLS và EOS không phải acid amin, và vì cache frozen đã tính đúng như vậy nên không phải dựng lại cache. Giá trị này là tư liệu: code không đọc nó, cả hai đường đã cùng một cách tính (features.embed_one_sequence và train.ProteinEncoderRuntime.encode).",
+      "note": "embedding_dim = null nghĩa là CHƯA ĐO trên máy này: chiều thật được đọc từ model đã nạp ở --mode prepare rồi ghi vào cache_manifest, và train/eval kiểm tra lại cho khớp. KHÔNG hardcode 512 hay bất kỳ số nào. max_residues là cửa sổ ESM2 trừ hai token đặc biệt. long_sequence: 'windows' = chuỗi dài hơn max_residues được chia thành các cửa sổ liền nhau rồi lấy mean của mean-pool từng cửa sổ (dùng cho frozen, không mất đuôi chuỗi); 'truncate' = chỉ lấy max_residues acid amin đầu (bắt buộc cho finetune vì bộ nhớ gradient). Chuỗi dài: 1.409 protein trên 11.835 dài hơn 1.024 aa, dài nhất 34.350 aa."
+    },
+    "model": {
+      "ligand_hidden": [1024, 512],
+      "ligand_out": 256,
+      "edit_hidden": [256],
+      "edit_out": 128,
+      "protein_out": 128,
+      "endpoint_dim": 16,
+      "head_hidden": [512, 256],
+      "dropout": 0.1,
+      "heads_note": "Ba đầu ra: direct (thấy cả A và B, có nhánh edit), direct_no_edit (thấy cả A và B, không có nhánh edit), twin (chấm điểm riêng từng phân tử rồi lấy hiệu). direct vs direct_no_edit tách tác dụng riêng của nhánh edit; direct_no_edit vs twin tách tác dụng riêng của việc tính Δ thẳng. Ô thứ tư (twin có nhánh edit) không tồn tại được vì một phép sửa là thuộc tính của cặp, không của một phân tử.",
+      "note": "protein_out = 128: giảm chiều embedding protein trước khi concat để đầu dự đoán không bị một nhánh áp đảo. endpoint_dim = 16 cho 4 endpoint."
+    },
+    "train": {
+      "configurations": ["frozen", "finetune", "no_protein"],
+      "head": "direct",
+      "heads": ["direct", "direct_no_edit", "twin"],
+      "batch_size": 512,
+      "learning_rate": 0.001,
+      "protein_learning_rate": 0.00001,
+      "weight_decay": 0.01,
+      "epochs": 10,
+      "loss": "huber",
+      "huber_delta": 1.0,
+      "early_stopping_patience": 2,
+      "grad_clip": 1.0,
+      "seed": 20261023,
+      "dataloader_workers": 0,
+      "device": "auto",
+      "eval_batch_size": 4096,
+      "smoke_rows": 20000,
+      "smoke_epochs": 2,
+      "finetune_overrides": {"batch_size": 64, "max_residues": 512},
+      "finetune_overrides_note": "CHƯA ĐO trên máy này — đây là phỏng đoán để tránh hết VRAM. GPU hiện có là RTX 3060 Laptop 6 GB; cấu hình finetune giữ ESM2 trong đồ thị nên bộ nhớ tỉ lệ với (số protein phân biệt trong batch × số acid amin). Nếu vẫn hết bộ nhớ thì giảm batch_size trước, rồi mới giảm max_residues.",
+      "note": "protein_learning_rate chỉ dùng ở cấu hình finetune: ESM2 đã pretrain nên học với learning rate nhỏ hơn phần đầu dự đoán hai bậc, tránh phá trọng số pretrain. loss = huber (ít nhạy với nhãn ngoại lai hơn MSE, mà dataset còn giữ nguyên giá trị nguồn bất khả thi và chỉ gắn cờ). early_stopping theo validation, KHÔNG dùng partition test. dataloader_workers = 0 vì Windows dùng spawn và cache fingerprint đã nằm trong RAM."
+    },
+    "metrics": {
+      "top_k": [1, 3, 10],
+      "min_candidates": 2,
+      "expand_both_directions": true,
+      "direction_tolerance": 0.0,
+      "measure_asymmetry": true,
+      "asymmetry_rows": 200000,
+      "baselines": ["zero", "endpoint_mean", "random"],
+      "slices": [
+        {"name": "all", "filters": {}},
+        {"name": "strict", "filters": {"unseen_pair": true}},
+        {"name": "multi_assay", "filters": {"min_n_assays": 2}},
+        {"name": "clean", "filters": {"plausible_range": true, "no_source_warning": true}}
+      ],
+      "asymmetry_note": "Đầu ra direct KHÔNG được cưỡng chế đối xứng (cưỡng chế sẽ làm thay đổi bản chất của ablation direct-vs-twin). Thay vào đó mức lệch được ĐO và ghi vào manifest: |f(A,B)+f(B,A)|/2 phải bằng 0 nếu mô hình đối xứng, và |f(A,A)| phải bằng 0 vì phép sửa không sửa gì. Cặp (A,A) không tồn tại trong dataset nên số đo thứ hai nói về ngoại suy, không nói về chất lượng khớp. asymmetry_rows là cỡ mẫu ngẫu nhiên có seed cố định; 0 nghĩa là dùng toàn bộ validation.",
+      "baselines_note": "Ba baseline tầm thường làm mốc dưới: zero luôn đoán Δp = 0; endpoint_mean đoán trung bình Δp của endpoint, ước lượng CHỈ trên train; random lấy mẫu có hoàn lại từ phân bố nhãn train với seed cố định (stage3.train.seed). zero và endpoint_mean cho dự đoán không đổi trong mỗi query nên tỉ lệ đúng chiều của chúng bằng 0 theo quy ước hòa-tính-sai, KHÔNG phải 50 %; phần so sánh được của hai cái đó là MAE/RMSE/R². random cho dự đoán liên tục và độc lập với dòng đang xét nên hầu như không có hòa, và tỉ lệ đúng chiều của nó là mốc 50 % thật để so; lấy mẫu từ phân bố nhãn train chứ không từ một phân bố tự chọn như N(0,1) để không thêm tham số tùy ý.",
+      "note": "Ranking CHỈ trong cùng một query = (phân tử tham chiếu, protein, endpoint). expand_both_directions = true: mỗi dòng (A, B, Δp) sinh hai hướng A->B (Δp) và B->A (−Δp), vì dataset lưu cặp theo chiều khóa A < B nên nếu chỉ nhóm theo smiles_a thì query bị cắt vụn theo thứ tự khóa chứ không theo hóa học. min_candidates = 2: query một ứng viên không xếp hạng được nên bị loại khỏi MẪU SỐ của ranking, vẫn tính regression. top_k chỉ tính trên query có ít nhất k ứng viên, và mẫu số được ghi riêng cho từng k. Mọi chỉ số ranking báo cáo CẢ macro (trung bình theo query) và micro (gộp mọi cặp ứng viên)."
     }
   }
 }

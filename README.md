@@ -26,6 +26,7 @@ hóa, schema đầy đủ, ví dụ lần theo từng dòng) nằm trong
 .
 ├── run_observations.py          # điểm vào Stage 1: --mode inspect | smoke | full | verify
 ├── run_dataset.py               # điểm vào Stage 2b: --mode smoke | full | split | export | verify
+├── run_evaluator.py             # điểm vào Stage 3: --mode prepare | smoke | train | eval
 ├── config.json                  # đường dẫn, tên cột, bảng đơn vị, kích thước lô
 ├── requirements.txt
 ├── src/molopt/observations/
@@ -39,6 +40,12 @@ hóa, schema đầy đủ, ví dụ lần theo từng dòng) nằm trong
 │   ├── delta.py                 # pair_id, chiều của cặp, Δp trong assay
 │   ├── split.py                 # split protein theo nhóm chuỗi, 80/10/10 theo số cặp
 │   └── pipeline.py              # I/O, song song hóa, báo cáo, năm chế độ chạy
+├── src/molopt/evaluator/        # Stage 3: evaluator dự đoán Δp của một cặp
+│   ├── data.py                  # đọc partition, lát cắt, mã hóa thành chỉ số, chia batch
+│   ├── features.py              # Morgan fingerprint, embedding ESM2, cache trên đĩa
+│   ├── models.py                # ligand encoder dùng chung, nhánh edit, đầu direct/twin
+│   ├── metrics.py               # regression + ranking trong từng query
+│   └── train.py                 # prepare, vòng train, đánh giá, checkpoint, manifest
 ├── tests/                       # unit test (pytest), không cần dữ liệu thật
 ├── scripts/
 │   ├── check_*.py, summarize_smoke.py   # script chẩn đoán chỉ đọc của Stage 1
@@ -48,12 +55,16 @@ hóa, schema đầy đủ, ví dụ lần theo từng dòng) nằm trong
 ├── docs/OBSERVATIONS_PIPELINE.md
 ├── docs/STAGE2A_DEDUP_AUDIT.md
 ├── docs/STAGE2B_DATASET.md
+├── docs/DATASET_REPORT.md       # báo cáo số liệu, các bước, kiểm chứng và tài liệu tham khảo
+├── docs/STAGE3_EVALUATOR.md     # Stage 3: kiến trúc v1, chỉ số, ba cấu hình, chỗ cần lưu ý
 │
 ├── raw/      (không có trong repo)  dữ liệu gốc tải về
 ├── work/     (không có trong repo)  ChEMBL SQLite đã giải nén
 ├── data/     (không có trong repo)  output Parquet: observations/ (Stage 1), dedup/ (Stage 2a),
 │                                   dataset/ (Stage 2b)
-└── runs/     (không có trong repo)  log và báo cáo: observations/, stage2a/, dataset/
+├── work/evaluator_cache/ (không có trong repo)  cache fingerprint và embedding của Stage 3
+└── runs/     (không có trong repo)  log và báo cáo: observations/, stage2a/, dataset/,
+                                    evaluator/ (Stage 3)
 ```
 
 Bốn thư mục `raw/`, `work/`, `data/` và `runs/` được loại khỏi repo bằng `.gitignore`,
@@ -224,6 +235,10 @@ nhóm MMseqs2 ở ngưỡng 50 % identity, và ba file xuất: evidence 10.546.3
 định: hai lần `smoke` độc lập cho 322/322 file dữ liệu trùng SHA-256. Số đo chi tiết ở
 `docs/STAGE2B_DATASET.md` mục 11.
 
+Cột thứ tư, `source_quality_warning`, mang nguyên văn cảnh báo chất lượng của chính
+ChEMBL và cũng không lọc dòng nào: 146.464 bản ghi evidence mang cảnh báo, và cột đã được
+audit độc lập với 0 lệch trên cả ba file. Xem `docs/STAGE2B_DATASET.md` mục 9.2.
+
 ```powershell
 python run_dataset.py --mode smoke     # ~1/200 số assay -> runs/dataset/smoke_<thời điểm>/
 python run_dataset.py --mode full      # toàn bộ -> data/dataset/full/   (thêm --force để ghi đè)
@@ -233,3 +248,51 @@ python run_dataset.py --mode verify    # kiểm tra -> runs/dataset/verify_<th�
 ```
 
 Tham số, quy tắc QC, giả định và những điểm chưa làm: [`docs/STAGE2B_DATASET.md`](docs/STAGE2B_DATASET.md).
+
+Báo cáo tổng hợp số liệu hiện có, các bước đã làm từ dữ liệu thô đến dataset,
+toàn bộ kiểm chứng đã chạy và tài liệu tham khảo cho từng ngưỡng:
+[`docs/DATASET_REPORT.md`](docs/DATASET_REPORT.md).
+
+## Stage 3: evaluator baseline
+
+Đã chạy: `pytest` (350 passed, 1 skipped), `--mode baseline` và `--mode prepare --skip-protein`.
+**Chưa train mô hình nào** — mọi chế độ cần torch vẫn chưa chạy.
+
+Evaluator nhận một cặp `(A, B, protein, endpoint)` và dự đoán
+Δp = p(B) − p(A). Phiên bản v1 cố tình dùng biểu diễn đơn giản nhất — Morgan fingerprint cho
+phân tử, chuỗi acid amin qua ESM2 cho protein, không 3D, không pocket — vì mục tiêu của v1 là
+ra được một thứ chạy được từ đầu đến cuối, không phải kiến trúc cuối.
+
+Ba cấu hình: `frozen` (ESM2 đóng băng, embedding tính sẵn), `finetune` (ESM2 train cùng) và
+`no_protein` (đối chứng, bỏ hẳn nhánh protein). Ba đầu dự đoán để ablation tách được hai yếu
+tố: `direct` (dự đoán thẳng Δp, có nhánh edit), `direct_no_edit` (như direct nhưng bỏ nhánh
+edit) và `twin` (chấm điểm từng phân tử rồi lấy hiệu).
+
+Mốc dưới đã đo được trên validation bằng `--mode baseline`: MAE của "luôn đoán 0" là
+**0,582** (0,528 trên lát cắt nhiều assay), còn đoán bừa cho **49,7 %** đúng chiều và top-1
+**0,23** — mọi mô hình phải vượt rõ các số này mới gọi là học được gì. Ba baseline: `zero` và
+`endpoint_mean` làm mốc cho MAE/RMSE/R², `random` (lấy mẫu từ phân bố nhãn train, seed cố
+định) làm mốc 50 % cho xếp hạng. Chi tiết và cách đọc: `docs/STAGE3_EVALUATOR.md` mục 4.5.
+
+Chỉ số xếp hạng **chỉ tính trong cùng một query** `(phân tử tham chiếu, protein, endpoint)`,
+không bao giờ gộp ứng viên của các query khác nhau vào một bảng. Mọi mẫu số được in riêng.
+Partition `test` bị chặn ở mức code: `evaluator/data.py` ném `ValueError` nếu bị yêu cầu đọc.
+
+```powershell
+python run_evaluator.py --mode baseline                        # ba mốc dưới (không cần torch)
+python run_evaluator.py --mode prepare --skip-protein          # cache fingerprint (không cần torch)
+python run_evaluator.py --mode smoke --config no_protein       # thử pipeline trên CPU
+python run_evaluator.py --mode prepare                         # cache embedding; in chiều thật của ESM2
+python run_evaluator.py --mode train --config frozen --head direct
+python run_evaluator.py --mode eval --checkpoint runs\evaluator\<tên>.pt
+```
+
+`torch` và `transformers` đã có trong `requirements.txt` nhưng **không pin phiên bản**, vì bản
+torch đúng phụ thuộc CUDA của máy; cả hai cũng **chưa được cài** ở đây, nên chiều embedding
+thật của ESM2 chưa đo được — code đọc chiều đó từ chính model lúc `--mode prepare` chứ không
+hardcode. Hai chế độ `baseline` và `prepare --skip-protein` không cần torch và đã chạy xong;
+cache fingerprint hiện có trong `work/evaluator_cache/` (958.926 phân tử, 70.455 nhóm thế,
+0 SMILES không đọc được).
+
+Kiến trúc, bốn quyết định về chỉ số, ước lượng tài nguyên và danh sách chỗ đáng lưu ý nhưng
+chưa sửa: [`docs/STAGE3_EVALUATOR.md`](docs/STAGE3_EVALUATOR.md).

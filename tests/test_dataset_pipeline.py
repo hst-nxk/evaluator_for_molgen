@@ -334,6 +334,8 @@ def record_table(rows: list[dict[str, Any]]) -> pa.Table:
         "plausible_range": pa.array([row.get("plausible_range", True) for row in rows],
                                     pa.bool_()),
         "short_protein": pa.array([row.get("short_protein", False) for row in rows], pa.bool_()),
+        "source_quality_warning": pa.array(
+            [row.get("source_quality_warning") for row in rows], pa.string()),
     })
 
 
@@ -439,6 +441,87 @@ def test_value_bounds_refuses_a_record_without_any_assay_delta(tmp_path: Path) -
     path = write_deltas(tmp_path / "b00.parquet", [("p1", 6.0, 7.0)])
     with pytest.raises(ValueError, match="pair_id"):
         pipeline.value_bounds(path, pa.array(["p9"]))
+
+
+# ------------------------------------------------------------------- cảnh báo chất lượng nguồn
+
+
+def write_warning_deltas(path: Path, rows: list[tuple[str, list[str], list[str]]]) -> Path:
+    table = pa.table({
+        "pair_id": pa.array([r[0] for r in rows], pa.string()),
+        "observation_ids_a": pa.array([r[1] for r in rows], pa.list_(pa.string())),
+        "observation_ids_b": pa.array([r[2] for r in rows], pa.list_(pa.string())),
+    })
+    pq.write_table(table, path)
+    return path
+
+
+def test_warning_column_gathers_both_sides_without_repeating_a_value(tmp_path: Path) -> None:
+    path = write_warning_deltas(tmp_path / "b00.parquet",
+                                [("p1", ["o1"], ["o2"]), ("p1", ["o3"], ["o9"]),
+                                 ("p2", ["o9"], ["o9"])])
+    comments = {"o1": "Outside typical range", "o2": "Potential author error",
+                "o3": "Outside typical range"}
+    column = pipeline.warning_column(path, pa.array(["p1", "p2"]), comments, "; ")
+    # 'Outside typical range' có ở cả hai dòng của p1 nhưng chỉ được kể một lần, và thứ tự
+    # đã sắp xếp nên giá trị không phụ thuộc thứ tự dòng.
+    assert column.to_pylist() == ["Outside typical range; Potential author error", None]
+
+
+def test_warning_column_is_null_when_no_measurement_carries_a_warning(tmp_path: Path) -> None:
+    path = write_warning_deltas(tmp_path / "b00.parquet", [("p1", ["o1"], ["o2"])])
+    column = pipeline.warning_column(path, pa.array(["p1"]), {"o7": "Potential author error"},
+                                     "; ")
+    assert column.to_pylist() == [None]
+
+
+def test_warning_column_skips_reading_when_the_source_has_no_warning(tmp_path: Path) -> None:
+    missing = tmp_path / "khong-ton-tai.parquet"
+    assert pipeline.warning_column(missing, pa.array(["p1", "p2"]), {}, "; ").to_pylist() == [
+        None, None]
+
+
+def test_observation_hits_returns_nothing_when_no_id_matches() -> None:
+    column = pa.chunked_array([pa.array([["o1"], ["o2"]], pa.list_(pa.string()))])
+    rows, which = pipeline.observation_hits(column, pa.array(["o9"], pa.string()))
+    assert rows.tolist() == [] and which.tolist() == []
+
+
+def test_observation_hits_maps_each_hit_to_its_row() -> None:
+    column = pa.chunked_array([pa.array([["o1", "o2"], [], ["o3"]], pa.list_(pa.string()))])
+    rows, which = pipeline.observation_hits(column, pa.array(["o3", "o1"], pa.string()))
+    assert rows.tolist() == [0, 2] and which.tolist() == [1, 0]
+
+
+def test_observation_hits_refuses_a_null_list() -> None:
+    column = pa.chunked_array([pa.array([["o1"], None], pa.list_(pa.string()))])
+    with pytest.raises(ValueError, match="null"):
+        pipeline.observation_hits(column, pa.array(["o1"], pa.string()))
+
+
+def test_source_quality_comments_keeps_only_rows_whose_key_has_a_value(
+        tmp_path: Path, config: dict[str, Any]) -> None:
+    names = config["stage2b"]["columns"]
+    table = pa.table({
+        names["observation_id"]: pa.array(["o1", "o2", "o3", "o4"], pa.string()),
+        names["activity_context"]: pa.array([
+            '{"data_validity_comment": "Outside typical range"}',
+            '{"data_validity_comment": null}',
+            '{"potential_duplicate": 0}',
+            '{"data_validity_comment": "Potential author error"}',
+        ], pa.string()),
+    })
+    pq.write_table(table, tmp_path / "src.parquet")
+    local = {"stage2b": dict(config["stage2b"], inputs={"chembl": "src.parquet"})}
+    found = pipeline.source_quality_comments(local, tmp_path, config["stage2b"]["export"])
+    assert found == {"o1": "Outside typical range", "o4": "Potential author error"}
+
+
+def test_generator_rows_carry_the_source_quality_warning() -> None:
+    rows = record_table([{"delta_p_mean": 1.0,
+                          "source_quality_warning": "Outside typical range"}])
+    table = pipeline.oriented_generator_rows(rows, 0.3)
+    assert table.column("source_quality_warning").to_pylist() == ["Outside typical range"]
 
 
 # --------------------------------------------------------------------------- split trong export

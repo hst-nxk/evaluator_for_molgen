@@ -1,10 +1,14 @@
 # Stage 2b: Observations → dataset cặp MMP có Δp
 
 Trạng thái ngày 22/10/2026: **đã chạy hết năm chế độ (`smoke`, `full`, `split`,
-`export`, `verify`); verify 7/7 PASS; 270 unit test pass.** Dataset cuối: 10.546.330 bản
+`export`, `verify`); verify 7/7 PASS; 278 unit test pass.** Dataset cuối: 10.546.330 bản
 ghi cặp MMP có Δp, split protein 80/10/10 theo số cặp, ba file xuất trong `data/dataset/`
 kèm ba cờ mô tả (mục 9.1). Pipeline đã chứng minh tính xác định (hai lần smoke trùng
 SHA-256 từng byte). Mọi số đo thật ở mục 11.
+
+Cập nhật cùng ngày: thêm cột `source_quality_warning` (mục 9.2) và chạy lại `--mode
+export`; 278 unit test pass, số dòng ba file không đổi, cột mới đã được audit độc lập với
+0 lệch.
 
 ## 1. Mục tiêu và phạm vi
 
@@ -455,6 +459,70 @@ nên nhóm của chúng không đáng tin bằng nhóm của protein đầy đ�
 
 Tập đánh giá nghiêm ngặt cho bài báo vì thế là 817.391 dòng test và 894.182 dòng
 validation — protein mới **và** cặp phân tử chưa từng thấy trong train.
+
+### 9.2 Cột `source_quality_warning` (thêm ngày 22/10/2026, không lọc dòng nào)
+
+Ngoài ba cờ bool trên, cả ba file xuất có thêm **một cột chuỗi**:
+`source_quality_warning` — cảnh báo chất lượng do **chính nguồn** gắn, lấy nguyên văn.
+
+| | |
+|---|---|
+| Nguồn giá trị | `data_validity_comment` trong `activity_context` của ChEMBL |
+| Giá trị thật trong ChEMBL 37 | `Outside typical range`, `Potential transcription error`, `Potential missing data`, `Manually validated`, `Potential author error` |
+| BindingDB 202610 | không có cột tương đương, nên bản ghi chỉ từ BindingDB luôn null |
+| Null nghĩa là | **không có cảnh báo**, hoặc nguồn không có cột tương đương — không phải "chưa biết" |
+| Nhiều cảnh báo trên một bản ghi | gom cảnh báo của mọi phép đo đóng góp, bỏ trùng, sắp xếp, nối bằng `export.source_quality_separator` (`"; "`) |
+| Lọc dòng | **không**, như ba cờ kia |
+
+**Vì sao cần.** ChEMBL tự đánh dấu dòng đáng nghi, và 51.945 dòng mang cảnh báo đã vào
+dataset (48.258 `Outside typical range`, 3.633 `Potential transcription error`,
+54 `Potential author error`, cộng 372 dòng `Manually validated` là dấu hiệu tốt chứ không
+phải cảnh báo). Quan trọng hơn: **toàn bộ 5.073 dòng ChEMBL có pActivity ngoài khoảng
+[2; 12] đều nằm trong số dòng đã bị ChEMBL gắn cảnh báo** — không một dòng nào thuộc nhóm
+"không cảnh báo" (đo ngày 22/10/2026). Vậy cờ `plausible_range` của dự án và cột curation
+của ChEMBL là hai dấu hiệu độc lập chỉ về cùng một tập dòng. Giữ nguyên văn đánh giá của
+nguồn để người đọc tự quyết, và để trả lời được câu hỏi "ChEMBL có cờ chất lượng, sao
+không dùng?".
+
+**Cách tính.** Cảnh báo nằm trong `activity_context`, mà các file trung gian của bước 1–4
+không mang cột đó, nên bước 5 đọc lại hai file nguồn một lượt — không phải chạy lại
+`--mode full`. Chỉ parse JSON ở dòng mà `export.source_quality_regex` đã thấy khóa có giá
+trị chuỗi (`null` không khớp), đúng cách làm của `independent_flags`, nên không phải đọc
+JSON của 8,6 triệu dòng. Nối bản ghi với phép đo qua `observation_ids_a` và
+`observation_ids_b` của file Δp assay; việc tra được làm theo offset của cột danh sách
+thay vì vòng lặp Python.
+
+`export_manifest.json` ghi thêm khối `source_quality_warning` gồm số observation có cảnh
+báo, số bản ghi mang cảnh báo, và số bản ghi theo từng giá trị; `--mode export` in cùng
+bảng đó.
+
+Đo được ở lần export 22/10/2026 (237.660 observation có cảnh báo — ChEMBL 237.660,
+BindingDB 0; đúng bằng tổng đếm trực tiếp từ ChEMBL SQLite):
+
+| giá trị | evidence | evaluator | generator |
+|---|---|---|---|
+| `Outside typical range` | 118.357 | 115.449 | 78.978 |
+| `Potential transcription error` | 15.630 | 14.507 | 7.857 |
+| `Outside typical range; Potential transcription error` | 10.063 | 9.965 | 5.737 |
+| `Manually validated` | 2.074 | 2.070 | 1.331 |
+| `Potential author error` | 291 | 291 | 220 |
+| `Manually validated; Outside typical range` | 49 | 49 | 19 |
+| **tổng** | **146.464** (1,39 %) | **142.331** | **94.142** |
+
+`Potential missing data` có 553 observation trong ChEMBL nhưng 0 bản ghi: không dòng nào
+trong số đó qua được bộ lọc của mục 2.
+
+**Audit cột này (22/10/2026).** Dựng lại bằng đường đi độc lập — parse JSON mọi dòng thay
+vì chọn trước bằng regex, và gom bằng vòng lặp Python thay vì theo offset — rồi so từng
+dòng với cả ba file: số bản ghi mang cảnh báo khớp tuyệt đối (146.464 / 142.331 / 94.142),
+**0 dòng null mà đáng ra phải có cảnh báo, 0 dòng có cảnh báo mà không được phép, 0 giá
+trị sai.**
+
+Đối chiếu chéo với `plausible_range`: trong 15.031 bản ghi `plausible_range = False`,
+11.928 (79,4 %) mang cảnh báo của nguồn; 3.103 (20,6 %) không mang, và toàn bộ 3.113 phép
+đo ngoài khoảng của chúng **đến từ BindingDB, 0 từ ChEMBL**. Hai dấu hiệu vì thế không mâu
+thuẫn: giá trị ChEMBL bất khả thi thì luôn đã bị ChEMBL gắn cảnh báo, phần còn lại là giá
+trị BindingDB mà nguồn đó không có cột chất lượng để gắn.
 
 ## 10. Output
 

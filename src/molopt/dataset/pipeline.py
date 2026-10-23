@@ -987,12 +987,14 @@ def split_lines(manifest: Mapping[str, Any]) -> list[str]:
 
 
 FLAG_COLUMNS = ["unseen_pair", "plausible_range", "short_protein"]
+# Cột cảnh báo của nguồn: chuỗi nguyên văn, không phải cờ bool, nên đếm riêng FLAG_COLUMNS.
+WARNING_COLUMN = "source_quality_warning"
 EVALUATOR_COLUMNS = ["pair_id", "endpoint", "protein_hash", "partition", "smiles_a", "smiles_b",
                      "constant_smiles", "variable_a", "variable_b", "delta_p_mean", "n_assays",
-                     "qc_status", *FLAG_COLUMNS]
+                     "qc_status", *FLAG_COLUMNS, WARNING_COLUMN]
 GENERATOR_COLUMNS = ["pair_id", "endpoint", "protein_hash", "partition", "smiles_weak",
                      "smiles_strong", "constant_smiles", "variable_weak", "variable_strong",
-                     "gain", "n_assays", "qc_status", *FLAG_COLUMNS]
+                     "gain", "n_assays", "qc_status", *FLAG_COLUMNS, WARNING_COLUMN]
 PAIR_CODE_SHIFT = 31
 
 
@@ -1077,6 +1079,100 @@ def value_bounds(path: Path, pair_ids: pa.Array) -> tuple[np.ndarray, np.ndarray
             np.asarray(hi.to_numpy(zero_copy_only=False), dtype=np.float64))
 
 
+def source_quality_comments(config: Mapping[str, Any], root: Path,
+                            settings: Mapping[str, Any]) -> dict[str, str]:
+    """observation_id -> cảnh báo chất lượng nguyên văn của nguồn; chỉ dòng CÓ cảnh báo.
+
+    Nhận: config, thư mục gốc, khối stage2b.export.
+    Trả về: từ điển chỉ chứa những observation có cảnh báo, nên nhỏ (ChEMBL 37: khoảng
+    237 nghìn dòng trên 5,3 triệu).
+    Vì sao đọc lại file nguồn ở bước 5: cảnh báo nằm trong activity_context, mà các file
+    trung gian của bước 1-4 không mang cột đó. Đọc lại ở đây để không phải chạy lại
+    toàn bộ pipeline.
+    Chỉ parse JSON ở dòng mà regex đã thấy khóa có giá trị chuỗi (null không khớp), theo
+    đúng cách làm của independent_flags. Nguồn không có cột tương đương (BindingDB) thì
+    không dòng nào khớp, nên không cần xử lý riêng.
+    """
+    stage = config["stage2b"]
+    names = stage["columns"]
+    key = settings["source_quality_key"]
+    pattern = settings["source_quality_regex"]
+    comments: dict[str, str] = {}
+    for source, relative_path in stage["inputs"].items():
+        path = root / relative_path
+        handle = pq.ParquetFile(path)
+        found = 0
+        for batch in handle.iter_batches(
+                batch_size=stage["run"]["batch_rows"],
+                columns=[names["observation_id"], names["activity_context"]]):
+            contexts = batch.column(names["activity_context"])
+            candidates = pc.fill_null(pc.match_substring_regex(contexts, pattern=pattern), False)
+            positions = np.flatnonzero(
+                np.asarray(candidates.to_numpy(zero_copy_only=False), dtype=bool))
+            if not positions.size:
+                continue
+            take = pa.array(positions, type=pa.int64())
+            texts = pc.take(contexts, take).to_pylist()
+            ids = pc.take(batch.column(names["observation_id"]), take).to_pylist()
+            for text, observation_id in zip(texts, ids):
+                value = parse_context(text, observation_id).get(key)
+                if value is None or not str(value).strip():
+                    continue
+                comments[observation_id] = str(value).strip()
+                found += 1
+        LOGGER.info("cảnh báo chất lượng của %s: %s dòng", source, fmt_int(found))
+    return comments
+
+
+def observation_hits(column: pa.ChunkedArray, warned: pa.Array) -> tuple[np.ndarray, np.ndarray]:
+    """(chỉ số dòng, chỉ số trong `warned`) của các observation_id có cảnh báo.
+
+    Nhận: cột danh sách observation_id của bảng Δp assay; mảng observation_id có cảnh báo.
+    Trả về: hai mảng cùng độ dài; rỗng nếu không dòng nào có cảnh báo.
+    Làm theo offset thay vì vòng lặp Python vì mỗi bucket có hàng trăm nghìn dòng.
+    """
+    listed = column.combine_chunks()
+    if listed.null_count:
+        raise ValueError("cột observation_ids có giá trị null")
+    offsets = np.asarray(listed.offsets.to_numpy(zero_copy_only=False), dtype=np.int64)
+    owner = np.repeat(np.arange(offsets.size - 1, dtype=np.int64), np.diff(offsets))
+    position = pc.index_in(listed.flatten(), value_set=warned)
+    found = np.asarray(pc.is_valid(position).to_numpy(zero_copy_only=False), dtype=bool)
+    if not found.any():
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    hits = pc.filter(position, pa.array(found, pa.bool_()))
+    return owner[found], np.asarray(hits.to_numpy(zero_copy_only=False), dtype=np.int64)
+
+
+def warning_column(path: Path, pair_ids: pa.Array, comments: Mapping[str, str],
+                   separator: str) -> pa.Array:
+    """Cảnh báo chất lượng của nguồn cho từng bản ghi, nguyên văn.
+
+    Nhận: file Δp assay của đúng (endpoint, bucket) đó; pair_id của các bản ghi, đúng thứ
+    tự; từ điển observation_id -> cảnh báo; dấu nối.
+    Trả về: mảng chuỗi, null ở bản ghi không có phép đo nào mang cảnh báo.
+    Một bản ghi gộp nhiều assay nên gom cảnh báo của MỌI phép đo đóng góp, bỏ trùng, sắp
+    xếp rồi nối — để giá trị không phụ thuộc thứ tự dòng.
+    """
+    if not comments:
+        return pa.nulls(len(pair_ids), pa.string())
+    deltas = pq.read_table(path, columns=["pair_id", "observation_ids_a", "observation_ids_b"])
+    warned = pa.array(list(comments), pa.string())
+    texts = list(comments.values())
+    found: dict[str, set[str]] = {}
+    for name in ("observation_ids_a", "observation_ids_b"):
+        rows, which = observation_hits(deltas.column(name), warned)
+        if not rows.size:
+            continue
+        keys = pc.take(deltas.column("pair_id"), pa.array(rows, pa.int64())).to_pylist()
+        for key, index in zip(keys, which):
+            found.setdefault(key, set()).add(texts[index])
+    if not found:
+        return pa.nulls(len(pair_ids), pa.string())
+    joined = {key: separator.join(sorted(values)) for key, values in found.items()}
+    return pa.array([joined.get(key) for key in pair_ids.to_pylist()], pa.string())
+
+
 def partition_column(records: pa.Table, assignment: pa.Table) -> pa.Array:
     """Partition của từng bản ghi, tra theo protein; protein thiếu trong split là lỗi."""
     keys = assignment.column("protein_sequence_hash").combine_chunks()
@@ -1115,6 +1211,7 @@ def oriented_generator_rows(records: pa.Table, min_gain: float) -> pa.Table:
         "gain": pc.abs(subset.column("delta_p_mean")),
         "n_assays": subset.column("n_assays"), "qc_status": subset.column("qc_status"),
         **{flag: subset.column(flag) for flag in FLAG_COLUMNS},
+        WARNING_COLUMN: subset.column(WARNING_COLUMN),
     }
     return pa.table(columns).select(GENERATOR_COLUMNS)
 
@@ -1141,12 +1238,15 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
                              columns=["protein_hash", "sequence_length"])
     lengths = dict(zip(proteins.column("protein_hash").to_pylist(),
                        proteins.column("sequence_length").to_pylist()))
+    separator = settings["export"]["source_quality_separator"]
     endpoints = list(config["endpoints"])
+    comments = source_quality_comments(config, root, settings["export"])
     codes, train_codes = train_pair_codes(full, endpoints, assignment)
     started = time.perf_counter()
 
     writers: dict[str, pq.ParquetWriter] = {}
     counts: Counter = Counter()
+    warning_counts: Counter = Counter()
     per_partition: dict[str, Counter] = {}
     try:
         for endpoint in endpoints:
@@ -1163,8 +1263,13 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
                 records = records.append_column("short_protein", pa.array(
                     [lengths[h] < min_length
                      for h in records.column("protein_hash").to_pylist()], pa.bool_()))
+                records = records.append_column(WARNING_COLUMN, warning_column(
+                    deltas, records.column("pair_id"), comments, separator))
                 for flag in FLAG_COLUMNS:
                     counts[f"{flag}_true"] += int(pc.sum(records.column(flag)).as_py() or 0)
+                warning_counts.update(
+                    value for value in records.column(WARNING_COLUMN).to_pylist()
+                    if value is not None)
                 evidence = records
                 training = records.filter(pc.is_in(records.column("qc_status"),
                                                    value_set=pa.array(eligible, pa.string())))
@@ -1194,10 +1299,17 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
         "parameters": settings["export"],
         "rows": dict(counts),
         "flags": {flag: counts[f"{flag}_true"] for flag in FLAG_COLUMNS},
+        "source_quality_warning": {
+            "observations_with_warning": len(comments),
+            "records_with_warning": sum(warning_counts.values()),
+            "by_value": dict(sorted(warning_counts.items(), key=lambda item: -item[1])),
+        },
         "flag_note": ("Cờ chỉ mô tả, không lọc gì. unseen_pair: cặp (A, B) không xuất hiện "
                       "trong partition train (dòng train luôn False). plausible_range: mọi "
                       f"phép đo đóng góp có pActivity trong [{low}, {high}]. short_protein: "
-                      f"chuỗi protein ngắn hơn {min_length} acid amin."),
+                      f"chuỗi protein ngắn hơn {min_length} acid amin. {WARNING_COLUMN}: "
+                      "cảnh báo chất lượng do chính nguồn gắn, nguyên văn, null nghĩa là "
+                      "không có cảnh báo hoặc nguồn không có cột tương đương."),
         "evaluator_by_partition": {partition: dict(endpoints)
                                    for partition, endpoints in sorted(per_partition.items())},
         "seconds": round(time.perf_counter() - started, 1),
@@ -1208,9 +1320,17 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     flags = [[flag, fmt_int(counts[f"{flag}_true"]),
               fmt_pct(counts[f"{flag}_true"], counts["evidence_records"])]
              for flag in FLAG_COLUMNS]
+    warned_rows = sum(warning_counts.values())
+    by_count = sorted(warning_counts.items(), key=lambda item: -item[1])
+    warning_table = [[value, fmt_int(number), fmt_pct(number, counts["evidence_records"])]
+                     for value, number in by_count]
     log_lines(["Bước 5 — xuất dataset:", *format_table(["file", "dòng"], rows), "",
                "Cờ mô tả trên evidence (không lọc gì):",
-               *format_table(["cờ", "số dòng True", "tỷ lệ"], flags)])
+               *format_table(["cờ", "số dòng True", "tỷ lệ"], flags), "",
+               f"{WARNING_COLUMN} — cảnh báo của chính nguồn, nguyên văn, không lọc gì "
+               f"({fmt_int(len(comments))} observation có cảnh báo, "
+               f"{fmt_int(warned_rows)} bản ghi mang cảnh báo):",
+               *format_table(["giá trị", "số bản ghi", "tỷ lệ"], warning_table)])
     LOGGER.info("manifest: %s", path)
     return manifest
 
