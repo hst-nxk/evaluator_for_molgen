@@ -35,6 +35,7 @@ from . import data, features, metrics
 
 LOGGER = logging.getLogger(__name__)
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+BYTES_PER_MIB = 1024 * 1024
 
 
 # --------------------------------------------------------------------------- tiện ích
@@ -49,6 +50,38 @@ def resolve_device(setting: str) -> str:
     if setting == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("config yêu cầu cuda nhưng torch không thấy GPU")
     return setting
+
+
+def limit_gpu_memory(settings: Mapping[str, Any], device: str) -> float | None:
+    """Chặn trên bộ nhớ GPU mà PyTorch được cấp phát cho tiến trình này.
+
+    Nhận: stage3.train (đọc khóa gpu_memory_limit_mib; None hoặc thiếu = không chặn);
+    thiết bị thực dùng.
+    Trả về: tỉ lệ bộ nhớ đã đặt cho GPU số 0, hoặc None nếu không chặn.
+    Vượt mức thì PyTorch báo hết bộ nhớ (OutOfMemoryError) thay vì lấn thêm VRAM. Mức này
+    không gồm CUDA context của tiến trình (vài trăm MiB, nằm ngoài bộ cấp phát của
+    PyTorch), nên nvidia-smi sẽ thấy cao hơn một chút.
+    """
+    limit = settings.get("gpu_memory_limit_mib")
+    if limit is None or not device.startswith("cuda"):
+        return None
+    import torch
+
+    total = torch.cuda.get_device_properties(0).total_memory
+    fraction = min(1.0, int(limit) * BYTES_PER_MIB / total)
+    torch.cuda.set_per_process_memory_fraction(fraction, 0)
+    LOGGER.info("giới hạn VRAM: %s MiB / %s MiB của GPU (tỉ lệ %.3f)", int(limit),
+                total // BYTES_PER_MIB, fraction)
+    return fraction
+
+
+def peak_gpu_memory_mib(device: str) -> float | None:
+    """VRAM cao nhất PyTorch đã giữ trong tiến trình này (MiB); None nếu không dùng GPU."""
+    if not device.startswith("cuda"):
+        return None
+    import torch
+
+    return round(torch.cuda.max_memory_reserved() / BYTES_PER_MIB, 1)
 
 
 def set_seeds(seed: int) -> None:
@@ -675,6 +708,7 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
     settings = config["stage3"]["train"]
     protein_mode = models.protein_mode_for(configuration)
     device = resolve_device(settings["device"])
+    limit_gpu_memory(settings, device)
     set_seeds(int(settings["seed"]))
     _, runs_dir = layout(config, root)
     limit = int(settings["smoke_rows"]) if smoke else None
@@ -793,7 +827,9 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "checkpoint": str(checkpoint_path) if best_epoch >= 0 else None,
         "history": history, "validation_metrics": final, "asymmetry": asymmetry,
         "seconds": round(time.perf_counter() - started, 1),
+        "gpu_peak_reserved_mib": peak_gpu_memory_mib(device),
     }
+    LOGGER.info("VRAM cao nhất PyTorch đã giữ: %s MiB", manifest["gpu_peak_reserved_mib"])
     path = runs_dir / f"{manifest['mode']}_{configuration}_{head}_{stamp}.json"
     path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     LOGGER.info("manifest lần chạy: %s", path)
@@ -812,6 +848,7 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
 
     settings = config["stage3"]["train"]
     device = resolve_device(settings["device"])
+    limit_gpu_memory(settings, device)
     state = torch.load(checkpoint, map_location=device, weights_only=False)
     configuration = str(state["configuration"])
     protein_mode = str(state["protein_mode"])

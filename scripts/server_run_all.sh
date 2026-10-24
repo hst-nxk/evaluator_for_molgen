@@ -14,7 +14,10 @@
 #     HOME, cache Hugging Face/torch/triton/CUDA và file tạm đều chuyển vào .cache/.
 #   - Chỉ dùng conda env ENV_NAME; sai env thì dừng ngay.
 #   - Chỉ dùng 1 GPU: GPU còn trống nhiều bộ nhớ nhất lúc bắt đầu.
+#   - VRAM bị chặn trên bởi stage3.train.gpu_memory_limit_mib trong config.json (9 GiB).
 #   - Không dùng partition test: code Stage 3 chỉ đọc train và validation.
+#   - Không chạy finetune: theo ước tính (chưa đo) nó cần quá trần VRAM ở batch hiện tại;
+#     cần đo riêng trước khi đưa vào.
 #
 # Thứ tự: kiểm tra môi trường -> pytest -> baseline -> smoke -> train. Kiểm tra môi trường
 # hoặc pytest lỗi thì dừng hẳn. Từ baseline trở đi, một bước lỗi chỉ được ghi lại, các bước
@@ -26,17 +29,16 @@ PROJECT_ROOT="/mnt/disk4/khainx/evaluator_for_molgen"
 CONDA_START_DIR="/mnt/disk4/khainx"
 ENV_NAME="nxk"
 LOG_NAME="server_run_all"
-# Ngưỡng an toàn, không phải số đo: laptop 6 GB đã chạy được smoke trên GPU.
-MIN_FREE_GPU_MIB=6144
+# GPU phải còn trống ít nhất bằng trần VRAM (9 GiB) cộng phần dự phòng cho CUDA context.
+MIN_FREE_GPU_MIB=10240
 SECONDS_PER_MINUTE=60
 SMOKE_CONFIGS=("no_protein" "frozen")
-# Thứ tự train theo docs/STAGE3_EVALUATOR.md; finetune để cuối vì chưa từng chạy thật.
+# Thứ tự train theo docs/STAGE3_EVALUATOR.md, chưa gồm finetune.
 TRAIN_RUNS=(
     "frozen direct"
     "no_protein direct"
     "frozen direct_no_edit"
     "frozen twin"
-    "finetune direct"
 )
 
 # --- 1. Chốt thư mục: script phải nằm đúng trong PROJECT_ROOT -----------------------------
@@ -180,19 +182,6 @@ if not torch.cuda.is_available():
 print("GPU:", torch.cuda.get_device_name(0))
 PY
 
-esm_ready=1
-run_step "tải ESM2 vào .cache/huggingface (cần cho finetune)" python - <<'PY' || esm_ready=0
-import json
-
-from transformers import AutoTokenizer, EsmModel
-
-with open("config.json", encoding="utf-8") as handle:
-    name = json.load(handle)["stage3"]["protein_encoder"]["model"]
-AutoTokenizer.from_pretrained(name)
-EsmModel.from_pretrained(name)
-print("đã nạp", name)
-PY
-
 if ! run_step "pytest" python -m pytest -q; then
     print_summary
     fail "pytest lỗi, không train"
@@ -214,10 +203,6 @@ for entry in "${TRAIN_RUNS[@]}"; do
     if [[ " ${SMOKE_CONFIGS[*]} " == *" $configuration "* && -z "${smoke_ok[$configuration]:-}" ]]
     then
         summary+=("$label: BỎ QUA (smoke $configuration lỗi)")
-        continue
-    fi
-    if [[ "$configuration" == "finetune" && "$esm_ready" -eq 0 ]]; then
-        summary+=("$label: BỎ QUA (không tải được ESM2)")
         continue
     fi
     run_step "$label" \

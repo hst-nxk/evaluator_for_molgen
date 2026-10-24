@@ -119,3 +119,14 @@ def test_baseline_random_refuses_a_missing_pool() -> None:
     with pytest.raises(ValueError, match="phân bố nhãn train"):
         train.baseline_prediction("random", np.array([0]), np.zeros(ENDPOINTS))
 
+
+
+def test_limit_gpu_memory_is_a_no_op_without_a_limit_or_without_gpu() -> None:
+    # Thiếu khóa, khóa null, hay chạy trên CPU thì không đặt trần (và không cần torch).
+    assert train.limit_gpu_memory({}, "cuda") is None
+    assert train.limit_gpu_memory({"gpu_memory_limit_mib": None}, "cuda") is None
+    assert train.limit_gpu_memory({"gpu_memory_limit_mib": 9216}, "cpu") is None
+
+
+def test_peak_gpu_memory_is_none_on_cpu() -> None:
+    assert train.peak_gpu_memory_mib("cpu") is None

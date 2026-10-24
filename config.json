@@ -459,6 +459,8 @@
       "seed": 20261023,
       "dataloader_workers": 0,
       "device": "auto",
+      "gpu_memory_limit_mib": 9216,
+      "gpu_memory_limit_note": "Trần VRAM cho PyTorch trong mỗi lần train/eval (train.limit_gpu_memory, dùng torch.cuda.set_per_process_memory_fraction): vượt trần thì báo hết bộ nhớ chứ không lấn thêm. Đặt 9216 MiB = 9 GiB để tổng VRAM của tiến trình (cộng CUDA context vài trăm MiB, chưa đo) nằm trong 8-10 GB khi chạy chung GPU RTX 4090 24 GB trên server. GPU nhỏ hơn mức này thì trần không có tác dụng (tỉ lệ bị chặn ở 1). null = không chặn. VRAM thực dùng được ghi vào manifest (gpu_peak_reserved_mib).",
       "eval_batch_size": 4096,
       "smoke_rows": 20000,
       "smoke_epochs": 2,
