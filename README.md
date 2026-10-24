@@ -1,6 +1,29 @@
-# MOLOPT: Raw → Observations
+# MOLOPT: dataset Δp theo cặp MMP và evaluator
 
-## Mục tiêu
+## Đọc theo thứ tự nào
+
+| # | Muốn biết | Đọc | Thời gian |
+|---|---|---|---|
+| 1 | Toàn cảnh: dữ liệu từ đâu, qua những bước nào, kiểm chứng ra sao | [`docs/DATASET_REPORT.md`](docs/DATASET_REPORT.md), mục 1–9 | 20 phút |
+| 2 | **Ngưỡng nào, vì sao, dựa trên tài liệu nào** | [`docs/DATASET_REPORT.md`](docs/DATASET_REPORT.md), mục 10 (bảng ngưỡng) và mục 12 (11 tài liệu tham khảo có DOI); hạn chế đã biết ở mục 11 | 15 phút |
+| 3 | Audit ngày 24/10/2026: tìm ra gì, sửa gì | [`docs/AUDIT_20261024.md`](docs/AUDIT_20261024.md), mục 0 (tóm tắt) và mục 6 (quyết định) | 10 phút |
+| 4 | **Dataset hiện dùng (v2)**: thay đổi so với v1 và số đo thật | [`docs/STAGE2B_DATASET.md`](docs/STAGE2B_DATASET.md), mục 0 (bảng v1/v2 ở 0.4) | 10 phút |
+| 5 | **Kiến trúc evaluator dự kiến** | [`docs/STAGE3_EVALUATOR.md`](docs/STAGE3_EVALUATOR.md), mục 1–6 (phạm vi, đầu vào, kiến trúc, chỉ số, ba cấu hình, ablation ba đầu ra) | 20 phút |
+
+Chi tiết kỹ thuật của từng giai đoạn, khi cần tra:
+- Stage 1, Raw → Observations: [`docs/OBSERVATIONS_PIPELINE.md`](docs/OBSERVATIONS_PIPELINE.md)
+- Stage 2a, gộp trùng giữa hai nguồn và đo nhiễu: [`docs/STAGE2A_DEDUP_AUDIT.md`](docs/STAGE2A_DEDUP_AUDIT.md)
+- Stage 2b, cặp MMP và Δp: [`docs/STAGE2B_DATASET.md`](docs/STAGE2B_DATASET.md)
+- Mọi tham số đều nằm trong `config.json`, mỗi khối có trường `note` ghi lý do.
+
+**Lưu ý phiên bản.** `DATASET_REPORT.md` từ mục 1 trở đi mô tả dataset **v1** (21–22/10/2026).
+Dataset đang dùng là **v2** (24/10/2026): 10.712.915 bản ghi, verify 7/7 PASS. Số đo của v2
+nằm ở `STAGE2B_DATASET.md` mục 0.4. Dữ liệu không nằm trong repo (`data/` bị
+`.gitignore`); repo chỉ có code, config và tài liệu.
+
+## Stage 1: Raw → Observations
+
+### Mục tiêu
 
 Repo này trích xuất các *observation* về hoạt tính phân tử từ hai cơ sở dữ liệu công
 khai là ChEMBL 37 và BindingDB 202610. Mục đích là chuẩn bị dữ liệu đầu vào để xây
