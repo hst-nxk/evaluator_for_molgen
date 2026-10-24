@@ -16,10 +16,10 @@ kiểm chứng đã thực sự chạy. Không có số nào là dự đoán.
 >    `qc_status = pass` bị thổi phồng;
 > 3. Stage 3 đưa 11 chuỗi protein viết thường vào ESM2 mà không viết hoa.
 >
-> Nhãn Δp của v1 không sai ở mức đáng kể. Bản sửa là **dataset v2** (`data/dataset_v2/`):
-> code và test đã viết, **chưa chạy**, nên chưa có số đo nào của v2. Thay đổi và thứ tự chạy
-> ở `docs/STAGE2B_DATASET.md` mục 0. Mục 1 dưới đây ("sẵn sàng cho việc train") chỉ đúng
-> cho v1, với các giới hạn vừa nêu.
+> Nhãn Δp của v1 không sai ở mức đáng kể. Bản sửa là **dataset v2** (`data/dataset_v2/`).
+> v2 đã dựng xong ngày 24/10/2026 và verify đạt 7/7 PASS: 10.712.915 bản ghi, evaluator
+> 10.684.298 dòng, 6.492 protein. Số đo đầy đủ, đối chiếu với v1 và thay đổi ở
+> `docs/STAGE2B_DATASET.md` mục 0. **Số liệu từ mục 1 trở đi trong báo cáo này là của v1.**
 
 ---
 

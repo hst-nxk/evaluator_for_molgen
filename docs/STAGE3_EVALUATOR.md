@@ -35,8 +35,9 @@ data/dataset/full/proteins.parquet        11.835 chuỗi protein (chỉ đọc)
 ```
 
 **Cập nhật 24/10/2026:** config giờ trỏ tới dataset v2 (`data/dataset_v2/…`, cache
-`work/evaluator_cache_v2`); v2 chưa được dựng nên các số ở tài liệu này vẫn là của v1. Hai
-thay đổi code của Stage 3 (đã viết, chưa chạy):
+`work/evaluator_cache_v2`). v2 đã dựng xong (evaluator 10.684.298 dòng), và `--mode prepare`
+đã chạy trên v2: 986.011 SMILES phân tử, 71.806 SMILES nhóm thế, 6.490 protein, chiều 480.
+Các số khác trong tài liệu này vẫn là của v1. Hai thay đổi code của Stage 3:
 
 - `train.canonical_sequence`: chuỗi protein được bỏ khoảng trắng và viết hoa trước khi vào
   ESM2. Trước đó, 11 protein viết thường của BindingDB (1.387 dòng) bị tokenizer biến thành

@@ -15,9 +15,10 @@ export`; 278 unit test pass, số dòng ba file không đổi, cột mới đã 
 
 ## 0. Dataset v2 (24/10/2026)
 
-Trạng thái: **code và unit test đã viết, CHƯA chạy** (chưa chạy pytest, chưa dựng dataset).
-Chưa có số đo nào của v2. Lý do từng thay đổi và số đo trên v1 nằm ở
-`docs/AUDIT_20261024.md`.
+Trạng thái: **đã dựng xong ngày 24/10/2026** (pytest 408 passed; smoke, full, split, export,
+verify; `run_evaluator.py --mode prepare`). **verify 7/7 PASS**
+(`runs/dataset/verify_20261024_181035.json`). Lý do từng thay đổi và số đo trên v1 nằm ở
+`docs/AUDIT_20261024.md`. Số đo của v2 ở mục 0.4.
 
 ### 0.1 Những gì đổi và vì sao
 
@@ -76,6 +77,82 @@ python run_dataset.py --mode export
 python run_dataset.py --mode verify
 python run_evaluator.py --mode prepare      # cache Stage 3 mới, chuỗi protein đã viết hoa
 ```
+
+### 0.4 Số đo của v2 (24/10/2026, từ log và manifest của lần chạy)
+
+**Đối chiếu với dự đoán của audit.** Audit (chỉ đọc, trên v1) dự đoán việc nâng
+`max_cut_bonds` sẽ thêm 194.400 Δp theo assay và 166.585 bản ghi. Lần dựng v2 cho đúng các con
+số đó:
+
+| | v1 | v2 | chênh | audit dự đoán |
+|---|---:|---:|---:|---:|
+| dòng vào (sau bộ lọc) | 2.972.507 | 2.972.507 | 0 | 0 |
+| Δp theo assay | 13.302.366 | 13.496.766 | +194.400 | +194.400 |
+| bản ghi (A, B, protein, endpoint) | 10.546.330 | 10.712.915 | +166.585 | +166.585 |
+| protein trong split | 6.315 | 6.492 | +177 | — |
+| nhóm MMseqs2 | 2.782 | 2.846 | +64 | — |
+
+**Bản ghi theo endpoint và cờ QC:**
+
+| endpoint | bản ghi | pass | identical_values | single_assay | quarantine |
+|---|---:|---:|---:|---:|---:|
+| Ki | 1.672.283 | 50.370 | 252.559 | 1.363.152 | 6.202 |
+| Kd | 187.513 | 9.483 | 11.684 | 164.775 | 1.571 |
+| IC50 | 8.059.678 | 460.270 | 969.888 | 6.610.842 | 18.678 |
+| EC50 | 793.441 | 30.205 | 68.921 | 692.149 | 2.166 |
+| **tổng** | **10.712.915** | **550.328** | **1.303.052** | **8.830.918** | **28.617** |
+
+Ở v1, 1.836.651 bản ghi mang `pass`. Ở v2 chỉ còn 550.328 bản ghi có ≥ 2 giá trị Δp khác
+nhau và nhất quán; 1.303.052 bản ghi là một giá trị lặp lại ở nhiều assay
+(`identical_values`). Số `quarantine` tăng từ 23.571 lên 28.617, vì bản sao không còn pha
+loãng độ phân tán.
+
+**Split** (`protein_split_manifest.json`; FASTA SHA-256 `b035efeb…cb9d8d`): 6.492 protein,
+2.846 nhóm; train 8.570.332 / validation 1.071.292 / test 1.071.291 cặp (80,0 / 10,0 /
+10,0 %). Không nhóm nào và không protein nào nằm ở hai partition. Đối chiếu split cũ (P50 V2):
+4.398 protein chung, 42,6 % cùng partition (v1: 43,0 %). **Split v2 khác split v1**, nên kết quả
+mô hình trên v1 và v2 không so trực tiếp được trên cùng một tập test.
+
+**Export:**
+
+| file | dòng |
+|---|---:|
+| evidence_records | 10.712.915 |
+| evaluator_training | 10.684.298 (= evidence − 28.617 quarantine) |
+| generator_training | 6.508.628 |
+
+| evaluator | Ki | Kd | IC50 | EC50 | tổng |
+|---|---:|---:|---:|---:|---:|
+| train | 1.374.702 | 145.514 | 6.444.153 | 581.361 | 8.545.730 |
+| validation | 146.429 | 14.626 | 812.103 | 95.895 | 1.069.053 |
+| test | 144.950 | 25.802 | 784.744 | 114.019 | 1.069.515 |
+
+**Cờ và cột bằng chứng trên evidence** (chỉ mô tả, không lọc dòng nào):
+
+| cột | số bản ghi |
+|---|---:|
+| `unseen_pair` = True | 1.779.674 (16,6 %) |
+| `plausible_range` = False | 15.863 |
+| `short_protein` = True | 1.640 |
+| `inactive_comment` = True | 2.705 |
+| `nonstandard_sequence` = True | 136 |
+| có `source_quality_warning` | 150.354 |
+| `min_target_confidence` = 9 | 5.622.683 |
+| `min_target_confidence` = 8 | 2.607.798 (24,3 %) |
+| `min_target_confidence` < 8 | 2.055 |
+| `min_target_confidence` null (chỉ có BindingDB) | 2.480.379 |
+
+**Stage 3** (`work/evaluator_cache_v2/cache_manifest.json`): 986.011 SMILES phân tử, 71.806
+SMILES nhóm thế, 6.490 protein được embed (chiều 480). 6.490 khác 6.492 của split; ở v1 cũng
+lệch 2 (6.313 / 6.315) vì hai protein chỉ còn cặp trong bản ghi `quarantine`. Ở v2 nguyên nhân
+có lẽ giống vậy nhưng **chưa kiểm**.
+
+**Thời gian:** full 2 giờ 32 phút (bước 1 → 4); export khoảng 5 phút; verify khoảng 3,5 phút;
+prepare khoảng 8 phút.
+
+**Chưa làm trên v2:** chạy lại các kiểm chứng độc lập của audit (bản cài MMP độc lập, kiểm
+bản sao) trên dữ liệu v2. Các kiểm chứng đó đã chạy trên v1. Phần v2 thêm vào đã được kiểm
+gián tiếp: số Δp và số bản ghi mới khớp chính xác với con số audit tính độc lập ở ngưỡng 400.
 
 ## 1. Mục tiêu và phạm vi
 

@@ -244,8 +244,10 @@ Các số trên là của **v1** (`data/dataset/`). Ngày 24/10/2026 audit
 `max_cut_bonds` 20 → 400, Δp chép giữa các assay chỉ tính một lần (cờ QC mới
 `identical_values`), thêm cột `n_documents`, `n_distinct_values`, `p_a_range`,
 `max_replicate_std`, `min_target_confidence`, `inactive_comment`, `nonstandard_sequence`.
-Code và test của v2 đã viết, **chưa chạy**. Thay đổi, lý do và thứ tự chạy (gồm câu lệnh
-MMseqs2 với `--max-seqs 11835`): `docs/STAGE2B_DATASET.md` mục 0.
+v2 đã dựng xong ngày 24/10/2026, verify 7/7 PASS: 13.496.766 Δp theo assay → 10.712.915
+bản ghi (pass 550.328; identical_values 1.303.052; single_assay 8.830.918; quarantine
+28.617), 6.492 protein trên 2.846 nhóm MMseqs2, evaluator 10.684.298 dòng, generator
+6.508.628 dòng. Thay đổi, lý do, số đo và thứ tự chạy: `docs/STAGE2B_DATASET.md` mục 0.
 
 ```powershell
 python run_dataset.py --mode smoke     # ~1/200 số assay -> runs/dataset/smoke_<thời điểm>/
