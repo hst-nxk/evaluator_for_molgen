@@ -498,6 +498,82 @@ def write_shards(writer: ShardWriter, rows: pa.Table, codes: np.ndarray,
 # --------------------------------------------------------------------------- bước 1 → 4
 
 
+DOCUMENT_ROLES = ("source", "assay_id", "assay_entry_id", "document_pmid", "document_doi",
+                  "document_patent", "document_id")
+
+
+def normalize_doi(values: pa.ChunkedArray | pa.Array, prefix_pattern: str) -> pa.ChunkedArray:
+    """DOI về một dạng: chữ thường, bỏ khoảng trắng và tiền tố URL/'doi:'.
+
+    Cùng quy tắc với Stage 2a (scripts/dedup_cross_source.py, normalize_doi) và đọc cùng
+    tham số config stage2a.dedup, để "cùng tài liệu" có một nghĩa duy nhất trong dự án.
+    """
+    lowered = pc.utf8_trim_whitespace(pc.utf8_lower(values))
+    return pc.replace_substring_regex(lowered, pattern=prefix_pattern, replacement="")
+
+
+def normalize_patent(values: pa.ChunkedArray | pa.Array, strip_pattern: str,
+                     kind_pattern: str, kind_replacement: str) -> pa.ChunkedArray:
+    """Số patent về một dạng, vd. 'US-9718838-B2' -> 'US9718838' (cùng quy tắc Stage 2a)."""
+    compact = pc.replace_substring_regex(pc.utf8_upper(values), pattern=strip_pattern,
+                                         replacement="")
+    return pc.replace_substring_regex(compact, pattern=kind_pattern,
+                                      replacement=kind_replacement)
+
+
+def document_identifiers(table: pa.Table, settings: Mapping[str, Any]) -> list[set[str]]:
+    """Tập định danh tài liệu của từng dòng: 'pmid:…', 'doi:…', 'patent:…'.
+
+    Nhận: bảng có các cột vai trò DOCUMENT_ROLES; config stage2a.dedup (regex chuẩn hóa).
+    Trả về: một tập mỗi dòng. Dòng không có PMID, DOI hay patent thì dùng mã tài liệu của
+    nguồn ('doc:<nguồn>:<mã>'), vì như vậy vẫn phân biệt được hai tài liệu khác nhau; dòng
+    không có gì cả thì tập rỗng.
+    """
+    doi = normalize_doi(table.column("document_doi"), settings["doi_prefix_pattern"])
+    patent = normalize_patent(table.column("document_patent"),
+                              settings["patent_strip_pattern"],
+                              settings["patent_kind_code_pattern"],
+                              settings["patent_kind_code_replacement"])
+    columns = zip(table.column("document_pmid").to_pylist(), doi.to_pylist(),
+                  patent.to_pylist(), table.column("document_id").to_pylist(),
+                  table.column("source").to_pylist())
+    result = []
+    for pmid, doi_value, patent_value, document, source in columns:
+        found = {f"{kind}:{value}" for kind, value in
+                 (("pmid", pmid), ("doi", doi_value), ("patent", patent_value)) if value}
+        if not found and document:
+            found = {f"doc:{source}:{document}"}
+        result.append(found)
+    return result
+
+
+def assay_documents(config: Mapping[str, Any], root: Path) -> dict[str, frozenset[str]]:
+    """assay_key -> tập định danh tài liệu của mọi dòng thuộc assay đó.
+
+    Nhận: config; thư mục gốc. Đọc lại các file đầu vào của Stage 2b (chỉ các cột tài liệu).
+    Trả về: từ điển cho MỌI assay của đầu vào. Dùng ở bước 4 để đếm số tài liệu độc lập của
+    một bản ghi (aggregate.document_count). Khóa assay tính bằng chính assay_keys, nên trùng
+    khít với khóa ở các bước khác.
+    """
+    stage = config["stage2b"]
+    columns, run = stage["columns"], stage["run"]
+    names = [columns[role] for role in DOCUMENT_ROLES]
+    documents: dict[str, set[str]] = {}
+    for source, relative_path in stage["inputs"].items():
+        parquet = pq.ParquetFile(root / relative_path)
+        for batch in parquet.iter_batches(batch_size=run["batch_rows"], columns=names):
+            table = rename_roles(batch, columns, DOCUMENT_ROLES)
+            keys = assay_keys(table).to_pylist()
+            for key, found in zip(keys, document_identifiers(table, config["stage2a"]["dedup"])):
+                documents.setdefault(key, set()).update(found)
+        LOGGER.info("bảng tài liệu sau %s: %s assay", source, fmt_int(len(documents)))
+    # Assay không có định danh nào thì không nối được với assay nào, nên được đếm là một
+    # tài liệu riêng. Ghi số lượng ra log để người đọc biết giới hạn này lớn đến đâu.
+    unknown = sum(1 for values in documents.values() if not values)
+    LOGGER.info("assay không có PMID, DOI, patent hay mã tài liệu: %s", fmt_int(unknown))
+    return {key: frozenset(values) for key, values in documents.items()}
+
+
 def attach_smiles(groups: pa.Table, molecules: pa.Table) -> pa.Table:
     """Thêm cột smiles (SMILES đại diện của khóa phân tử) vào bảng bước 1."""
     keys = molecules.column("molecule_key").combine_chunks()
@@ -581,7 +657,7 @@ def fragment_settings(settings: Mapping[str, Any]) -> mmp.FragmentSettings:
     """config stage2b.mmp -> FragmentSettings (bỏ các khóa chỉ về cách chạy)."""
     return mmp.FragmentSettings(
         min_cuts=settings["min_cuts"], max_cuts=settings["max_cuts"],
-        max_cut_bonds=settings["max_cut_bonds"],
+        max_cut_bonds=settings["max_cut_bonds"], cut_smarts=settings["cut_smarts"],
         min_core_fraction=settings["min_core_fraction"],
         max_variable_heavy_atoms=settings["max_variable_heavy_atoms"],
         attachment_points=settings["attachment_points"],
@@ -608,8 +684,8 @@ def write_parquet(table: pa.Table, path: Path) -> None:
 
 
 def process_bucket(layout: Layout, endpoint: str, bucket: int, molecules: pa.Table,
-                   config: Mapping[str, Any], pool: ProcessPoolExecutor | None
-                   ) -> dict[str, Any]:
+                   config: Mapping[str, Any], pool: ProcessPoolExecutor | None,
+                   documents: Mapping[str, frozenset[str]]) -> dict[str, Any]:
     """Chạy bước 1 → 4 cho một (endpoint, bucket) và ghi bốn file output của nó.
 
     Trả về: số đếm của bucket (dòng, nhóm, cặp, cặp mất, bản ghi, cờ QC, phân tán...).
@@ -639,7 +715,9 @@ def process_bucket(layout: Layout, endpoint: str, bucket: int, molecules: pa.Tab
     if endpoint not in thresholds:
         raise KeyError(f"thiếu ngưỡng phân tán cho endpoint {endpoint} trong config")
     records = aggregate.aggregate_deltas(deltas, thresholds[endpoint],
-                                         settings["qc"]["dispersion_ddof"])
+                                         settings["qc"]["dispersion_ddof"],
+                                         settings["qc"]["collapse_tolerance"],
+                                         replicate["float_slack"], documents)
     records = records.append_column("endpoint",
                                     pa.array([endpoint] * records.num_rows, pa.string()))
     write_parquet(records, layout.bucket_file("records_dir", endpoint, bucket))
@@ -710,12 +788,14 @@ def qc_lines(per_endpoint: Mapping[str, Mapping[str, Any]],
         measured = spread.get("measured", 0)
         cells = [endpoint, fmt_int(qc.get(aggregate.QC_PASS, 0)),
                  fmt_int(qc.get(aggregate.QC_SINGLE, 0)),
+                 fmt_int(qc.get(aggregate.QC_IDENTICAL, 0)),
                  fmt_int(qc.get(aggregate.QC_QUARANTINE, 0)), fmt_int(measured)]
         for level in levels:
             cells.append(fmt_pct(spread.get(f"le_{level}", 0), measured))
             cells.append(fmt_pct(spread.get(f"gt_{level}", 0), measured))
         rows.append(cells)
-    headers = ["endpoint", "pass", "single_assay", "quarantine", "đo được phân tán"]
+    headers = ["endpoint", "pass", "single_assay", "identical_values", "quarantine",
+               "đo được phân tán"]
     for level in levels:
         headers += [f"≤ {fmt_float(level, 1)}", f"> {fmt_float(level, 1)}"]
     return ["Cờ QC và phân tán của Δp (tỷ lệ tính trên số bản ghi đo được phân tán):",
@@ -754,10 +834,12 @@ def run_pipeline(config: Mapping[str, Any], root: Path, out_root: Path,
         pool = ProcessPoolExecutor(max_workers=workers, initializer=mmp.init_worker,
                                    initargs=(fragment_settings(settings["mmp"]),
                                              settings["mmp"]["fragment_cache_size"]))
+    documents = assay_documents(config, root)
     per_endpoint: dict[str, Any] = {}
     try:
         for endpoint in endpoints:
-            parts = [process_bucket(layout, endpoint, bucket, molecules, config, pool)
+            parts = [process_bucket(layout, endpoint, bucket, molecules, config, pool,
+                                    documents)
                      for bucket in range(buckets)]
             per_endpoint[endpoint] = merge_stats([part for part in parts if part])
     finally:
@@ -912,6 +994,11 @@ def run_split(config: Mapping[str, Any], root: Path, clusters: Path | None,
         return result
 
     clustering = settings["split"]["clustering"]
+    if clustering["max_seqs"] < written:
+        # --max-seqs nhỏ hơn số chuỗi thì MMseqs2 cắt bớt láng giềng, protein cùng họ có
+        # thể mất cạnh nối và rơi vào hai partition: rò rỉ mà không có lỗi nào báo ra.
+        raise ValueError(f"split.clustering.max_seqs = {clustering['max_seqs']} nhỏ hơn số "
+                         f"chuỗi trong FASTA ({written}); sửa config và chạy lại MMseqs2")
     membership = load_cluster_tsv(clusters)
     table = split.build_split_table(counts, membership, settings["split"]["target_ratios"],
                                     settings["split"]["partitions"], settings["split"]["seed"])
@@ -986,15 +1073,19 @@ def split_lines(manifest: Mapping[str, Any]) -> list[str]:
 # --------------------------------------------------------------------------- bước 5
 
 
-FLAG_COLUMNS = ["unseen_pair", "plausible_range", "short_protein"]
+FLAG_COLUMNS = ["unseen_pair", "plausible_range", "short_protein", "inactive_comment",
+                "nonstandard_sequence"]
 # Cột cảnh báo của nguồn: chuỗi nguyên văn, không phải cờ bool, nên đếm riêng FLAG_COLUMNS.
 WARNING_COLUMN = "source_quality_warning"
+# Cột mô tả bằng chứng (số, không phải cờ bool), có ở cả hai file training. Không lọc gì.
+EVIDENCE_COLUMNS = ["n_assays", "n_distinct_values", "n_documents", "qc_status",
+                    "min_target_confidence", "p_a_range", "max_replicate_std"]
 EVALUATOR_COLUMNS = ["pair_id", "endpoint", "protein_hash", "partition", "smiles_a", "smiles_b",
-                     "constant_smiles", "variable_a", "variable_b", "delta_p_mean", "n_assays",
-                     "qc_status", *FLAG_COLUMNS, WARNING_COLUMN]
+                     "constant_smiles", "variable_a", "variable_b", "delta_p_mean",
+                     *EVIDENCE_COLUMNS, *FLAG_COLUMNS, WARNING_COLUMN]
 GENERATOR_COLUMNS = ["pair_id", "endpoint", "protein_hash", "partition", "smiles_weak",
                      "smiles_strong", "constant_smiles", "variable_weak", "variable_strong",
-                     "gain", "n_assays", "qc_status", *FLAG_COLUMNS, WARNING_COLUMN]
+                     "gain", *EVIDENCE_COLUMNS, *FLAG_COLUMNS, WARNING_COLUMN]
 PAIR_CODE_SHIFT = 31
 
 
@@ -1173,6 +1264,123 @@ def warning_column(path: Path, pair_ids: pa.Array, comments: Mapping[str, str],
     return pa.array([joined.get(key) for key in pair_ids.to_pylist()], pa.string())
 
 
+def chembl_observation_info(config: Mapping[str, Any], root: Path,
+                            settings: Mapping[str, Any]) -> tuple[dict[str, int], set[str]]:
+    """Hai thông tin của chính ChEMBL theo từng observation, chỉ giữ dòng cần gắn cờ.
+
+    Nhận: config, thư mục gốc, khối stage2b.export.
+    Trả về: (observation_id -> confidence_score khi < direct_confidence; tập observation có
+    activity_comment thuộc export.inactive_comments).
+    Vì sao: confidence 8 nghĩa là ChEMBL gán target đồng đẳng, có thể khác loài với protein
+    thật sự được đo (ChEMBL FAQ); activity_comment kiểu "inactive" trên dòng '=' cho thấy
+    giá trị có thể là nồng độ cao nhất đã thử. Cả hai là thông tin của nguồn, nên chỉ gắn
+    cờ, không lọc. Chỉ parse JSON ở dòng mà regex đã chọn trước, như source_quality_comments.
+    """
+    stage = config["stage2b"]
+    names = stage["columns"]
+    inactive_values = {value.strip().lower() for value in settings["inactive_comments"]}
+    confidence: dict[str, int] = {}
+    inactive: set[str] = set()
+    for source, relative_path in stage["inputs"].items():
+        handle = pq.ParquetFile(root / relative_path)
+        for batch in handle.iter_batches(
+                batch_size=stage["run"]["batch_rows"],
+                columns=[names["observation_id"], names["activity_context"],
+                         names["assay_context"]]):
+            ids = batch.column(names["observation_id"])
+            scores = context_hits(batch.column(names["assay_context"]), ids,
+                                  settings["low_confidence_regex"], settings["confidence_key"])
+            for observation_id, score in scores:
+                # null nghĩa là ChEMBL chưa gán mức tin cậy: coi như mức 0 của ChEMBL
+                # ("target unknown or has yet to be curated"), không coi là gán trực tiếp.
+                value = settings["missing_confidence"] if score is None else int(score)
+                if value < settings["direct_confidence"]:
+                    confidence[observation_id] = value
+            comments = context_hits(batch.column(names["activity_context"]), ids,
+                                    settings["activity_comment_regex"],
+                                    settings["activity_comment_key"])
+            for observation_id, comment in comments:
+                if comment is not None and str(comment).strip().lower() in inactive_values:
+                    inactive.add(observation_id)
+        LOGGER.info("thông tin ChEMBL sau %s: %s dòng confidence < %d, %s dòng ghi chú "
+                    "không hoạt tính", source, fmt_int(len(confidence)),
+                    settings["direct_confidence"], fmt_int(len(inactive)))
+    return confidence, inactive
+
+
+def context_hits(texts: pa.ChunkedArray | pa.Array, ids: pa.ChunkedArray | pa.Array,
+                 pattern: str, key: str) -> list[tuple[str, Any]]:
+    """[(observation_id, giá trị của `key`)] ở các dòng mà JSON khớp regex chọn trước."""
+    hit = pc.fill_null(pc.match_substring_regex(texts, pattern=pattern), False)
+    positions = np.flatnonzero(np.asarray(hit.to_numpy(zero_copy_only=False), dtype=bool))
+    if not positions.size:
+        return []
+    take = pa.array(positions, type=pa.int64())
+    return [(observation_id, parse_context(text, observation_id).get(key))
+            for text, observation_id in zip(pc.take(texts, take).to_pylist(),
+                                            pc.take(ids, take).to_pylist())]
+
+
+def record_hits(deltas: pa.Table, lookup: pa.Array) -> dict[str, set[int]]:
+    """pair_id -> chỉ số (trong `lookup`) của các observation đóng góp có mặt trong lookup."""
+    found: dict[str, set[int]] = {}
+    if not len(lookup):
+        return found
+    for name in ("observation_ids_a", "observation_ids_b"):
+        rows, which = observation_hits(deltas.column(name), lookup)
+        if not rows.size:
+            continue
+        keys = pc.take(deltas.column("pair_id"), pa.array(rows, pa.int64())).to_pylist()
+        for key, index in zip(keys, which.tolist()):
+            found.setdefault(key, set()).add(index)
+    return found
+
+
+def observation_flag_columns(path: Path, records: pa.Table, confidence: Mapping[str, int],
+                             inactive: set[str], direct: int, chembl_prefix: str
+                             ) -> tuple[pa.Array, pa.Array]:
+    """(min_target_confidence, inactive_comment) cho từng bản ghi của một bucket.
+
+    min_target_confidence: confidence_score nhỏ nhất của ChEMBL trong các phép đo đóng góp;
+    bản ghi có assay ChEMBL mà không phép đo nào < `direct` thì bằng `direct`; bản ghi chỉ
+    có BindingDB thì null (BindingDB không có trường tương đương).
+    inactive_comment: ít nhất một phép đo đóng góp mang ghi chú không hoạt tính.
+    """
+    deltas = pq.read_table(path, columns=["pair_id", "observation_ids_a", "observation_ids_b"])
+    low_ids = list(confidence)
+    low_values = [confidence[key] for key in low_ids]
+    low_hits = record_hits(deltas, pa.array(low_ids, pa.string()))
+    inactive_hits = record_hits(deltas, pa.array(sorted(inactive), pa.string()))
+    minimum: list[int | None] = []
+    flagged: list[bool] = []
+    for key, assays in zip(records.column("pair_id").to_pylist(),
+                           records.column("assay_keys").to_pylist()):
+        if key in low_hits:
+            minimum.append(min(low_values[index] for index in low_hits[key]))
+        elif any(assay.startswith(chembl_prefix) for assay in assays):
+            minimum.append(direct)
+        else:
+            minimum.append(None)
+        flagged.append(key in inactive_hits)
+    return pa.array(minimum, pa.int64()), pa.array(flagged, pa.bool_())
+
+
+def nonstandard_proteins(proteins: pa.Table, alphabet: str) -> set[str]:
+    """protein_hash có chuỗi (đã bỏ khoảng trắng, viết hoa) chứa ký tự ngoài `alphabet`.
+
+    Vì sao: nguồn có chuỗi lẫn chữ số hay tên nhóm hóa học (vd. 'biotin-C6linker-...').
+    Chuẩn hóa giống hệt hash của Stage 1, nên chuỗi viết thường không bị coi là bất thường.
+    """
+    allowed = set(alphabet)
+    flagged = set()
+    for key, sequence in zip(proteins.column("protein_hash").to_pylist(),
+                             proteins.column("protein_sequence").to_pylist()):
+        cleaned = "".join((sequence or "").split()).upper()
+        if set(cleaned) - allowed:
+            flagged.add(key)
+    return flagged
+
+
 def partition_column(records: pa.Table, assignment: pa.Table) -> pa.Array:
     """Partition của từng bản ghi, tra theo protein; protein thiếu trong split là lỗi."""
     keys = assignment.column("protein_sequence_hash").combine_chunks()
@@ -1209,7 +1417,7 @@ def oriented_generator_rows(records: pa.Table, min_gain: float) -> pa.Table:
         "variable_strong": pc.if_else(forward, subset.column("variable_b"),
                                       subset.column("variable_a")),
         "gain": pc.abs(subset.column("delta_p_mean")),
-        "n_assays": subset.column("n_assays"), "qc_status": subset.column("qc_status"),
+        **{name: subset.column(name) for name in EVIDENCE_COLUMNS},
         **{flag: subset.column(flag) for flag in FLAG_COLUMNS},
         WARNING_COLUMN: subset.column(WARNING_COLUMN),
     }
@@ -1235,9 +1443,12 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     low, high = settings["export"]["plausible_p_range"]
     min_length = settings["export"]["min_protein_length"]
     proteins = pq.read_table(full.file("proteins"),
-                             columns=["protein_hash", "sequence_length"])
+                             columns=["protein_hash", "sequence_length", "protein_sequence"])
     lengths = dict(zip(proteins.column("protein_hash").to_pylist(),
                        proteins.column("sequence_length").to_pylist()))
+    export = settings["export"]
+    unusual = nonstandard_proteins(proteins, export["protein_alphabet"])
+    confidence, inactive = chembl_observation_info(config, root, export)
     separator = settings["export"]["source_quality_separator"]
     endpoints = list(config["endpoints"])
     comments = source_quality_comments(config, root, settings["export"])
@@ -1247,6 +1458,7 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     writers: dict[str, pq.ParquetWriter] = {}
     counts: Counter = Counter()
     warning_counts: Counter = Counter()
+    confidence_counts: Counter = Counter()
     per_partition: dict[str, Counter] = {}
     try:
         for endpoint in endpoints:
@@ -1265,6 +1477,15 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
                      for h in records.column("protein_hash").to_pylist()], pa.bool_()))
                 records = records.append_column(WARNING_COLUMN, warning_column(
                     deltas, records.column("pair_id"), comments, separator))
+                minimum, flagged = observation_flag_columns(
+                    deltas, records, confidence, inactive, export["direct_confidence"],
+                    export["chembl_assay_prefix"])
+                records = records.append_column("min_target_confidence", minimum)
+                confidence_counts.update(minimum.to_pylist())
+                records = records.append_column("inactive_comment", flagged)
+                records = records.append_column("nonstandard_sequence", pa.array(
+                    [key in unusual for key in records.column("protein_hash").to_pylist()],
+                    pa.bool_()))
                 for flag in FLAG_COLUMNS:
                     counts[f"{flag}_true"] += int(pc.sum(records.column(flag)).as_py() or 0)
                 warning_counts.update(
@@ -1309,7 +1530,14 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
                       f"phép đo đóng góp có pActivity trong [{low}, {high}]. short_protein: "
                       f"chuỗi protein ngắn hơn {min_length} acid amin. {WARNING_COLUMN}: "
                       "cảnh báo chất lượng do chính nguồn gắn, nguyên văn, null nghĩa là "
-                      "không có cảnh báo hoặc nguồn không có cột tương đương."),
+                      "không có cảnh báo hoặc nguồn không có cột tương đương. "
+                      "inactive_comment: ít nhất một phép đo đóng góp có activity_comment "
+                      "thuộc export.inactive_comments. nonstandard_sequence: chuỗi protein "
+                      "có ký tự ngoài export.protein_alphabet. min_target_confidence (cột "
+                      "bằng chứng, không phải cờ): confidence_score nhỏ nhất của ChEMBL, "
+                      "null khi bản ghi chỉ có BindingDB."),
+        "min_target_confidence": dict(sorted(confidence_counts.items(),
+                                             key=lambda item: (item[0] is None, item[0]))),
         "evaluator_by_partition": {partition: dict(endpoints)
                                    for partition, endpoints in sorted(per_partition.items())},
         "seconds": round(time.perf_counter() - started, 1),
@@ -1378,49 +1606,27 @@ def list_offsets(column: pa.ChunkedArray) -> tuple[np.ndarray, pa.Array]:
     return offsets - base, flat.values.slice(base, end - base)
 
 
-def check_record_stats(layout: Layout, config: Mapping[str, Any],
-                       endpoints: Sequence[str]) -> dict[str, Any]:
-    """Tính lại thống kê của bản ghi từ danh sách Δp lưu trong chính bản ghi.
+def check_record_stats(layout: Layout, config: Mapping[str, Any], endpoints: Sequence[str],
+                       documents: Mapping[str, frozenset[str]]) -> dict[str, Any]:
+    """Tính lại thống kê của bản ghi từ danh sách Δp và assay lưu trong chính bản ghi.
 
-    Kiểm tra mean, median, STD, min, max, phân tán và cờ QC của MỌI bản ghi, không lấy
-    mẫu: đây là phép kiểm tra rẻ (chỉ đọc lại phần evidence đã lưu).
+    Kiểm tra n_assays, n_distinct_values, n_documents, mean, median, STD, min, max, phân
+    tán và cờ QC của MỌI bản ghi, không lấy mẫu. Dùng lại đúng các hàm của bước 4
+    (summarize_values, document_count): phép kiểm tra này bắt lỗi ghi/đọc và lắp cột, không
+    phải một cài đặt độc lập của quy tắc gộp (cài đặt độc lập nằm trong test).
     """
     settings = config["stage2b"]
     tolerance = settings["run"]["verify_tolerance"]
+    collapse = settings["qc"]["collapse_tolerance"]
+    slack = settings["replicate"]["float_slack"]
+    ddof = settings["qc"]["dispersion_ddof"]
     checked, mismatched, examples = 0, 0, []
     for endpoint in endpoints:
         threshold = settings["qc"]["dispersion_thresholds"][endpoint]
         for path in layout.bucket_files("records_dir", endpoint):
-            table = pq.read_table(path, columns=[
-                "pair_id", "n_assays", "delta_p_mean", "delta_p_median", "delta_p_std",
-                "delta_p_min", "delta_p_max", "dispersion", "qc_status", "delta_p_values"])
-            offsets, flat = list_offsets(table.column("delta_p_values"))
-            values = np.asarray(flat.to_numpy(zero_copy_only=False), dtype=np.float64)
-            starts, sizes = offsets[:-1], np.diff(offsets)
-            stored_sizes = np.asarray(table.column("n_assays").to_numpy(zero_copy_only=False),
-                                      dtype=np.int64)
-            mean = np.add.reduceat(values, starts) / sizes if sizes.size else np.empty(0)
-            minimum = np.minimum.reduceat(values, starts) if sizes.size else np.empty(0)
-            maximum = np.maximum.reduceat(values, starts) if sizes.size else np.empty(0)
-            squares = (np.add.reduceat((values - np.repeat(mean, sizes)) ** 2, starts)
-                       if sizes.size else np.empty(0))
-            ddof = settings["qc"]["dispersion_ddof"]
-            with np.errstate(invalid="ignore", divide="ignore"):
-                std = np.where(sizes > ddof, np.sqrt(squares / np.maximum(sizes - ddof, 1)),
-                               np.nan)
-            spread = aggregate.dispersion(sizes, std, minimum, maximum)
-            status = aggregate.qc_status(sizes, spread, threshold)
-            median = aggregate.group_median(values, offsets) if sizes.size else np.empty(0)
-            stored = {name: np.asarray(table.column(name).to_numpy(zero_copy_only=False),
-                                       dtype=np.float64)
-                      for name in ("delta_p_mean", "delta_p_median", "delta_p_std",
-                                   "delta_p_min", "delta_p_max", "dispersion")}
-            bad = (sizes != stored_sizes)
-            for name, computed in (("delta_p_mean", mean), ("delta_p_median", median),
-                                   ("delta_p_std", std), ("delta_p_min", minimum),
-                                   ("delta_p_max", maximum), ("dispersion", spread)):
-                bad |= ~close_or_both_nan(computed, stored[name], tolerance)
-            bad |= status != np.asarray(table.column("qc_status").to_pylist(), dtype=object)
+            table = pq.read_table(path, columns=list(RECOMPUTED_COLUMNS))
+            bad = recompute_mismatch(table, threshold, ddof, collapse, slack, tolerance,
+                                     documents)
             checked += table.num_rows
             mismatched += int(bad.sum())
             for index in np.flatnonzero(bad)[:3]:
@@ -1428,6 +1634,54 @@ def check_record_stats(layout: Layout, config: Mapping[str, Any],
                                  "pair_id": table.column("pair_id")[int(index)].as_py()})
     return {"passed": mismatched == 0, "records_checked": checked,
             "mismatched": mismatched, "examples": examples[:20]}
+
+
+RECOMPUTED_COLUMNS = ("pair_id", "n_assays", "n_distinct_values", "n_documents",
+                      "delta_p_mean", "delta_p_median", "delta_p_std", "delta_p_min",
+                      "delta_p_max", "dispersion", "qc_status", "delta_p_values", "assay_keys")
+RECOMPUTED_FLOATS = ("delta_p_mean", "delta_p_median", "delta_p_std", "delta_p_min",
+                     "delta_p_max", "dispersion")
+
+
+def recompute_mismatch(table: pa.Table, threshold: float, ddof: int, collapse: float,
+                       slack: float, tolerance: float,
+                       documents: Mapping[str, frozenset[str]]) -> np.ndarray:
+    """Mặt nạ bool: bản ghi có ít nhất một cột lưu khác giá trị tính lại."""
+    values = table.column("delta_p_values").to_pylist()
+    assays = table.column("assay_keys").to_pylist()
+    rows = table.num_rows
+    computed = {name: np.full(rows, np.nan) for name in RECOMPUTED_FLOATS}
+    sizes = np.zeros(rows, dtype=np.int64)
+    distinct = np.zeros(rows, dtype=np.int64)
+    counted = np.zeros(rows, dtype=np.int64)
+    for row in range(rows):
+        sizes[row] = len(values[row])
+        if sizes[row] == 1:
+            # Một assay (đa số bản ghi): thống kê suy ra thẳng, không cần gộp.
+            only = float(values[row][0])
+            for name in ("delta_p_mean", "delta_p_median", "delta_p_min", "delta_p_max"):
+                computed[name][row] = only
+            distinct[row] = 1
+            counted[row] = aggregate.document_count(assays[row], documents)
+            continue
+        summary = aggregate.summarize_values(np.asarray(values[row], dtype=np.float64),
+                                             collapse, slack, ddof)
+        for name, value in zip(RECOMPUTED_FLOATS, summary[:-1]):
+            computed[name][row] = value
+        distinct[row] = summary[-1]
+        counted[row] = aggregate.document_count(assays[row], documents)
+    bad = sizes != np.asarray(table.column("n_assays").to_numpy(zero_copy_only=False))
+    bad |= sizes != np.asarray([len(keys) for keys in assays], dtype=np.int64)
+    bad |= distinct != np.asarray(
+        table.column("n_distinct_values").to_numpy(zero_copy_only=False))
+    bad |= counted != np.asarray(table.column("n_documents").to_numpy(zero_copy_only=False))
+    for name in RECOMPUTED_FLOATS:
+        stored = np.asarray(table.column(name).to_numpy(zero_copy_only=False),
+                            dtype=np.float64)
+        bad |= ~close_or_both_nan(computed[name], stored, tolerance)
+    status = aggregate.qc_status(sizes, distinct, computed["dispersion"], threshold)
+    bad |= status != np.asarray(table.column("qc_status").to_pylist(), dtype=object)
+    return bad
 
 
 def close_or_both_nan(left: np.ndarray, right: np.ndarray, tolerance: float) -> np.ndarray:
@@ -1744,7 +1998,8 @@ def run_verify(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"chưa có {full.root}; chạy --mode full trước")
     checks = {
         "bao_toan_cap": check_conservation(full, endpoints),
-        "thong_ke_tu_evidence": check_record_stats(full, config, endpoints),
+        "thong_ke_tu_evidence": check_record_stats(full, config, endpoints,
+                                                   assay_documents(config, root)),
         "khoa_endpoint_protein": check_keys(full, config, endpoints),
         "mot_delta_moi_assay": check_one_delta_per_assay(full, endpoints),
         "doi_chieu_observations": check_against_observations(config, root, full, endpoints),

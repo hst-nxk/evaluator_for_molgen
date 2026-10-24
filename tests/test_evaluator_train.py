@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from molopt.evaluator import train
+from molopt.observations import normalize
 
 ENDPOINTS = 4
 
@@ -32,6 +34,19 @@ def test_train_module_imports_torch_only_inside_functions() -> None:
                 imported.add(node.module.split(".")[0])
     assert "torch" not in imported
     assert "models" not in imported
+
+
+def test_canonical_sequence_upper_cases_and_drops_whitespace() -> None:
+    # Tokenizer ESM2 biến mỗi chữ thường thành <unk>; chuỗi BindingDB viết thường phải
+    # được viết hoa trước, đúng như hash của Stage 1.
+    assert train.canonical_sequence("mkt ay\nlq") == "MKTAYLQ"
+    assert train.canonical_sequence("MKTAY") == "MKTAY"
+
+
+def test_canonical_sequence_keeps_the_stage1_identity() -> None:
+    raw = "mktay lq"
+    cleaned = train.canonical_sequence(raw)
+    assert normalize.sequence_hash(raw) == hashlib.sha256(cleaned.encode("ascii")).hexdigest()
 
 
 def test_endpoint_means_averages_within_each_endpoint() -> None:

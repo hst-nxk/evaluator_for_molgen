@@ -9,9 +9,16 @@ Khóa định danh:
     (đếm riêng để báo cáo).
 
 Cặp MMP (single cut, như mmpdb):
-    - RDKit rdMMPA.FragmentMol với minCuts = maxCuts = 1, maxCutBonds = 20: mỗi lần cắt
-      một liên kết đơn không vòng cho hai mảnh; mỗi mảnh lần lượt đóng vai lõi chung
-      (constant) và phần biến đổi (variable);
+    - RDKit rdMMPA.FragmentMol với minCuts = maxCuts = 1 và mẫu liên kết cắt ghi tường
+      minh trong config (cut_smarts, đúng mẫu mặc định của RDKit): mỗi lần cắt một liên kết
+      khớp mẫu cho hai mảnh; mỗi mảnh lần lượt đóng vai lõi chung (constant) và phần biến
+      đổi (variable);
+    - maxCutBonds của RDKit KHÔNG phải giới hạn số lần cắt: nếu phân tử có nhiều liên kết
+      khớp mẫu hơn maxCutBonds thì FragmentMol trả về rỗng cho CẢ phân tử (đo 24/10/2026,
+      docs/AUDIT_20261024.md mục 3.3). Vì vậy max_cut_bonds được đặt lớn hơn mọi phân tử
+      trong dữ liệu, và fragment_molecule báo lỗi nếu gặp phân tử vượt giới hạn thay vì
+      lặng lẽ bỏ nó. Kích thước của phép sửa do hai điều kiện dưới đây khống chế, không do
+      maxCutBonds;
     - A và B là một cặp khi có cùng constant (SMILES chính tắc, gồm vị trí nối) và khác
       variable;
     - constant ≥ min_core_fraction số nguyên tử nặng của phân tử: vì constant giống hệt ở
@@ -49,6 +56,7 @@ class FragmentSettings:
     min_cuts: int
     max_cuts: int
     max_cut_bonds: int
+    cut_smarts: str
     min_core_fraction: float
     max_variable_heavy_atoms: int
     attachment_points: int
@@ -136,6 +144,27 @@ def fragment_pieces(chains: Chem.Mol, settings: FragmentSettings
     return pieces, valid and len(pieces) == 2
 
 
+@functools.lru_cache(maxsize=None)
+def cut_pattern(smarts: str) -> Chem.Mol:
+    """Mẫu liên kết cắt đã biên dịch (một lần cho mỗi chuỗi SMARTS)."""
+    pattern = Chem.MolFromSmarts(smarts)
+    if pattern is None:
+        raise ValueError(f"cut_smarts không đọc được: {smarts!r}")
+    return pattern
+
+
+def check_cut_bonds(molecule: Chem.Mol, smiles: str, settings: FragmentSettings) -> None:
+    """Báo lỗi khi FragmentMol trả rỗng VÌ phân tử vượt max_cut_bonds.
+
+    Vì sao: RDKit bỏ cả phân tử trong trường hợp này mà không báo gì; dataset v1 mất
+    166.585 bản ghi vì vậy. Phân tử không có liên kết nào khớp mẫu thì trả rỗng là đúng.
+    """
+    matches = len(molecule.GetSubstructMatches(cut_pattern(settings.cut_smarts)))
+    if matches > settings.max_cut_bonds:
+        raise ValueError(f"phân tử có {matches} liên kết cắt được, vượt max_cut_bonds = "
+                         f"{settings.max_cut_bonds}; tăng giới hạn trong config: {smiles}")
+
+
 def fragment_molecule(smiles: str, settings: FragmentSettings) -> FragmentResult:
     """Mọi cách chia hợp lệ (constant, variable) của một phân tử.
 
@@ -151,7 +180,10 @@ def fragment_molecule(smiles: str, settings: FragmentSettings) -> FragmentResult
     total = molecule.GetNumHeavyAtoms()
     results = rdMMPA.FragmentMol(molecule, minCuts=settings.min_cuts,
                                  maxCuts=settings.max_cuts,
-                                 maxCutBonds=settings.max_cut_bonds, resultsAsMols=True)
+                                 maxCutBonds=settings.max_cut_bonds,
+                                 pattern=settings.cut_smarts, resultsAsMols=True)
+    if not results:
+        check_cut_bonds(molecule, smiles, settings)
     cuts: set[Cut] = set()
     violations = 0
     for _, chains in results:

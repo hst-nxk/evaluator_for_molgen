@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from molopt.dataset import pipeline
+from molopt.dataset import aggregate, pipeline
 
 ENDPOINTS = ["Ki", "Kd", "IC50", "EC50"]
 BUCKETS = 16
@@ -325,7 +325,19 @@ def record_table(rows: list[dict[str, Any]]) -> pa.Table:
         "variable_b": pa.array([row.get("variable_b", "vb") for row in rows], pa.string()),
         "delta_p_mean": pa.array([row["delta_p_mean"] for row in rows], pa.float64()),
         "n_assays": pa.array([row.get("n_assays", 2) for row in rows], pa.int64()),
+        "n_distinct_values": pa.array([row.get("n_distinct_values", 2) for row in rows],
+                                      pa.int64()),
+        "n_documents": pa.array([row.get("n_documents", 2) for row in rows], pa.int64()),
         "qc_status": pa.array([row.get("qc_status", "pass") for row in rows], pa.string()),
+        "min_target_confidence": pa.array([row.get("min_target_confidence", 9) for row in rows],
+                                          pa.int64()),
+        "p_a_range": pa.array([row.get("p_a_range", 0.0) for row in rows], pa.float64()),
+        "max_replicate_std": pa.array([row.get("max_replicate_std") for row in rows],
+                                      pa.float64()),
+        "inactive_comment": pa.array([row.get("inactive_comment", False) for row in rows],
+                                     pa.bool_()),
+        "nonstandard_sequence": pa.array(
+            [row.get("nonstandard_sequence", False) for row in rows], pa.bool_()),
         "molecule_a_key": pa.array([row.get("molecule_a_key", "KEY-A") for row in rows],
                                    pa.string()),
         "molecule_b_key": pa.array([row.get("molecule_b_key", "KEY-B") for row in rows],
@@ -374,6 +386,21 @@ def test_oriented_generator_rows_carries_the_descriptive_flags() -> None:
     (row,) = pipeline.oriented_generator_rows(rows, 0.3).to_pylist()
     assert (row["unseen_pair"], row["plausible_range"],
             row["short_protein"]) == (True, False, True)
+
+
+def test_oriented_generator_rows_carries_the_evidence_columns() -> None:
+    rows = record_table([{"delta_p_mean": -1.0, "n_documents": 1, "n_distinct_values": 1,
+                          "qc_status": "identical_values", "min_target_confidence": 8,
+                          "p_a_range": 3.0, "inactive_comment": True}])
+    (row,) = pipeline.oriented_generator_rows(rows, 0.3).to_pylist()
+    assert (row["n_documents"], row["n_distinct_values"], row["qc_status"],
+            row["min_target_confidence"], row["p_a_range"], row["inactive_comment"]) == (
+        1, 1, "identical_values", 8, 3.0, True)
+
+
+def test_evaluator_columns_carry_every_evidence_and_flag_column() -> None:
+    for name in [*pipeline.EVIDENCE_COLUMNS, *pipeline.FLAG_COLUMNS]:
+        assert name in pipeline.EVALUATOR_COLUMNS and name in pipeline.GENERATOR_COLUMNS
 
 
 # --------------------------------------------------------------------------- cờ mô tả bước 5
@@ -524,6 +551,108 @@ def test_generator_rows_carry_the_source_quality_warning() -> None:
     assert table.column("source_quality_warning").to_pylist() == ["Outside typical range"]
 
 
+# ------------------------------------------------------------------- tài liệu độc lập (bước 4)
+
+
+def test_normalize_patent_matches_both_source_spellings(config: dict[str, Any]) -> None:
+    dedup = config["stage2a"]["dedup"]
+    values = pa.array(["US-9321727-B2", "US9321727", "us 9321727 b1", None])
+    normalized = pipeline.normalize_patent(values, dedup["patent_strip_pattern"],
+                                           dedup["patent_kind_code_pattern"],
+                                           dedup["patent_kind_code_replacement"])
+    assert normalized.to_pylist() == ["US9321727", "US9321727", "US9321727", None]
+
+
+def test_normalize_doi_drops_url_prefix_and_case(config: dict[str, Any]) -> None:
+    pattern = config["stage2a"]["dedup"]["doi_prefix_pattern"]
+    values = pa.array(["https://doi.org/10.1021/JM001", "10.1021/jm001", None])
+    assert pipeline.normalize_doi(values, pattern).to_pylist() == [
+        "10.1021/jm001", "10.1021/jm001", None]
+
+
+def document_table(rows: list[dict[str, Any]]) -> pa.Table:
+    return pa.table({role: pa.array([row.get(role) for row in rows], pa.string())
+                     for role in pipeline.DOCUMENT_ROLES})
+
+
+def test_document_identifiers_prefers_pmid_doi_patent_over_source_id(
+        config: dict[str, Any]) -> None:
+    table = document_table([
+        {"source": "chembl", "document_pmid": "123", "document_doi": "10.1/X",
+         "document_id": "CHEMBL1"},
+        {"source": "bindingdb", "document_patent": "US-1234567-B2", "document_id": "9"},
+        {"source": "chembl", "document_id": "CHEMBL2"},
+        {"source": "bindingdb"},
+    ])
+    found = pipeline.document_identifiers(table, config["stage2a"]["dedup"])
+    assert found == [{"pmid:123", "doi:10.1/x"}, {"patent:US1234567"},
+                     {"doc:chembl:CHEMBL2"}, set()]
+
+
+def test_assay_documents_merges_rows_of_one_assay(tmp_path: Path,
+                                                  config: dict[str, Any]) -> None:
+    names = config["stage2b"]["columns"]
+    rows = {"source": ["chembl", "chembl", "bindingdb"], "assay_id": ["A1", "A1", "7"],
+            "assay_entry_id": [None, None, "50"], "document_pmid": ["1", None, None],
+            "document_doi": [None, "10.1/x", None], "document_patent": [None, None, None],
+            "document_id": ["D1", "D1", None]}
+    pq.write_table(pa.table({names[role]: pa.array(values, pa.string())
+                             for role, values in rows.items()}), tmp_path / "src.parquet")
+    local = dict(config, stage2b=dict(config["stage2b"], inputs={"chembl": "src.parquet"}))
+    documents = pipeline.assay_documents(local, tmp_path)
+    assert documents == {"chembl::A1": frozenset({"pmid:1", "doi:10.1/x"}),
+                         "bindingdb:50:7": frozenset()}
+
+
+# ------------------------------------------------------------------- cờ của ChEMBL (bước 5)
+
+
+def test_chembl_observation_info_reads_confidence_and_inactive_comments(
+        tmp_path: Path, config: dict[str, Any]) -> None:
+    names = config["stage2b"]["columns"]
+    table = pa.table({
+        names["observation_id"]: pa.array(["o1", "o2", "o3", "o4", "o5"], pa.string()),
+        names["assay_context"]: pa.array([
+            '{"confidence_score": 9}', '{"confidence_score": 8}',
+            '{"confidence_score": null}', '{"confidence_score": "7"}', None], pa.string()),
+        names["activity_context"]: pa.array([
+            '{"activity_comment": "Not Active"}', '{"activity_comment": "active"}',
+            '{"activity_comment": null}', None, '{"activity_comment": "inconclusive "}'],
+            pa.string()),
+    })
+    pq.write_table(table, tmp_path / "src.parquet")
+    local = {"stage2b": dict(config["stage2b"], inputs={"chembl": "src.parquet"})}
+    export = config["stage2b"]["export"]
+    confidence, inactive = pipeline.chembl_observation_info(local, tmp_path, export)
+    assert confidence == {"o2": 8, "o3": export["missing_confidence"], "o4": 7}
+    assert inactive == {"o1", "o5"}
+
+
+def test_observation_flag_columns_by_source(tmp_path: Path) -> None:
+    path = write_warning_deltas(tmp_path / "b00.parquet",
+                                [("p1", ["o1"], ["o2"]), ("p1", ["o3"], ["o4"]),
+                                 ("p2", ["o5"], ["o6"]), ("p3", ["o7"], ["o8"])])
+    records = pa.table({
+        "pair_id": pa.array(["p1", "p2", "p3"], pa.string()),
+        "assay_keys": pa.array([["chembl::A1", "chembl::A2"], ["chembl::A3"],
+                                ["bindingdb:5:1"]], pa.list_(pa.string())),
+    })
+    minimum, inactive = pipeline.observation_flag_columns(
+        path, records, {"o2": 8, "o4": 0}, {"o5"}, 9, "chembl:")
+    # p1: mức nhỏ nhất của các phép đo đóng góp; p2: ChEMBL không có mức thấp -> 9;
+    # p3: chỉ BindingDB -> null.
+    assert minimum.to_pylist() == [0, 9, None]
+    assert inactive.to_pylist() == [False, True, False]
+
+
+def test_nonstandard_proteins_ignores_case_and_whitespace() -> None:
+    proteins = pa.table({"protein_hash": ["h1", "h2", "h3", "h4"],
+                         "protein_sequence": ["mktay", "MKT AY\n", "MKT1AY",
+                                              "biotin-C6linker-MKT"]})
+    alphabet = "ACDEFGHIKLMNPQRSTVWYBXZUO"
+    assert pipeline.nonstandard_proteins(proteins, alphabet) == {"h3", "h4"}
+
+
 # --------------------------------------------------------------------------- split trong export
 
 
@@ -543,6 +672,76 @@ def test_partition_column_reads_the_partition_of_each_protein() -> None:
 
 
 # --------------------------------------------------------------------------- verify, split
+
+
+def stored_records(config: dict[str, Any]) -> tuple[pa.Table, dict[str, frozenset[str]]]:
+    """Bản ghi do chính aggregate_deltas tạo, và bảng tài liệu dùng cho nó."""
+    documents = {"s:e:1": frozenset({"pmid:1"}), "s:e:2": frozenset({"pmid:2"}),
+                 "s:e:3": frozenset({"pmid:1"})}
+    rows = [("KEY-B", "s:e:1", 1.0), ("KEY-B", "s:e:2", 1.0), ("KEY-B", "s:e:3", 2.5),
+            ("KEY-C", "s:e:1", 0.4)]
+    deltas = pa.table({
+        "protein_hash": pa.array([HASH_A] * len(rows), pa.string()),
+        "molecule_a_key": pa.array(["KEY-A"] * len(rows), pa.string()),
+        "molecule_b_key": pa.array([row[0] for row in rows], pa.string()),
+        "assay_key": pa.array([row[1] for row in rows], pa.string()),
+        "delta_p": pa.array([row[2] for row in rows], pa.float64()),
+        "p_a": pa.array([6.0] * len(rows), pa.float64()),
+        "p_std_a": pa.array([None] * len(rows), pa.float64()),
+        "p_std_b": pa.array([None] * len(rows), pa.float64()),
+        "independent": pa.array([True] * len(rows), pa.bool_()),
+        **{name: pa.array([name] * len(rows), pa.string())
+           for name in aggregate.RECORD_CARRIED},
+    })
+    qc = config["stage2b"]["qc"]
+    records = aggregate.aggregate_deltas(deltas, qc["dispersion_thresholds"]["Ki"],
+                                         qc["dispersion_ddof"], qc["collapse_tolerance"],
+                                         config["stage2b"]["replicate"]["float_slack"],
+                                         documents)
+    return records, documents
+
+
+def recompute(records: pa.Table, documents: dict[str, frozenset[str]],
+              config: dict[str, Any]) -> list[bool]:
+    stage = config["stage2b"]
+    return pipeline.recompute_mismatch(
+        records.select(list(pipeline.RECOMPUTED_COLUMNS)),
+        stage["qc"]["dispersion_thresholds"]["Ki"], stage["qc"]["dispersion_ddof"],
+        stage["qc"]["collapse_tolerance"], stage["replicate"]["float_slack"],
+        stage["run"]["verify_tolerance"], documents).tolist()
+
+
+def test_recompute_mismatch_accepts_records_written_by_step_four(
+        config: dict[str, Any]) -> None:
+    records, documents = stored_records(config)
+    assert recompute(records, documents, config) == [False, False]
+
+
+def test_recompute_mismatch_catches_a_wrong_document_count(config: dict[str, Any]) -> None:
+    records, documents = stored_records(config)
+    index = records.schema.get_field_index("n_documents")
+    wrong = records.set_column(index, "n_documents",
+                               pa.array([9, 1], pa.int64()))
+    assert recompute(wrong, documents, config) == [True, False]
+
+
+def test_recompute_mismatch_catches_a_wrong_status(config: dict[str, Any]) -> None:
+    records, documents = stored_records(config)
+    index = records.schema.get_field_index("qc_status")
+    # Bản ghi đầu đúng là quarantine (hai giá trị 1,0 và 2,5); bản ghi sau đúng là
+    # single_assay nên ghi 'pass' là sai.
+    wrong = records.set_column(index, "qc_status",
+                               pa.array(["quarantine", "pass"], pa.string()))
+    assert recompute(wrong, documents, config) == [False, True]
+
+
+def test_stored_records_fixture_has_the_expected_meaning(config: dict[str, Any]) -> None:
+    records, _ = stored_records(config)
+    first, second = records.to_pylist()
+    # 1,0 xuất hiện ở hai assay nhưng chỉ tính một lần; s:e:1 và s:e:3 chung PMID.
+    assert (first["n_assays"], first["n_distinct_values"], first["n_documents"]) == (3, 2, 2)
+    assert first["qc_status"] == aggregate.QC_QUARANTINE
+    assert second["qc_status"] == aggregate.QC_SINGLE
 
 
 def test_close_or_both_nan_accepts_two_nans() -> None:

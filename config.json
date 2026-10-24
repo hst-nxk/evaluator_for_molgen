@@ -245,9 +245,10 @@
       "bindingdb": "data/dedup/bindingdb202610_observations_dedup.parquet"
     },
     "paths": {
-      "dataset_dir": "data/dataset",
-      "full_dir": "data/dataset/full",
-      "runs_dir": "runs/dataset"
+      "dataset_dir": "data/dataset_v2",
+      "full_dir": "data/dataset_v2/full",
+      "runs_dir": "runs/dataset",
+      "version_note": "v2 (24/10/2026) ghi vào thư mục mới; v1 (data/dataset, dựng 21-22/10/2026) giữ nguyên, chỉ đọc, để đối chiếu. Thay đổi của v2 và lý do: docs/AUDIT_20261024.md mục 6 và docs/STAGE2B_DATASET.md mục v2."
     },
     "files": {
       "molecules": "molecules.parquet",
@@ -285,7 +286,12 @@
       "assay_status": "assay_status",
       "keep": "dedup_keep",
       "activity_context": "activity_context",
-      "molecule_source_id": "molecule_source_id"
+      "assay_context": "assay_context",
+      "molecule_source_id": "molecule_source_id",
+      "document_pmid": "document_pmid",
+      "document_doi": "document_doi",
+      "document_patent": "document_patent_number",
+      "document_id": "document_id"
     },
     "filter": {
       "resolved_status": "resolved",
@@ -308,7 +314,9 @@
     "mmp": {
       "min_cuts": 1,
       "max_cuts": 1,
-      "max_cut_bonds": 20,
+      "max_cut_bonds": 400,
+      "cut_smarts": "[#6+0;!$(*=,#[!#6])]!@!=!#[*]",
+      "max_cut_bonds_note": "v2. maxCutBonds của rdMMPA KHÔNG giới hạn kích thước phép sửa: nếu số liên kết khớp cut_smarts của phân tử vượt maxCutBonds thì FragmentMol trả về RỖNG cho cả phân tử, nên phân tử lớn mất hết cặp. Kích thước phép sửa do max_variable_heavy_atoms và min_core_fraction quyết định. v1 dùng 20 (mặc định RDKit) và mất 194.400 Δp assay (+1,46 %), 166.585 bản ghi (đo ngày 24/10/2026, docs/AUDIT_20261024.md mục 3.3). Phân tử nhiều liên kết cắt nhất trong dữ liệu có 340; 400 vượt mức đó, và mmp.check_cut_bonds báo lỗi nếu có phân tử vượt, nên không mất cặp thầm lặng. cut_smarts là mẫu mặc định của rdMMPA, ghi rõ ra để kiểm tra dùng đúng một định nghĩa.",
       "min_core_fraction": 0.6,
       "max_variable_heavy_atoms": 10,
       "attachment_points": 1,
@@ -327,11 +335,23 @@
     "qc": {
       "dispersion_thresholds": {"Ki": 1.0, "Kd": 1.0, "IC50": 1.4, "EC50": 1.4},
       "dispersion_ddof": 1,
+      "collapse_tolerance": 0.01,
       "report_levels": [0.3, 1.0],
-      "note": "Bước 4. Độ phân tán của các Δp: ≥ 3 assay là STD (ddof = dispersion_ddof); 2 assay là |Δ_X − Δ_Y|; 1 assay không tính (cờ single_assay). Vượt ngưỡng của endpoint -> cờ quarantine. Ngưỡng ≈ 2σ với σ mỗi phép đo đo ở Stage 2a (Ki 0,50; Kd 0,57; IC50/EC50 0,73). report_levels chỉ để báo cáo, đối chiếu Nelen et al. 2025, không lọc."
+      "note": "Bước 4 (v2). Trước khi tính thống kê, các Δp của một bản ghi lệch nhau ≤ collapse_tolerance được gộp làm MỘT giá trị (cùng quy tắc neo và cùng 0,01 với bước 1): đo ngày 24/10/2026, 69,3 % bản ghi ≥ 2 assay chỉ có một giá trị Δp, phần lớn là số liệu chép giữa các tài liệu, nên không được tính là bằng chứng thứ hai. Độ phân tán tính trên các giá trị khác nhau: ≥ 3 giá trị là STD (ddof = dispersion_ddof); 2 giá trị là |Δ_X − Δ_Y|. Cờ: single_assay (1 assay); identical_values (≥ 2 assay, 1 giá trị); quarantine (≥ 2 giá trị, phân tán > ngưỡng); pass (≥ 2 giá trị, phân tán ≤ ngưỡng). Ngưỡng giữ như v1: Ki/Kd 1,0; IC50/EC50 1,4. Căn cứ: ngưỡng được chọn trước khi xem nhãn, từ σ mỗi phép đo ở Stage 2a (Ki 0,50; Kd 0,57; IC50/EC50 0,73). Đo lại ngày 24/10/2026 trên cặp Δp từ hai tài liệu KHÁC nhau và khác giá trị, SD của hiệu là Ki ≈ 0,27; IC50 ≈ 0,38; EC50 ≈ 0,49, tức ngưỡng ≈ 3-4 SD của nhiễu giữa hai tài liệu độc lập (docs/AUDIT_20261024.md mục 4.4), KHÔNG phải '2σ' theo nghĩa thống kê của hiệu. report_levels chỉ để báo cáo, đối chiếu Nelen et al. 2025, không lọc."
     },
     "export": {
-      "eligible_qc": ["pass", "single_assay"],
+      "eligible_qc": ["pass", "single_assay", "identical_values"],
+      "eligible_qc_note": "identical_values là nhóm v1 xếp vào pass. Vẫn đủ điều kiện training (một giá trị đo được, không mâu thuẫn), nhưng tách nhãn để không ai đọc nó là 'được xác nhận bởi nhiều assay'. Lát đánh giá 'xác nhận độc lập' dùng n_documents ≥ 2 và n_distinct_values ≥ 2.",
+      "inactive_comments": ["inactive", "not active", "inconclusive", "uncertain", "not determined", "no inhibition", "no activity"],
+      "activity_comment_key": "activity_comment",
+      "activity_comment_regex": "\"activity_comment\"\\s*:\\s*\"",
+      "confidence_key": "confidence_score",
+      "low_confidence_regex": "\"confidence_score\"\\s*:\\s*(null|\"?[0-8]\\b)",
+      "direct_confidence": 9,
+      "missing_confidence": 0,
+      "chembl_assay_prefix": "chembl:",
+      "protein_alphabet": "ACDEFGHIKLMNPQRSTVWYBXZUO",
+      "observation_flag_note": "v2. Ba cột mô tả thêm, KHÔNG lọc dòng nào. min_target_confidence: confidence_score nhỏ nhất của ChEMBL trong các phép đo đóng góp (assay_context); 9 = 'Direct single protein target assigned', 8 = 'Homologous single protein target assigned' (protein đo có thể là đồng đẳng khác loài); null ChEMBL được coi là missing_confidence = 0 ('target unknown or has yet to be curated'); bản ghi chỉ có BindingDB thì null vì BindingDB không có trường tương đương. Đo ngày 24/10/2026 trên v1: 24,4 % dòng evaluator có ít nhất một assay mức 8. inactive_comment: ít nhất một phép đo đóng góp có activity_comment (so không phân biệt hoa thường) thuộc inactive_comments trên dòng qualifier '=', tức giá trị có thể là nồng độ cao nhất đã thử chứ không phải hằng số đo được (v1: 2.699 dòng evaluator). nonstandard_sequence: chuỗi protein (bỏ khoảng trắng, viết hoa — đúng chuẩn hóa của hash Stage 1) có ký tự ngoài protein_alphabet (20 acid amin chuẩn + B, X, Z, U, O), vd. chuỗi có chữ số hay tên nhóm hóa học như 'biotin-C6linker-'. Hai regex chỉ chọn trước dòng cần parse JSON; dòng đã chọn vẫn được parse đầy đủ.",
       "generator_min_gain": 0.3,
       "plausible_p_range": [2.0, 12.0],
       "min_protein_length": 50,
@@ -351,7 +371,7 @@
         "tool": "mmseqs2",
         "tool_install": "WSL Ubuntu-24.04, apt install mmseqs2",
         "tool_version": "15-6f452+ds-2",
-        "command": "mmseqs easy-cluster <fasta> <prefix> <tmp> --min-seq-id 0.5 -c 0.8 --cov-mode 2 --cluster-mode 1 --single-step-clustering --max-seqs 6315 --alignment-mode 3 --seq-id-mode 0 -s 7.5",
+        "command": "mmseqs easy-cluster <fasta> <prefix> <tmp> --min-seq-id 0.5 -c 0.8 --cov-mode 2 --cluster-mode 1 --single-step-clustering --max-seqs 11835 --alignment-mode 3 --seq-id-mode 0 -s 7.5",
         "cluster_tsv": "<prefix>_cluster.tsv",
         "min_identity": 0.5,
         "identity_denominator": "aligned_columns",
@@ -361,7 +381,8 @@
         "coverage_mode": 2,
         "cluster_mode": 1,
         "single_step_clustering": true,
-        "max_seqs": 6315,
+        "max_seqs": 11835,
+        "max_seqs_note": "v2: 11835 = tổng số chuỗi protein của Stage 2b (proteins.parquet); FASTA của split luôn là tập con nên con số này luôn đủ, kể cả khi v2 có thêm protein. run_split báo lỗi nếu max_seqs < số chuỗi FASTA. v1 dùng 6315 = đúng số chuỗi FASTA v1.",
         "sensitivity": 7.5,
         "note": "MMseqs2, chọn ngày 21/10/2026, ba tham số sửa ngày 22/10/2026 sau lần gom thử đầu tiên (xem docs/STAGE2B_DATASET.md mục 8.1). min_identity 0,5 và cluster_mode 1 (connected component) giữ đúng như split cũ (single-linkage ở 50 %). coverage 0,8 là chỗ CỐ Ý KHÁC split cũ, vì split cũ không có ràng buộc coverage nào. Lý do khoa học: không có coverage thì construct ngắn và protein đầy đủ của cùng một gene rơi vào hai partition, đó là rò rỉ thật với dữ liệu lấy protein_sequence theo construct. coverage_mode 2 = alnRes/qLen: với cặp (construct ngắn, protein đầy đủ), chiều chuỗi ngắn làm query che gần hết query nên đạt ngưỡng và hai chuỗi vẫn nối với nhau — vẫn là coverage đo trên chuỗi ngắn hơn, chỉ khác vai so với cov-mode 1. Lần đầu dùng cov-mode 1 và MMseqs2 in cảnh báo \"Combining cluster mode 1 in combination with coverage mode 1 can produce wrong results. Please use --cov-mode 2\", nên đổi theo khuyến nghị của chính công cụ; vai query/target không đi vào dataset vì ta chỉ dùng thành viên nhóm. Không dùng cov-mode 0 vì nó chia cho max(qLen, tLen), tức chuỗi dài hơn, nên loại đúng loại cặp construct/full-length cần gom. single_step_clustering: mặc định easy-cluster gom cascade 3 bước, mỗi bước chỉ xét chuỗi đại diện của bước trước, nên nhóm vụn hơn; MMseqs2 cũng nói \"Connected component clustering produces less clusters in a single step clustering\". Ít nhóm hơn = gộp nhiều hơn = an toàn hơn trước rò rỉ. max_seqs 6315: mặc định mmseqs cluster chặn ở 20 láng giềng mỗi chuỗi, và log lần đầu cho \"20 median result list length\", tức đã chạm mức chặn — protein có hơn 20 anh em cùng họ bị mất cạnh nối. Đặt bằng số chuỗi trong FASTA để bỏ hẳn giới hạn; nếu số protein có cặp thay đổi thì phải sửa con số này cho ≥ số chuỗi. alignment_mode 3 để identity là số residue giống nhau chia cho số cột alignment, cùng mẫu số với split cũ; mặc định MMseqs2 chỉ ước lượng identity từ score mỗi cột. seq_id_mode 0 cũng là mẫu số theo độ dài alignment; đã xác nhận cờ này có trong bản 15-6f452+ds-2 (`mmseqs cluster -h`: \"0: alignment length 1: shorter, 2: longer sequence [0]\"), mặc định đã là 0 nên truyền thêm chỉ để ghi rõ ý định. sensitivity 7.5 là tham số không do đề bài chốt: prefilter của MMseqs2 có thể bỏ sót cặp quanh 50 % mà global NW của split cũ không bỏ sót, với 6.315 chuỗi thì chi phí không đáng kể."
       },
@@ -380,11 +401,11 @@
   },
   "stage3": {
     "inputs": {
-      "evaluator": "data/dataset/evaluator_training.parquet",
-      "proteins": "data/dataset/full/proteins.parquet"
+      "evaluator": "data/dataset_v2/evaluator_training.parquet",
+      "proteins": "data/dataset_v2/full/proteins.parquet"
     },
     "paths": {
-      "cache_dir": "work/evaluator_cache",
+      "cache_dir": "work/evaluator_cache_v2",
       "runs_dir": "runs/evaluator"
     },
     "files": {
@@ -402,13 +423,13 @@
     },
     "protein_encoder": {
       "model": "facebook/esm2_t12_35M_UR50D",
-      "embedding_dim": null,
+      "embedding_dim": 480,
       "max_residues": 1022,
       "long_sequence": "windows",
       "pooling": "residues_only",
       "batch_sequences": 8,
       "pooling_note": "CHUẨN POOLING dùng chung cho CẢ HAI cấu hình frozen và finetune: mean-pool chỉ trên token acid amin, bỏ CLS/EOS/PAD. Chọn chuẩn này vì CLS và EOS không phải acid amin, và vì cache frozen đã tính đúng như vậy nên không phải dựng lại cache. Giá trị này là tư liệu: code không đọc nó, cả hai đường đã cùng một cách tính (features.embed_one_sequence và train.ProteinEncoderRuntime.encode).",
-      "note": "embedding_dim = null nghĩa là CHƯA ĐO trên máy này: chiều thật được đọc từ model đã nạp ở --mode prepare rồi ghi vào cache_manifest, và train/eval kiểm tra lại cho khớp. KHÔNG hardcode 512 hay bất kỳ số nào. max_residues là cửa sổ ESM2 trừ hai token đặc biệt. long_sequence: 'windows' = chuỗi dài hơn max_residues được chia thành các cửa sổ liền nhau rồi lấy mean của mean-pool từng cửa sổ (dùng cho frozen, không mất đuôi chuỗi); 'truncate' = chỉ lấy max_residues acid amin đầu (bắt buộc cho finetune vì bộ nhớ gradient). Chuỗi dài: 1.409 protein trên 11.835 dài hơn 1.024 aa, dài nhất 34.350 aa."
+      "note": "embedding_dim = 480: ĐO ĐƯỢC ngày 24/10/2026 từ model.config.hidden_size của facebook/esm2_t12_35M_UR50D ở --mode prepare, đã ghi vào cache_manifest. Con số 512 nhắc trong buổi họp là SAI. Giá trị ở đây giờ là một CHỐT KIỂM, không phải nguồn: features.load_protein_encoder báo lỗi nếu chiều thật của model khác số này, nên đổi model mà quên sửa thì chương trình dừng chứ không chạy sai. max_residues là cửa sổ ESM2 trừ hai token đặc biệt. long_sequence: 'windows' = chuỗi dài hơn max_residues được chia thành các cửa sổ liền nhau rồi lấy mean của mean-pool từng cửa sổ (dùng cho frozen, không mất đuôi chuỗi); 'truncate' = chỉ lấy max_residues acid amin đầu (bắt buộc cho finetune vì bộ nhớ gradient). Chuỗi dài: trong 6.313 protein thực sự được dùng, 797 chuỗi dài hơn max_residues nên phải chia cửa sổ (đo ngày 24/10/2026); trên toàn bộ 11.835 chuỗi của Stage 2b thì có 1.409, dài nhất 34.350 aa."
     },
     "model": {
       "ligand_hidden": [1024, 512],
@@ -457,6 +478,7 @@
         {"name": "all", "filters": {}},
         {"name": "strict", "filters": {"unseen_pair": true}},
         {"name": "multi_assay", "filters": {"min_n_assays": 2}},
+        {"name": "independent_agreement", "filters": {"min_n_documents": 2, "min_distinct_values": 2}},
         {"name": "clean", "filters": {"plausible_range": true, "no_source_warning": true}}
       ],
       "asymmetry_note": "Đầu ra direct KHÔNG được cưỡng chế đối xứng (cưỡng chế sẽ làm thay đổi bản chất của ablation direct-vs-twin). Thay vào đó mức lệch được ĐO và ghi vào manifest: |f(A,B)+f(B,A)|/2 phải bằng 0 nếu mô hình đối xứng, và |f(A,A)| phải bằng 0 vì phép sửa không sửa gì. Cặp (A,A) không tồn tại trong dataset nên số đo thứ hai nói về ngoại suy, không nói về chất lượng khớp. asymmetry_rows là cỡ mẫu ngẫu nhiên có seed cố định; 0 nghĩa là dùng toàn bộ validation.",

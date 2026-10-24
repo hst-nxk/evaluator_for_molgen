@@ -8,6 +8,19 @@ ngày 22/10/2026 (ghi ở mục 9).
 Mọi con số trong báo cáo này đều lấy từ một lần chạy đã hoàn tất hoặc từ một
 kiểm chứng đã thực sự chạy. Không có số nào là dự đoán.
 
+> **Cập nhật 24/10/2026 — báo cáo này mô tả dataset v1.** Audit ngày 24/10
+> (`docs/AUDIT_20261024.md`) tìm ra ba điểm cần sửa ở v1:
+>
+> 1. `maxCutBonds = 20` làm mất 1,58 % bản ghi;
+> 2. 69,3 % bản ghi "≥ 2 assay" thực chất là một giá trị bị chép, nên `n_assays` và
+>    `qc_status = pass` bị thổi phồng;
+> 3. Stage 3 đưa 11 chuỗi protein viết thường vào ESM2 mà không viết hoa.
+>
+> Nhãn Δp của v1 không sai ở mức đáng kể. Bản sửa là **dataset v2** (`data/dataset_v2/`):
+> code và test đã viết, **chưa chạy**, nên chưa có số đo nào của v2. Thay đổi và thứ tự chạy
+> ở `docs/STAGE2B_DATASET.md` mục 0. Mục 1 dưới đây ("sẵn sàng cho việc train") chỉ đúng
+> cho v1, với các giới hạn vừa nêu.
+
 ---
 
 ## 1. Trả lời ngắn
@@ -38,7 +51,7 @@ lại `--mode full`.
 | `data/dataset/evidence_records.parquet` | 10.546.330 | Toàn bộ bản ghi, kể cả phần bị cách ly |
 | `data/dataset/protein_split.parquet` | 6.315 | protein_hash sang train/validation/test |
 | `data/dataset/full/proteins.parquet` | 11.835 | Chuỗi protein, accession, tên |
-| `data/dataset/full/molecules.parquet` | 1.306.158 | molecule_key sang SMILES |
+| `data/dataset/full/molecules.parquet` | 1.306.158 | molecule_key sang SMILES (1.285.061 SMILES phân biệt; chênh lệch là các khóa `-REL`, xem mục 6.2) |
 
 Cột của `evaluator_training.parquet`: `pair_id`, `endpoint`, `protein_hash`,
 `partition`, `smiles_a`, `smiles_b`, `constant_smiles`, `variable_a`,
@@ -203,7 +216,32 @@ là phép đo độc lập và không tính là assay độc lập.
    hơn để chiều cặp luôn xác định. Kết quả **13.302.366 dòng**. 164.156 cặp bị
    loại vì một phía mang cờ `-REL` và phía kia không (1,2 %).
 4. **Gộp theo bản ghi** `(A, B, protein, endpoint)`: lấy trung bình các Δp theo
-   assay, được **10.546.330 bản ghi**; 1.306.158 phân tử, 11.835 protein.
+   assay, được **10.546.330 bản ghi**.
+   Số phân tử và protein *thực sự xuất hiện trong các bản ghi này* (đo lại ngày
+   24/10/2026): **959.239 phân tử** và 6.315 protein. Hai con số 1.306.158 và 11.835 là
+   kích thước của hai **bảng tra** `molecules.parquet` và `proteins.parquet`, tức toàn bộ
+   phân tử và chuỗi đi vào Stage 2b. Bản ghi của `evaluator_training.parquet` dùng 958.926
+   phân tử và 6.313 protein; chênh 313 phân tử và **2 protein** so với evidence là phần chỉ
+   xuất hiện trong 23.571 bản ghi `quarantine` (2 protein đó đã kiểm trực tiếp: có trong
+   evidence, không có ngoài quarantine).
+
+   Mọi khóa của bảng tra rơi vào đúng một nhóm sau (kế toán đầy đủ, đo 24/10/2026, đọc
+   `replicates/`, `assay_deltas/`, `records/` và `lost_relative_pairs/` của bước `full`):
+
+   | nhóm | ý nghĩa | số khóa |
+   |---|---|---:|
+   | A | không có nhóm bước 1 nào | 0 |
+   | B | mọi khối `(endpoint, assay, protein)` chứa nó chỉ có 1 phân tử — không thể ghép cặp | 10.260 |
+   | C1 | chỉ mất do quy tắc `-REL` | 1.433 |
+   | C2 | nằm trong khối ≥ 2 phân tử nhưng **không tạo được MMP hợp lệ nào** | **321.462** |
+   | D | có cặp nhưng không có bản ghi | **0** |
+   | E | có mặt trong bản ghi (→ 959.239 SMILES, khớp evidence) | 973.003 |
+   | | **tổng** | **1.306.158** |
+
+   Những gì kế toán này **chứng minh**: không phân tử nào mất ở các bước sau ghép cặp
+   (nhóm D = 0), và 11.693 phân tử (B + C1) bị loại vì quy tắc đã ghi. Những gì nó **chưa
+   chứng minh**: 321.462 phân tử nhóm C2 bị loại *đúng* — tức thực sự không có đối tác MMP
+   hợp lệ trong khối của mình — hay bị bỏ sót. Xem mục 11, điểm 10.
 5. **Xuất** ba file ở mục 2.
 
 ### 6.3 QC của bước 4
@@ -374,9 +412,12 @@ Giữ lại ở đây cho đầy đủ; chi tiết ở `docs/STAGE2B_DATASET.md`
 | Gộp replicate trong một assay | lệch pActivity không quá 0,01 | Quy ước nội bộ: 0,01 log nhỏ hơn hai bậc so với σ thực nghiệm (0,5 đến 0,7), nên chỉ gộp các giá trị khác nhau do làm tròn. Ghi ở `docs/STAGE2A_DEDUP_AUDIT.md` mục 5.6 |
 | Cách tổng hợp replicate và Δp nhiều assay | Trung bình trên thang log (p), không trên thang nồng độ | pActivity là thang log; Ki và IC50 phân bố lệch nên trung bình trên thang log là cách tổng hợp chuẩn — [1], [2] |
 | σ thực nghiệm cho một phép đo | Ki 0,50, Kd 0,57, IC50 và EC50 0,73 (đo từ chính dữ liệu dự án) | Khớp với tài liệu: σ(pKi) = 0,54 trên ChEMBL [1]; σ(pIC50) = 0,68, MUE 0,55, MedUE 0,43, tức nhiễu IC50 lớn hơn Ki khoảng 25 % [2] |
-| Ngưỡng cách ly bản ghi phân tán | Ki và Kd 1,0; IC50 và EC50 1,4 | Khoảng 2σ của chính endpoint đó (2 nhân 0,50 bằng 1,0; 2 nhân 0,73 xấp xỉ 1,4). Chênh lệch dưới 2σ không phân biệt được với nhiễu thực nghiệm [1], [2] |
+| Ngưỡng cách ly bản ghi phân tán | Ki và Kd 1,0; IC50 và EC50 1,4 | Chọn **trước khi xem nhãn**, bằng 2 lần σ của một phép đo (2 × 0,50 = 1,0; 2 × 0,73 ≈ 1,4) [1], [2]. **Sửa lập luận (audit 24/10/2026, mục 4.4):** đây là bội của σ một phép đo, *không* phải "2 SD" của đại lượng được so. Đo trực tiếp trên các cặp Δp đến từ hai tài liệu khác nhau và có giá trị khác nhau, SD của hiệu là Ki ≈ 0,27; IC50 ≈ 0,38; EC50 ≈ 0,49. Như vậy ngưỡng ≈ 3–4 SD của nhiễu giữa hai tài liệu độc lập, và bản ghi bị cách ly là bất đồng thật chứ không phải nhiễu thông thường |
+| Gộp Δp trùng giữa các assay (**v2**) | Δp lệch ≤ 0,01 thành **một** giá trị trước khi tính thống kê; cờ `identical_values` | Cùng quy tắc neo và cùng ngưỡng với gộp replicate. Lý do là số đo của dự án (audit mục 4): 69,3 % bản ghi ≥ 2 assay chỉ có một giá trị Δp, phần lớn là số liệu chép giữa các tài liệu, nên không được tính là xác nhận độc lập |
+| Số tài liệu độc lập (**v2**) | `n_documents`: assay nối với nhau khi chung PMID, DOI, patent đã chuẩn hóa, hoặc mã tài liệu của nguồn | Cùng quy tắc chuẩn hóa tài liệu với Stage 2a. Lát đánh giá "xác nhận độc lập" = `n_documents ≥ 2` và `n_distinct_values ≥ 2` |
+| Mức tin cậy target của ChEMBL (**v2**, cờ, không lọc) | `min_target_confidence` | `confidence_score` của ChEMBL: 9 = gán trực tiếp một protein, 8 = gán protein đồng đẳng (có thể khác loài với protein thật sự được đo). Định nghĩa theo bảng `confidence_score_lookup` của ChEMBL. Đo trên v1: 24,4 % dòng evaluator có ≥ 1 assay mức 8 |
 | Δp tính **trong cùng một assay**, không trộn assay | bắt buộc | [3] cho thấy gộp IC50 hoặc Ki từ các assay và nguồn khác nhau tạo nhiễu lớn: với mức curation tối thiểu, khoảng 65 % cặp lệch trên 0,3 log và 27 % lệch trên 1 log; siết metadata assay thì còn 48 % và 13 %. Vì vậy Δp chỉ tính trong một assay, rồi mới lấy trung bình giữa các assay và báo độ phân tán |
-| Cặp MMP một lần cắt | `minCuts = maxCuts = 1`, `maxCutBonds = 20` | Thuật toán phân mảnh và chỉ mục của [4]; RDKit `rdMMPA` hiện thực thuật toán này. Cách dùng MMP cho dữ liệu nhiều thuộc tính theo [5], [6] |
+| Cặp MMP một lần cắt | `minCuts = maxCuts = 1`; `maxCutBonds` = 20 ở v1, 400 ở **v2** | Thuật toán phân mảnh và chỉ mục của [4]; RDKit `rdMMPA` hiện thực thuật toán này. Cách dùng MMP cho dữ liệu nhiều thuộc tính theo [5], [6]. `maxCutBonds` **không** giới hạn kích thước phép sửa: phân tử có nhiều liên kết cắt được hơn ngưỡng bị loại cả phân tử, tức là một bộ lọc ngầm (mục 11.10). v2 bỏ bộ lọc ngầm này; kích thước phép sửa vẫn do hai ngưỡng ở dòng dưới khống chế |
 | Lõi chung từ 60 % nguyên tử nặng, phần biến đổi không quá 10 nguyên tử nặng | ngưỡng dự án | Giữ nghĩa "một thay đổi nhỏ trên cùng một khung" của MMP; [5] dùng giới hạn tương tự để cặp còn ý nghĩa hóa dược |
 | Chỉ dùng giá trị qualifier `=` | bắt buộc | Giá trị bị chặn (`>`, `<`) không cho biết hoạt tính thật, nên không thể trừ nhau thành Δp |
 | Định danh phân tử tính lại bằng RDKit | bắt buộc | [7]: lỗi cấu trúc trong dữ liệu công khai lan xuống descriptor và làm giảm chất lượng model, nên phải tự chuẩn hóa thay vì tin định danh của nguồn. Số đo của dự án ở mục 9.3 |
@@ -499,6 +540,69 @@ Tất cả đều đã đo, đã gắn cờ hoặc đã ghi lại; không có c�
    dòng (mục 9.3). Không ảnh hưởng vì định danh luôn tính lại từ SMILES.
 9. **BindingDB mất 58.159 dòng** vì không có liên kết assay trong
    `BindingDB_rsid_eaids`, nên không xác định được "cùng một assay".
+10. **Tính đầy đủ của bước ghép cặp MMP chưa được kiểm chứng độc lập.** 321.462 phân tử
+   (24,6 % bảng tra) nằm trong khối `(endpoint, assay, protein)` có ≥ 2 phân tử — trung vị
+   khối lớn nhất của chúng là 31 phân tử, p90 là 406, lớn nhất 2.882 — nhưng không tạo được
+   cặp MMP hợp lệ nào (mục 6.2, nhóm C2). Với quy tắc cắt đơn, lõi ≥ 60 % và nhóm thế ≤ 10
+   nguyên tử nặng, nhiều phân tử không có đối tác là điều chờ đợi, vì một assay thường
+   chứa nhiều dãy hóa học khác nhau. Nhưng "chờ đợi" chưa phải "đã kiểm": các kiểm chứng
+   đã chạy cho bước này đều về tính **đúng** của các cặp đã sinh, chưa có kiểm chứng nào
+   về tính **đủ**. Theo SMILES phân biệt, C2 là 316.354 (khóa và SMILES lệch nhau vì khóa
+   `-REL`; khi báo cáo phải nói rõ đơn vị).
+
+   **Một phần C2 đã có nguyên nhân, đo ngày 24/10/2026: `maxCutBonds = 20` là một bộ lọc
+   thầm.** `rdMMPA.FragmentMol` (RDKit 2026.09.1) **không** cắt tối đa 20 liên kết — nếu
+   phân tử có hơn 20 liên kết khớp mẫu cắt mặc định `[#6+0;!$(*=,#[!#6])]!@!=!#[*]` thì nó
+   trả về **rỗng cho cả phân tử**. Kiểm trên chuỗi carbon thẳng: 20 liên kết khớp cho 10 mảnh,
+   21 liên kết khớp cho 0 mảnh (cùng chuỗi đó, `maxCutBonds = 100` cho 10 mảnh). Trên dữ liệu
+   thật, đếm **toàn bộ** (không lấy mẫu): số liên kết khớp lớn nhất trong 959.239 SMILES của
+   nhóm E là **đúng 20**, và **48.954** trên 316.354 SMILES của nhóm C2 (15,5 %) có hơn 20 —
+   tất cả đều bị trả rỗng. Đây là một tiêu chí **không có trong tài liệu**: docstring của
+   `dataset/mmp.py` mô tả `maxCutBonds` như tham số của từng lần cắt.
+
+   Số SMILES C2 vẫn bị loại theo từng ngưỡng (lớn nhất trong dữ liệu là 340):
+
+   | ngưỡng `maxCutBonds` | 20 | 30 | 50 | 100 | 150 | 200 | 300 |
+   |---|---:|---:|---:|---:|---:|---:|---:|
+   | C2 vẫn bị loại | 48.954 | 20.230 | 9.650 | 2.856 | 1.050 | 101 | 4 |
+
+   Về hiệu năng: với cắt đơn (`maxCuts = 1`), số cách cắt **một phân tử** tăng tuyến tính
+   theo số liên kết. Nhưng số **cặp** trong một khối tăng theo bình phương số phân tử cùng
+   lõi, nên nâng ngưỡng có thể làm bước ghép cặp tăng nhanh hơn tuyến tính, nhất là ở các
+   assay nhiều peptide. Câu "giới hạn 20 không có lý do hiệu năng" ở bản trước chỉ đúng cho
+   bước phân mảnh, không đúng cho cả pipeline; tác động thật phải đo.
+
+   Cần quyết định: giữ và ghi thành tiêu chí chọn mẫu, hoặc nâng giới hạn rồi dựng lại
+   Stage 2b thành một **phiên bản dataset mới** có manifest riêng, không ghi đè bản hiện tại.
+
+   Hồ sơ của nhóm bị loại, đo trên cùng mẫu (3.012 phân tử bị loại trong 20.000 mẫu C2, so
+   với 20.000 mẫu nhóm E):
+
+   | | nhóm E (đang có) | C2, ≤ 20 liên kết cắt | C2, > 20 (bị loại) |
+   |---|---:|---:|---:|
+   | nguyên tử nặng, trung vị | 31 | 30 | 65 |
+   | MW, trung vị | 437 | 429 | 913 |
+   | liên kết quay, trung vị (p90) | 6 (9) | 5 (10) | 21 (75) |
+   | liên kết quay > 10 | 6,0 % | 8,3 % | 93,9 % |
+   | MW > 500 | 26,4 % | 27,9 % | 96,3 % |
+   | dạng peptide (≥ 2 đơn vị khung amide nối tiếp) | 2,2 % | 3,2 % | 58,5 % |
+
+   Nhóm bị loại là một vùng hóa học khác hẳn — gấp đôi kích thước, quá nửa dạng peptide.
+   Phần C2 chưa giải thích thì trùng khít với nhóm E, nên không thấy dấu hiệu của một bộ
+   lọc theo kích thước thứ hai. Số liên kết cắt lớn nhất trong nhóm E là đúng 20.
+   Hệ quả cho evaluator: không nên dùng nó để chấm phân tử có hơn 20 liên kết cắt được,
+   vì đó là ngoài phân bố huấn luyện.
+
+   Phần còn lại của C2 (cỡ 84 %, có ≤ 20 liên kết khớp nên có mảnh) **vẫn chưa kiểm**. Cách
+   kiểm đúng: lấy mẫu phân tầng theo **khối** (không theo phân tử), liệt kê mọi cặp hợp lệ
+   trong khối bằng một bản cài **độc lập** với `dataset/mmp.py`, rồi so với `assay_deltas`
+   của khối đó — bắt được cả phân tử mất hết cặp (C2) lẫn phân tử chỉ mất một phần cặp (nằm
+   trong E, vô hình với kiểm tra chỉ trên C2). Không tìm thấy cặp sót nào trong n khối lấy
+   ngẫu nhiên thì cận trên 95 % của **tỉ lệ khối có ít nhất một cặp sót** là xấp xỉ 3/n —
+   **không** phải tỉ lệ cặp bị sót, hai đại lượng phải tách bạch trong paper. Lấy mẫu khối
+   đều nhau còn thiên về khối nhỏ trong khi phần lớn cặp nằm ở khối lớn, nên muốn có cận
+   trên cho tỉ lệ cặp thì phải lấy mẫu phân tầng theo kích thước khối hoặc theo xác suất tỉ
+   lệ với số cặp.
 
 ---
 

@@ -132,11 +132,26 @@ def build_fingerprint_cache(config: Mapping[str, Any], root: Path) -> dict[str, 
     return report
 
 
+def canonical_sequence(sequence: str) -> str:
+    """Chuỗi protein bỏ khoảng trắng và viết hoa — đúng chuẩn hóa của hash ở Stage 1.
+
+    Vì sao: proteins.parquet giữ chuỗi nguyên văn của nguồn, và BindingDB có chuỗi viết
+    thường (đo ngày 24/10/2026: 34 hash, 11 protein có cặp). Tokenizer ESM2 không nhận chữ
+    thường: mỗi ký tự thường thành token <unk>, nên embedding của protein đó vô nghĩa.
+    Hash của Stage 1 đã coi chuỗi thường và hoa là một (normalize.sequence_hash), nên
+    chuẩn hóa ở đây không đổi danh tính protein nào.
+    """
+    return "".join(sequence.split()).upper()
+
+
 def protein_sequences(config: Mapping[str, Any], root: Path) -> dict[str, str]:
     """{hash protein: chuỗi} cho các protein thực sự có cặp trong dataset.
 
-    Chỉ lấy protein xuất hiện trong dataset (6.315 trên 11.835 chuỗi của Stage 2b), vì
-    chạy ESM2 cho chuỗi không dùng đến là tốn vô ích.
+    Chỉ lấy protein xuất hiện trong dataset (đo ngày 24/10/2026: 6.313 trên 11.835 chuỗi
+    của Stage 2b), vì chạy ESM2 cho chuỗi không dùng đến là tốn vô ích. Hàm báo lỗi nếu có
+    protein của dataset không có chuỗi, nên từ vựng cache luôn phủ hết dataset.
+    Chuỗi trả về đã qua canonical_sequence: mọi đường dùng ESM2, frozen lẫn finetune,
+    đều lấy chuỗi từ đây.
     """
     source = root / config["stage3"]["inputs"]["evaluator"]
     used = set(distinct_values(source, ("protein_hash",)))
@@ -146,7 +161,7 @@ def protein_sequences(config: Mapping[str, Any], root: Path) -> dict[str, str]:
     for hash_value, sequence in zip(table.column("protein_hash").to_pylist(),
                                     table.column("protein_sequence").to_pylist()):
         if hash_value in used:
-            mapping[hash_value] = sequence
+            mapping[hash_value] = canonical_sequence(sequence)
     missing = used - set(mapping)
     if missing:
         raise ValueError(f"{len(missing)} protein của dataset không có chuỗi trong "

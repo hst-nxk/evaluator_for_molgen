@@ -9,3 +9,6 @@ __pycache__/
 venv/
 env/
 *.partial
+
+# Trọng số model tải từ Hugging Face khi đặt HF_HOME vào trong repo (ESM2 ~136 MB).
+.cache/

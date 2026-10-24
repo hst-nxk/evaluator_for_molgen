@@ -239,11 +239,19 @@ Cột thứ tư, `source_quality_warning`, mang nguyên văn cảnh báo chất 
 ChEMBL và cũng không lọc dòng nào: 146.464 bản ghi evidence mang cảnh báo, và cột đã được
 audit độc lập với 0 lệch trên cả ba file. Xem `docs/STAGE2B_DATASET.md` mục 9.2.
 
+Các số trên là của **v1** (`data/dataset/`). Ngày 24/10/2026 audit
+(`docs/AUDIT_20261024.md`) dẫn tới **dataset v2** (`data/dataset_v2/`, v1 giữ nguyên):
+`max_cut_bonds` 20 → 400, Δp chép giữa các assay chỉ tính một lần (cờ QC mới
+`identical_values`), thêm cột `n_documents`, `n_distinct_values`, `p_a_range`,
+`max_replicate_std`, `min_target_confidence`, `inactive_comment`, `nonstandard_sequence`.
+Code và test của v2 đã viết, **chưa chạy**. Thay đổi, lý do và thứ tự chạy (gồm câu lệnh
+MMseqs2 với `--max-seqs 11835`): `docs/STAGE2B_DATASET.md` mục 0.
+
 ```powershell
 python run_dataset.py --mode smoke     # ~1/200 số assay -> runs/dataset/smoke_<thời điểm>/
-python run_dataset.py --mode full      # toàn bộ -> data/dataset/full/   (thêm --force để ghi đè)
+python run_dataset.py --mode full      # toàn bộ -> data/dataset_v2/full/ (thêm --force để ghi đè)
 python run_dataset.py --mode split     # ghi FASTA đầu vào; cần --clusters để dựng split
-python run_dataset.py --mode export    # training + evidence -> data/dataset/
+python run_dataset.py --mode export    # training + evidence -> data/dataset_v2/
 python run_dataset.py --mode verify    # kiểm tra -> runs/dataset/verify_<thời điểm>.json
 ```
 
@@ -255,8 +263,9 @@ toàn bộ kiểm chứng đã chạy và tài liệu tham khảo cho từng ng�
 
 ## Stage 3: evaluator baseline
 
-Đã chạy: `pytest` (350 passed, 1 skipped), `--mode baseline` và `--mode prepare --skip-protein`.
-**Chưa train mô hình nào** — mọi chế độ cần torch vẫn chưa chạy.
+Đã chạy: `pytest`, `--mode baseline`, `--mode prepare --skip-protein` và `--mode smoke`
+cho cả ba đầu ra trên GPU. **Chưa train mô hình nào** — smoke chỉ 20.000 dòng và 2 epoch.
+Phần ESM2 còn chờ `transformers`.
 
 Evaluator nhận một cặp `(A, B, protein, endpoint)` và dự đoán
 Δp = p(B) − p(A). Phiên bản v1 cố tình dùng biểu diễn đơn giản nhất — Morgan fingerprint cho
@@ -287,12 +296,14 @@ python run_evaluator.py --mode train --config frozen --head direct
 python run_evaluator.py --mode eval --checkpoint runs\evaluator\<tên>.pt
 ```
 
-`torch` và `transformers` đã có trong `requirements.txt` nhưng **không pin phiên bản**, vì bản
-torch đúng phụ thuộc CUDA của máy; cả hai cũng **chưa được cài** ở đây, nên chiều embedding
-thật của ESM2 chưa đo được — code đọc chiều đó từ chính model lúc `--mode prepare` chứ không
-hardcode. Hai chế độ `baseline` và `prepare --skip-protein` không cần torch và đã chạy xong;
-cache fingerprint hiện có trong `work/evaluator_cache/` (958.926 phân tử, 70.455 nhóm thế,
-0 SMILES không đọc được).
+Môi trường đã kiểm chứng: torch 2.5.1+cu121 (GPU hoạt động), transformers 4.44.2.
+**Chiều embedding ESM2 đo được là 480**, không phải 512 như nhắc trong buổi họp — code đọc
+chiều từ chính `model.config.hidden_size` lúc `--mode prepare` chứ không hardcode, và giá
+trị trong config giờ là chốt kiểm để đổi model mà quên sửa thì chương trình dừng.
+
+Cache đã dựng xong trong `work/evaluator_cache/` (~104 MB): 958.926 fingerprint phân tử,
+70.455 fingerprint nhóm thế (0 SMILES không đọc được) và 6.313 embedding protein.
+Hai chế độ `baseline` và `prepare --skip-protein` không cần torch.
 
 Kiến trúc, bốn quyết định về chỉ số, ước lượng tài nguyên và danh sách chỗ đáng lưu ý nhưng
 chưa sửa: [`docs/STAGE3_EVALUATOR.md`](docs/STAGE3_EVALUATOR.md).

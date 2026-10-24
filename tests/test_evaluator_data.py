@@ -26,6 +26,9 @@ def pair_table(rows: list[dict[str, Any]]) -> pa.Table:
         "variable_b": pa.array([row.get("variable_b", "[*]CC") for row in rows], pa.string()),
         "delta_p_mean": pa.array([row.get("delta_p_mean", 1.0) for row in rows], pa.float64()),
         "n_assays": pa.array([row.get("n_assays", 1) for row in rows], pa.int64()),
+        "n_documents": pa.array([row.get("n_documents", 1) for row in rows], pa.int64()),
+        "n_distinct_values": pa.array([row.get("n_distinct_values", 1) for row in rows],
+                                      pa.int64()),
         "qc_status": pa.array([row.get("qc_status", "pass") for row in rows], pa.string()),
         "unseen_pair": pa.array([row.get("unseen_pair", False) for row in rows], pa.bool_()),
         "plausible_range": pa.array([row.get("plausible_range", True) for row in rows],
@@ -72,6 +75,26 @@ def test_slice_mask_on_the_clean_slice_combines_two_conditions() -> None:
 def test_slice_mask_on_the_multi_assay_slice() -> None:
     table = pair_table([{"n_assays": 1}, {"n_assays": 2}, {"n_assays": 7}])
     assert data.slice_mask(table, {"min_n_assays": 2}).tolist() == [False, True, True]
+
+
+def test_slice_mask_on_the_independent_agreement_slice() -> None:
+    # Cần CẢ hai: ≥ 2 tài liệu và ≥ 2 giá trị khác nhau. Hai tài liệu cùng một giá trị là
+    # bản sao, không phải xác nhận độc lập.
+    table = pair_table([{"n_documents": 2, "n_distinct_values": 1},
+                        {"n_documents": 1, "n_distinct_values": 2},
+                        {"n_documents": 3, "n_distinct_values": 2}])
+    mask = data.slice_mask(table, {"min_n_documents": 2, "min_distinct_values": 2})
+    assert mask.tolist() == [False, False, True]
+
+
+def test_pair_columns_cover_every_slice_column() -> None:
+    for column in data.MINIMUM_KEYS.values():
+        assert column in data.PAIR_COLUMNS
+
+
+def test_config_slices_use_only_known_keys(config: dict[str, Any]) -> None:
+    for entry in config["stage3"]["metrics"]["slices"]:
+        assert set(entry["filters"]) <= set(data.SLICE_KEYS), entry["name"]
 
 
 def test_slice_mask_refuses_an_unknown_filter_key() -> None:

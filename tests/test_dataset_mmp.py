@@ -23,6 +23,7 @@ def settings(config: dict[str, Any]) -> mmp.FragmentSettings:
     return mmp.FragmentSettings(
         min_cuts=mmp_settings["min_cuts"], max_cuts=mmp_settings["max_cuts"],
         max_cut_bonds=mmp_settings["max_cut_bonds"],
+        cut_smarts=mmp_settings["cut_smarts"],
         min_core_fraction=mmp_settings["min_core_fraction"],
         max_variable_heavy_atoms=mmp_settings["max_variable_heavy_atoms"],
         attachment_points=mmp_settings["attachment_points"],
@@ -89,6 +90,41 @@ def test_fragment_molecule_of_molecule_without_cut_bonds(
 def test_fragment_molecule_reports_unreadable_smiles(settings: mmp.FragmentSettings) -> None:
     result = mmp.fragment_molecule("không phải SMILES", settings)
     assert result.failed is True and result.cuts == ()
+
+
+# Mạch thẳng 22 carbon: 21 liên kết C-C đơn ngoài vòng, đều khớp mẫu cắt.
+LONG_CHAIN = "C" * 22
+LONG_CHAIN_CUT_BONDS = 21
+
+
+def test_long_chain_has_the_expected_number_of_cut_bonds(
+        settings: mmp.FragmentSettings) -> None:
+    molecule = mmp.Chem.MolFromSmiles(LONG_CHAIN)
+    pattern = mmp.cut_pattern(settings.cut_smarts)
+    assert len(molecule.GetSubstructMatches(pattern)) == LONG_CHAIN_CUT_BONDS
+
+
+def test_fragment_molecule_raises_instead_of_dropping_a_large_molecule(
+        settings: mmp.FragmentSettings) -> None:
+    # Với max_cut_bonds < số liên kết cắt được, RDKit trả rỗng cho CẢ phân tử; v1 mất
+    # cặp thầm lặng vì vậy. v2 phải báo lỗi.
+    small = dataclasses.replace(settings, max_cut_bonds=LONG_CHAIN_CUT_BONDS - 1)
+    with pytest.raises(ValueError, match="max_cut_bonds"):
+        mmp.fragment_molecule(LONG_CHAIN, small)
+
+
+def test_fragment_molecule_cuts_a_large_molecule_under_config_limit(
+        settings: mmp.FragmentSettings) -> None:
+    assert settings.max_cut_bonds >= LONG_CHAIN_CUT_BONDS
+    cuts = mmp.fragment_molecule(LONG_CHAIN, settings).cuts
+    # Phép sửa vẫn nhỏ: giới hạn phần biến đổi không phụ thuộc max_cut_bonds.
+    assert cuts
+    assert max(cut.variable_heavy for cut in cuts) <= settings.max_variable_heavy_atoms
+
+
+def test_cut_pattern_rejects_bad_smarts() -> None:
+    with pytest.raises(ValueError, match="cut_smarts"):
+        mmp.cut_pattern("[[[")
 
 
 def test_fragment_molecule_respects_variable_size_limit(

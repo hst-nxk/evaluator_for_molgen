@@ -118,6 +118,15 @@ def test_assay_deltas_matches_the_stored_pair_id() -> None:
     assert row["pair_id"] == delta.pair_id("Ki", "aa", "KEY-A", "KEY-B", ID_LENGTH)
 
 
+def test_assay_deltas_carries_replicate_std_with_its_side() -> None:
+    # KEY-B ở dòng đầu nhưng là phía b sau khi xếp theo khóa: STD phải đi theo nó.
+    groups = group_table([{"molecule_key": "KEY-B", "p_mean": 8.0, "p_std": 0.4},
+                          {"molecule_key": "KEY-A", "p_mean": 6.0}])
+    (row,) = delta.assay_deltas(groups, [pair(0, 1)], "Ki", ID_LENGTH).to_pylist()
+    assert row["p_std_a"] is None
+    assert row["p_std_b"] == pytest.approx(0.4)
+
+
 def test_assay_deltas_without_pairs_returns_the_schema() -> None:
     table = delta.assay_deltas(group_table([]), [], "Ki", ID_LENGTH)
     assert table.num_rows == 0 and table.schema == delta.ASSAY_DELTA_SCHEMA

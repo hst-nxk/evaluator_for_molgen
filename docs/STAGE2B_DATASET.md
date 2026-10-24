@@ -10,6 +10,73 @@ Cập nhật cùng ngày: thêm cột `source_quality_warning` (mục 9.2) và c
 export`; 278 unit test pass, số dòng ba file không đổi, cột mới đã được audit độc lập với
 0 lệch.
 
+> **Mọi số đo ở mục 11 là của v1** (`data/dataset/`, dựng 21–22/10/2026). Mục 0 dưới đây
+> mô tả **v2**, ghi vào `data/dataset_v2/`; v1 giữ nguyên, chỉ đọc, để đối chiếu.
+
+## 0. Dataset v2 (24/10/2026)
+
+Trạng thái: **code và unit test đã viết, CHƯA chạy** (chưa chạy pytest, chưa dựng dataset).
+Chưa có số đo nào của v2. Lý do từng thay đổi và số đo trên v1 nằm ở
+`docs/AUDIT_20261024.md`.
+
+### 0.1 Những gì đổi và vì sao
+
+| # | Thay đổi | Vì sao (đo trên v1, 24/10/2026) | Code |
+|---|---|---|---|
+| 1 | `mmp.max_cut_bonds` 20 → 400; `cut_smarts` ghi rõ trong config; phân tử vượt giới hạn thì **báo lỗi** | `maxCutBonds` của RDKit không giới hạn kích thước phép sửa: vượt giới hạn thì `FragmentMol` trả về rỗng cho **cả phân tử**. v1 mất 194.400 Δp assay và 166.585 bản ghi (+1,58 %). Phân tử nhiều liên kết cắt nhất có 340. Kích thước phép sửa vẫn do `max_variable_heavy_atoms = 10` và `min_core_fraction = 0,6` khống chế, không đổi. | `mmp.check_cut_bonds`, `mmp.fragment_molecule` |
+| 2 | Bước 4: Δp của các assay lệch nhau ≤ 0,01 được gộp làm **một giá trị** trước khi tính thống kê (cùng quy tắc neo và cùng ngưỡng với bước 1) | 69,3 % bản ghi ≥ 2 assay chỉ có một giá trị Δp, phần lớn là số liệu chép giữa các tài liệu. Gộp như vậy để bản sao không được tính là bằng chứng thứ hai và không kéo mean về phía nó. | `aggregate.collapse_values`, `summarize_values` |
+| 3 | Cờ QC mới `identical_values` (≥ 2 assay, một giá trị). `pass` chỉ còn nghĩa "≥ 2 giá trị khác nhau, phân tán ≤ ngưỡng" | Ở v1 các bản ghi này mang `pass`, tức bị đọc nhầm là "được nhiều assay xác nhận". Vẫn đủ điều kiện training (`export.eligible_qc`). | `aggregate.qc_status` |
+| 4 | Cột mới ở bản ghi: `n_distinct_values`, `n_documents`, `p_a_range`, `max_replicate_std` | `n_documents` = số tài liệu độc lập (assay nối với nhau khi chung PMID, DOI, patent đã chuẩn hóa, hoặc mã tài liệu của nguồn). `p_a_range` lộ ra bản sao sai đơn vị (Δp trùng mà p(A) lệch đúng 3 hay 6 log: 30.391 bản ghi ở v1). `max_replicate_std`: 6.602 nhóm replicate trong assay có STD > 1. | `aggregate.document_count`, `pipeline.assay_documents` |
+| 5 | Cột mới ở file xuất: `min_target_confidence`, `inactive_comment`, `nonstandard_sequence` | Confidence 8 của ChEMBL = target đồng đẳng (24,4 % dòng evaluator v1 có ≥ 1 assay mức 8). `activity_comment` kiểu "inactive" trên dòng `=` (2.699 dòng v1). Chuỗi protein có chữ số hay tên nhóm hóa học (2 chuỗi, 136 dòng). **Chỉ gắn cờ, không lọc.** | `pipeline.chembl_observation_info`, `observation_flag_columns`, `nonstandard_proteins` |
+| 6 | `split.clustering.max_seqs` 6315 → 11835 và `run_split` báo lỗi nếu nhỏ hơn số chuỗi FASTA | v2 có protein mới nên FASTA đổi; 11835 = tổng số chuỗi của Stage 2b nên luôn đủ. | `pipeline.run_split` |
+| 7 | `verify` tính lại `n_distinct_values`, `n_documents` và mọi thống kê theo quy tắc mới, trên **mọi** bản ghi | Phép kiểm tra cũ tính trên giá trị chưa gộp nên sẽ báo sai với v2. | `pipeline.check_record_stats`, `recompute_mismatch` |
+
+**Không đổi:** bộ lọc đầu vào, định nghĩa cặp MMP (single cut, lõi ≥ 60 %, phần biến đổi
+≤ 10 nguyên tử nặng), khóa `-REL`, `pair_id`, ngưỡng phân tán (Ki/Kd 1,0; IC50/EC50 1,4),
+tỷ lệ split, seed.
+
+**Chưa làm (phạm vi):** cặp "thay H" (≈ 3,4 % Δp theo ước lượng ở audit mục 3.5) không được
+thêm vào v2; phải nêu là giới hạn trong paper.
+
+### 0.2 Ngưỡng phân tán: lập luận đã sửa
+
+Ngưỡng giữ nguyên, nhưng lập luận "≈ 2σ" ở v1 không đúng về thống kê. Ngưỡng được chọn trước
+khi xem nhãn, từ σ mỗi phép đo ở Stage 2a (Ki 0,50; Kd 0,57; IC50/EC50 0,73). Đo lại trên các
+cặp Δp đến từ **hai tài liệu khác nhau và có giá trị khác nhau** (tức không phải bản sao), SD
+của hiệu là Ki ≈ 0,27; IC50 ≈ 0,38; EC50 ≈ 0,49. Nghĩa là ngưỡng ≈ 3–4 SD của nhiễu giữa hai
+tài liệu độc lập: một bản ghi bị cách ly là bất đồng thật, không phải nhiễu đo thông thường.
+
+### 0.3 Thứ tự chạy v2
+
+Mọi lệnh ghi vào `data/dataset_v2/` (config `stage2b.paths`) và `work/evaluator_cache_v2/`;
+không lệnh nào ghi vào `data/dataset/` của v1.
+
+```powershell
+python -m pytest -q
+python run_dataset.py --mode smoke
+python run_dataset.py --mode full
+python run_dataset.py --mode split          # ghi FASTA rồi thoát mã 2 (bình thường)
+```
+
+```bash
+# trong WSL — thư mục mmseqs_v2 để không ghi đè kết quả gom của v1
+cd /mnt/e/eval_training
+mkdir -p runs/dataset/mmseqs_v2 ~/mmseqs_tmp_v2
+mmseqs easy-cluster data/dataset_v2/protein_split_input.fasta \
+    runs/dataset/mmseqs_v2/p50 ~/mmseqs_tmp_v2 \
+    --min-seq-id 0.5 -c 0.8 --cov-mode 2 --cluster-mode 1 \
+    --single-step-clustering --max-seqs 11835 \
+    --alignment-mode 3 --seq-id-mode 0 -s 7.5
+```
+
+```powershell
+python run_dataset.py --mode split --clusters runs\dataset\mmseqs_v2\p50_cluster.tsv `
+    --cluster-tool mmseqs2 --cluster-tool-version <đúng dòng `mmseqs version` in ra>
+python run_dataset.py --mode export
+python run_dataset.py --mode verify
+python run_evaluator.py --mode prepare      # cache Stage 3 mới, chuỗi protein đã viết hoa
+```
+
 ## 1. Mục tiêu và phạm vi
 
 Stage 2b biến các phép đo lẻ của Stage 1 (đã được Stage 2a đánh dấu trùng nguồn) thành
@@ -606,7 +673,8 @@ QC, ngưỡng quarantine hay tỷ lệ so với Nelen et al. 2025 trước khi c
 | mục | giá trị |
 |---|---|
 | dòng vào / nhóm bước 1 | 2.972.507 / 2.876.220 (3.555 nhóm `multi_source_id`) |
-| phân tử / protein | 1.306.158 khóa / 11.835 chuỗi |
+| phân tử / protein (bảng tra) | 1.306.158 khóa / 11.835 chuỗi |
+| phân tử / protein có mặt trong bản ghi | 959.239 / 6.315 (đo 24/10/2026) |
 | protein thực sự có cặp (đầu vào của split) | 6.315 / 11.835 (53,4 %); 5.520 protein không tạo được cặp MMP nào |
 | Δp trong assay | 13.302.366 |
 | **bản ghi bước 4** | **10.546.330** |

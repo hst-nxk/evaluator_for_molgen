@@ -2,12 +2,15 @@
 
 Trạng thái ngày 23/10/2026:
 
-- **Đã chạy**: `pytest` (350 passed, 1 skipped — file test của `models` bị bỏ qua vì chưa
-  có torch), `--mode baseline` (số đo ở mục 4.5) và `--mode prepare --skip-protein` (cache
-  fingerprint, mục 8).
-- **Chưa chạy**: mọi thứ cần torch — `--mode smoke`, `--mode train`, `--mode eval`, và
-  `--mode prepare` phần ESM2. **Chưa có mô hình nào được train**, nên tài liệu này không
-  có số đo nào của mô hình.
+- **Đã chạy**: `pytest` — **374 passed** sau khi có torch (350 trước đó cộng 24 test của `models.py` vốn bị bỏ qua khi thiếu torch), `--mode baseline` (số
+  đo ở mục 4.5), `--mode prepare --skip-protein` (cache fingerprint, mục 8) và
+  `--mode smoke --config no_protein` cho cả ba đầu ra (mục 6.2). torch 2.5.1+cu121 đã cài,
+  chạy được trên GPU.
+  `--mode prepare` đầy đủ cũng đã chạy: **chiều embedding ESM2 đo được là 480** (mục 7),
+  cache cho 6.313 protein.
+- **Chưa chạy**: `--mode train`, `--mode eval`, và cấu hình `finetune`. **Chưa có mô hình
+  nào được train thật** — smoke chỉ dùng 20.000 dòng và 2 epoch, nên mọi con số của nó nói
+  về *pipeline*, không nói về chất lượng mô hình.
 
 ## 1. Phạm vi v1
 
@@ -30,6 +33,17 @@ Không thêm thành phần nào nếu chưa có lý do.
 data/dataset/evaluator_training.parquet   10.522.759 dòng, 16 cột (chỉ đọc)
 data/dataset/full/proteins.parquet        11.835 chuỗi protein (chỉ đọc)
 ```
+
+**Cập nhật 24/10/2026:** config giờ trỏ tới dataset v2 (`data/dataset_v2/…`, cache
+`work/evaluator_cache_v2`); v2 chưa được dựng nên các số ở tài liệu này vẫn là của v1. Hai
+thay đổi code của Stage 3 (đã viết, chưa chạy):
+
+- `train.canonical_sequence`: chuỗi protein được bỏ khoảng trắng và viết hoa trước khi vào
+  ESM2. Trước đó, 11 protein viết thường của BindingDB (1.387 dòng) bị tokenizer biến thành
+  một token `<unk>` (`docs/AUDIT_20261024.md` mục 5).
+- Lát đánh giá mới `independent_agreement` (`n_documents ≥ 2` và `n_distinct_values ≥ 2`):
+  chỉ gồm bản ghi được hai tài liệu độc lập đo ra hai giá trị khác nhau. Lát `multi_assay`
+  cũ vẫn giữ để so với v1, nhưng ở v1 phần lớn bản ghi trong lát đó là bản sao.
 
 Mỗi dòng: `(smiles_a, smiles_b, protein_hash, endpoint) -> delta_p_mean`, kèm
 `constant_smiles`, `variable_a`, `variable_b`, `partition`, `n_assays`, `qc_status` và bốn
@@ -233,6 +247,27 @@ là chạy lại với `expand_both_directions = false`, khi đó `endpoint_mean
 | `finetune` | ESM2 train cùng, trong đồ thị tính toán | theo gợi ý trong buổi họp |
 | `no_protein` | bỏ hẳn nhánh protein | đối chứng: protein có đóng góp gì không |
 
+### 5.1 Đọc kết quả `no_protein` thế nào — và không được đọc thế nào
+
+`no_protein` là đối chứng, nên dễ bị đọc quá mạnh. Quy tắc:
+
+- **Được phép kết luận**: nếu `frozen` không hơn `no_protein` một cách rõ ràng thì *biểu
+  diễn protein này, trong kiến trúc này, ở ngân sách train này* không thêm gì đo được.
+- **KHÔNG được kết luận**: "protein không đóng góp gì cho bài toán". Có ít nhất năm cách để
+  protein thật sự quan trọng mà vẫn ra kết quả trên:
+  1. mean-pool toàn chuỗi thành 480 chiều quá thô để phân biệt túi gắn kết — v1 cố tình
+     không dùng 3D hay pocket (mục 1);
+  2. MLP ghép có thể học cách bỏ qua một nhánh bị các nhánh khác áp đảo;
+  3. tham số chưa được tinh chỉnh riêng cho từng cấu hình, nên so sánh là ở ngân sách
+     chung chứ không ở điểm tốt nhất của mỗi cấu hình;
+  4. 82,4 % nhãn chỉ dựa trên một assay (mục 11.5), nên nhiễu nhãn có thể nhấn chìm một
+     hiệu ứng protein yếu;
+  5. nhiều cặp MMP có SAR chuyển được giữa các protein, nên Δp của chúng vốn ít phụ thuộc
+     protein — điều này là tính chất của bài toán, không phải của mô hình.
+
+Để kết luận mạnh hơn thì phải so hai cấu hình trên **cùng dữ liệu, cùng ngân sách và cùng
+protocol**, và nếu muốn công bằng tuyệt đối thì phải tinh chỉnh riêng từng cấu hình.
+
 Chạy `frozen` trước để có mốc, rồi mới so với `finetune`. Ở `finetune`, ESM2 nằm ở một
 nhóm optimizer riêng với learning rate nhỏ hơn hai bậc (`protein_learning_rate` = 1e-5 so
 với 1e-3): ESM2 đã pretrain còn đầu dự đoán khởi tạo ngẫu nhiên, dùng cùng learning rate
@@ -293,24 +328,96 @@ có nhiễu thực nghiệm**, khác hẳn dữ liệu MOLOPT (σ mỗi phép đ
 `docs/DATASET_REPORT.md` mục 10). Con số đó vì thế **không được dẫn như thể đã đúng cho bài
 toán này**; ablation ở đây để tự kiểm chứng.
 
-## 7. Chiều embedding ESM2 — CHƯA ĐO ĐƯỢC
+### 6.2 Smoke đã chạy 23/10/2026 — pipeline thông, chưa nói gì về chất lượng
 
-**Máy này chưa cài `torch` và `transformers`** (kiểm ngày 23/10/2026: `pip list` chỉ có
-numpy, pandas, pyarrow, rdkit). Hai thư viện đã được ghi vào `requirements.txt` nhưng
-**không pin phiên bản**, vì bản torch đúng phụ thuộc CUDA của máy và chưa có lần cài nào
-thành công để pin theo — xem ghi chú trong chính file đó. Vì vậy **tôi không đo được chiều
-thật**, và code không hardcode chiều nào:
+`--mode smoke --config no_protein`, cả ba đầu ra, trên GPU. 20.000 dòng train, 20.000 dòng
+validation, 2 epoch, batch 128. **5 giây một epoch.**
 
-- `config.json` ghi `stage3.protein_encoder.embedding_dim = null`, nghĩa là **chưa đo**.
-- `features.load_protein_encoder` đọc chiều từ `model.config.hidden_size` của chính model
-  đã nạp, đó là chỗ duy nhất trong dự án biết chiều thật.
-- `--mode prepare` in dòng `CHIỀU EMBEDDING ĐO ĐƯỢC: <số>` và ghi số đó vào
-  `cache_manifest.json` cùng metadata của file cache.
-- `train` và `eval` đọc lại chiều từ metadata cache và **báo lỗi** nếu lệch với config,
-  hoặc nếu cache dựng bằng model khác với model trong config.
+**Bẫy phải biết trước khi đọc bảng dưới:** `limit` lấy các dòng **đầu tiên** của partition,
+không lấy mẫu ngẫu nhiên (xem `data.read_partition`). Dataset được ghi theo thứ tự
+(endpoint, bucket protein), nên 20.000 dòng đầu của validation là **100 % Ki và chỉ 101
+protein**. Mốc dưới trên đúng tập đó là MAE **0,6372** và sd nhãn **0,8815** — khác hẳn
+0,5820 và 0,8314 của toàn bộ validation ở mục 4.5. **Không được so số smoke với số ở mục
+4.5.**
 
-Con số 512 nói trong buổi họp là lời nhớ lúc họp, chưa kiểm chứng; code không dùng nó.
-Chiều thật sẽ xuất hiện trong log của `--mode prepare`.
+| đầu ra | train loss | MAE | so với sàn 0,6372 | R² | đúng chiều macro | Spearman macro |
+|---|---:|---:|---|---:|---:|---:|
+| `direct` | 0,0537 | 0,6623 | **tệ hơn** | −0,056 | 0,5256 | 0,0704 |
+| `direct_no_edit` | 0,0558 | 0,6486 | **tệ hơn** | −0,020 | 0,5268 | 0,0741 |
+| `twin` | 0,0529 | 0,6471 | **tệ hơn** | −0,016 | 0,5322 | 0,0876 |
+
+Ba điều đọc được, và một điều **không** đọc được:
+
+1. **Pipeline thông từ đầu đến cuối** trên cả ba đường forward khác nhau, có GPU, có
+   checkpoint, có manifest. Đó là toàn bộ mục đích của smoke và nó đạt.
+2. **Cả ba đầu ra đều tệ hơn "luôn đoán 0" về sai số tuyệt đối.** Không bất ngờ: train
+   loss 0,053 ứng với RMSE train ≈ 0,33 so với RMSE validation 0,89 — mô hình ~2,7 triệu
+   tham số học thuộc 20.000 dòng. Đây là lý do mốc dưới phải có trước khi train: nó biến
+   "MAE 0,66" từ một con số vô nghĩa thành một kết luận dứt khoát.
+3. **Nhưng xếp hạng thì vượt sàn.** Đúng chiều 0,526–0,532 so với sàn cấu trúc 0,50, và
+   Spearman macro 0,070–0,088 so với sàn 0. Nhỏ nhưng cùng dấu ở cả ba đầu ra. Đây đúng là
+   căng thẳng mà bài SMER nêu — xếp hạng được không kéo theo sai số tuyệt đối tốt, và
+   ngược lại — xuất hiện ngay trên dữ liệu MOLOPT ở lần chạy đầu.
+4. **Không đọc được: ablation.** Thứ tự twin < direct_no_edit < direct theo MAE là trên
+   20.000 dòng và 2 epoch, trong chế độ học thuộc. Nó **không** là kết quả ablation. Kết
+   quả ablation chỉ có sau `--mode train` đầy đủ.
+
+**Số đo bất đối xứng, lần đầu có số thật** (mục 6.1):
+
+| đầu ra | \|f(A,B)+f(B,A)\|/2 | so với sd nhãn | \|f(A,A)\| | so với sd nhãn |
+|---|---:|---:|---:|---:|
+| `direct` | 0,0430 | 4,9 % | 0,0421 | 4,8 % |
+| `direct_no_edit` | 0,0206 | 2,3 % | 0,0190 | 2,2 % |
+| `twin` | **0,0000** | **0,0 %** | **0,0000** | **0,0 %** |
+
+`twin` ra đúng 0 ở cả bốn số — **phép kiểm tra chéo đã đạt**: kiến trúc twin bảo đảm hai
+tính chất đó, nên 0,0000 nghĩa là `swap_sides`, `identity_sides` và `asymmetry_metrics`
+tính đúng. Và nhánh edit **làm mức bất đối xứng tăng gấp đôi** (2,3 % → 4,9 %), hợp lý vì
+nó là đầu vào phụ thuộc chiều mạnh nhất. Hai con số này đo trên một mô hình đang học thuộc
+20.000 dòng nên là **tạm thời**; số dùng cho paper phải lấy từ `--mode train` đầy đủ.
+
+## 7. Chiều embedding ESM2 = 480, đã đo
+
+Đo ngày 24/10/2026 bằng `--mode prepare`, đọc từ `model.config.hidden_size` của chính
+`facebook/esm2_t12_35M_UR50D` sau khi nạp:
+
+```
+CHIỀU EMBEDDING ĐO ĐƯỢC: 480 (model facebook/esm2_t12_35M_UR50D)
+```
+
+**Con số 512 nhắc trong buổi họp là sai.** Nó là lời nhớ lúc họp, và vì code không bao giờ
+hardcode chiều nên cái sai đó không lọt vào đâu được: nếu tôi đã viết 512 vào kiến trúc thì
+`protein_projection` sẽ nhận sai chiều đầu vào và lỗi chỉ lộ ra ở lần train đầu.
+
+480 giờ nằm trong ba chỗ, với ba vai khác nhau:
+
+| chỗ | vai |
+|---|---|
+| `cache_manifest.json` → `protein_embeddings.embedding_dim` | **nguồn sự thật**, ghi lúc đo |
+| metadata của `protein_embeddings.parquet` | để `train`/`eval` kiểm lại cache |
+| `config.json` → `protein_encoder.embedding_dim` | **chốt kiểm**: `features.load_protein_encoder` báo lỗi nếu model có chiều khác |
+
+Vai thứ ba đáng nói: nó không phải nguồn mà là cái phanh. Đổi `protein_encoder.model` sang
+bản ESM2 khác mà quên sửa 480 thì chương trình **dừng** chứ không âm thầm chạy với cache
+sai. Cùng lý do, `Caches` từ chối một cache được dựng bằng model khác với model trong config.
+
+**Môi trường đã kiểm chứng:** torch 2.5.1+cu121 (CUDA build 12.1,
+`torch.cuda.is_available() = True` trên RTX 3060 Laptop 6144 MiB), transformers 4.44.2,
+tokenizers 0.19.1, safetensors 0.8.0. `pip check`: no broken requirements.
+
+**Một cảnh báo của Hugging Face xuất hiện và là vô hại — nhưng chỉ vì thiết kế:**
+
+```
+Some weights of EsmModel were not initialized ... ['esm.pooler.dense.bias',
+'esm.pooler.dense.weight']. You should probably TRAIN this model ...
+```
+
+ESM2 không có trọng số pooler trong checkpoint nên `transformers` khởi tạo **ngẫu nhiên**
+lớp đó. Dự án không bao giờ đọc `pooler_output`: cả `features.embed_one_sequence` và
+`train.ProteinEncoderRuntime.encode` đều lấy `last_hidden_state` rồi tự mean-pool trên
+token acid amin (mục 8). Nếu code dùng `pooler_output` thì toàn bộ 6.313 embedding sẽ là
+nhiễu ngẫu nhiên — và không có gì trong log báo cho ta biết. Đây là chỗ im lặng nguy hiểm
+nhất của cả Stage 3, nên ghi lại rõ.
 
 ## 8. Thực tế tài nguyên
 
@@ -329,8 +436,10 @@ Python 3.10.11.
   phỏng đoán để tránh hết VRAM, chưa đo.** Nếu vẫn hết bộ nhớ: giảm `batch_size` trước,
   rồi mới giảm `max_residues`.
 
-Chuỗi dài: 1.409 trên 11.835 protein dài hơn 1.024 aa, dài nhất 34.350 aa (p50 = 455,
-p90 = 1.104). Hai cách xử lý, chọn theo cấu hình:
+Chuỗi dài: trong **6.313 protein thực sự được dùng, 797 chuỗi dài hơn cửa sổ 1.022 aa**
+nên phải chia cửa sổ (đo ngày 24/10/2026). Trên toàn bộ 11.835 chuỗi của Stage 2b thì có
+1.409 chuỗi dài hơn 1.024 aa, dài nhất 34.350 aa (p50 = 455, p90 = 1.104). Hai cách xử lý,
+chọn theo cấu hình:
 - `frozen` dùng `long_sequence = "windows"`: chia chuỗi thành các cửa sổ liền nhau rồi lấy
   trung bình **có trọng số theo độ dài cửa sổ**, nên không mất phần đuôi chuỗi và kết quả
   bằng mean-pool trên toàn chuỗi nếu model không có hiệu ứng biên.
@@ -350,20 +459,36 @@ hệt `features.embed_one_sequence`.
 
 | bước | khối lượng | thời gian | kết quả trên đĩa |
 |---|---|---:|---|
-| `prepare --skip-protein`, phân tử | 958.926 SMILES phân biệt | 388 s | 83,7 MiB parquet |
-| `prepare --skip-protein`, nhóm thế | 70.455 SMILES phân biệt | 10,5 s | 3,1 MiB parquet |
+| `prepare`, fingerprint phân tử | 958.926 SMILES phân biệt | 374–388 s | 83,7 MiB parquet |
+| `prepare`, fingerprint nhóm thế | 70.455 SMILES phân biệt | 10,5–11 s | 3,1 MiB parquet |
+| `prepare`, embedding ESM2 | 6.313 protein trên GPU | 457 s | ~12 MiB parquet |
+| tải trọng số ESM2 (một lần) | 136 MB | 140 s | trong `HF_HOME` |
 | `--mode baseline` | 3 baseline × 4 lát cắt trên 1.052.791 dòng | ~360 s | manifest JSON |
+| `--mode smoke` một đầu ra | 20.000 dòng, 2 epoch, GPU | ~16 s | checkpoint + manifest |
 
 **0 SMILES không đọc được** trên cả hai cache, nên không có dòng fingerprint toàn 0 nào.
 
-Con số phân tử ở đây là **958.926**, không phải 1.306.158. 1.306.158 là số dòng của
-`data/dataset/full/molecules.parquet`, tức bảng phân tử của bước `full`; số phân tử thật sự
-xuất hiện trong `evaluator_training.parquet` nhỏ hơn. Chênh lệch 347.232 phân tử **chưa
-được truy nguyên** (mục 11).
+Con số phân tử ở đây là **958.926**, không phải 1.306.158. 1.306.158 là số dòng của **bảng
+tra** `data/dataset/full/molecules.parquet` (1.285.061 SMILES phân biệt; phần chênh là các
+khóa `-REL`), tức mọi phân tử đi vào Stage 2b. Số phân tử thật sự có trong bản ghi là
+959.239 ở `evidence_records` và **958.926** ở `evaluator_training` (lệch 313 là phần chỉ
+xuất hiện trong 23.571 bản ghi `quarantine`). Kế toán đầy đủ cho 1.306.158 khóa nằm ở
+`docs/DATASET_REPORT.md` mục 6.2: 0 phân tử mất sau bước ghép cặp, 11.693 bị loại vì quy tắc
+đã ghi, và **321.462 phân tử không tạo được MMP hợp lệ nào** dù nằm trong khối có phân tử
+khác — tính đầy đủ của nhóm cuối này **chưa được kiểm chứng** (`DATASET_REPORT` mục 11.10).
+Nó không ảnh hưởng tới tính đúng của dữ liệu train hiện có, chỉ tới việc dữ liệu đó có đủ
+hay không.
 
-**Thời gian train thì tôi không ước lượng.** Bài học từ Stage 2b là ước lượng thời gian của
-tôi sai 5,2 lần và sai cả chiều. Khối lượng đo được: 8.417.004 dòng train, 6.315 protein
-cần chạy ESM2 một lần. Thời gian thật sẽ có sau epoch đầu tiên.
+**Thời gian train: số học từ số đo, không phải số đo.** Smoke xử lý 40.000 dòng (20.000
+train + 20.000 validation) cộng chỉ số trên 6.089 query trong **5,4 giây** trên GPU ở batch
+128. Lần train đầy đủ có 8.417.004 dòng train và 1.052.791 dòng validation, tức ~237 lần
+khối lượng đó, và chạy ở batch 512 nên phần train nhanh hơn trên mỗi dòng; chỉ số trên
+198.197 query mất khoảng 2 phút một lượt (đo ở mục 4.5). Cộng lại: **cỡ 15–25 phút một
+epoch** cho cấu hình `frozen`, tức 1,5–4 giờ cho 10 epoch có dừng sớm.
+
+Đây là phép nhân, không phải phép đo. Bài học từ Stage 2b là ước lượng thời gian của tôi
+sai 5,2 lần và sai cả chiều, nên đừng lập kế hoạch dựa vào con số này; số thật sẽ có sau
+epoch đầu tiên của lần train thật.
 
 ## 9. Cấu trúc file
 
@@ -467,37 +592,38 @@ python run_evaluator.py --mode eval --checkpoint runs\evaluator\frozen_direct_<t
 
 1. **Hai đầu ra `direct` không đối xứng** — đổi chỗ A với B không bảo đảm Δp đổi dấu, và
    cặp (X, X) không bảo đảm cho 0. Đây là **lựa chọn đã chốt**: đo chứ không cưỡng chế
-   (mục 6.1), vì cưỡng chế sẽ làm thay đổi chính thứ mà ablation muốn đo. Hệ quả phải ghi
-   vào phần giới hạn của paper, không được bỏ qua.
+   (mục 6.1), vì cưỡng chế sẽ làm thay đổi chính thứ mà ablation muốn đo. Số đo đầu tiên
+   (smoke, nên tạm thời): mức lệch bằng **4,9 % sd nhãn** với `direct` và **2,3 %** với
+   `direct_no_edit` — nhánh edit làm tăng gấp đôi. Hệ quả phải ghi vào phần giới hạn của
+   paper, không được bỏ qua.
 2. **Ablation chỉ có ba ô.** Ô "twin có nhánh edit" không định nghĩa được (mục 6), nên
    không thể tách hoàn toàn hai yếu tố trong một bảng 2×2 đầy đủ.
-3. **958.926 phân tử trong dataset evaluator so với 1.306.158 dòng trong
-   `data/dataset/full/molecules.parquet`** — chênh 347.232 phân tử. Hai con số đo hai thứ
-   khác nhau (bảng phân tử của bước `full` so với phân tử thật sự xuất hiện trong file
-   evaluator), nhưng chênh lệch 27 % thì **đáng truy nguyên**: nó nói rằng một phần tư số
-   phân tử trong vũ trụ cặp MMP không có mặt trong dữ liệu huấn luyện. Chưa truy, chỉ cần
-   một lượt đọc để trả lời.
-
-4. **`endpoint_mean` cho 16,6 % đúng chiều do thứ tự khóa A < B lọt vào qua phép nhân đôi
+3. **`endpoint_mean` cho 16,6 % đúng chiều do thứ tự khóa A < B lọt vào qua phép nhân đôi
    hai chiều** (giải thích ở mục 4.5). Chỉ ảnh hưởng tới bộ dự đoán hằng số, không ảnh
    hưởng tới mô hình thật, và chưa kiểm chứng trực tiếp — cách kiểm là chạy lại với
    `expand_both_directions = false`.
 
-5. **Lát cắt `strict` trên validation là 892.742 dòng, không phải 894.182.** Con số
+4. **Lát cắt `strict` trên validation là 892.742 dòng, không phải 894.182.** Con số
    894.182 trong đề bài là của `evidence_records.parquet`; `evaluator_training.parquet` đã
    bỏ 23.571 bản ghi `quarantine` nên nhỏ hơn. Đo được: strict 892.742, nhiều assay
    139.640, sạch 1.035.364, strict ∧ sạch 877.852.
-6. **82,4 % bản ghi có `n_assays = 1`**, nên nhãn của phần lớn dữ liệu chỉ dựa trên một
+5. **82,4 % bản ghi có `n_assays = 1`**, nên nhãn của phần lớn dữ liệu chỉ dựa trên một
    assay. Lát cắt `multi_assay` chính là chỗ để thấy điều đó ảnh hưởng thế nào.
-7. **`weight_decay` áp cho cả bias và LayerNorm.** Thông lệ là loại hai nhóm đó ra. Ảnh
+6. **`weight_decay` áp cho cả bias và LayerNorm.** Thông lệ là loại hai nhóm đó ra. Ảnh
    hưởng nhỏ ở v1, nhưng là chỗ cần sửa nếu so sánh cấu hình một cách chặt chẽ.
-8. **Seed chỉ cố định ở mức numpy/torch**, không bật `cudnn.deterministic` vì nó làm chậm
+7. **Seed chỉ cố định ở mức numpy/torch**, không bật `cudnn.deterministic` vì nó làm chậm
    đáng kể. Hai lần chạy trên GPU có thể lệch nhau chút ít ở chữ số cuối.
-9. **`torch` và `transformers` trong `requirements.txt` không pin phiên bản.** Môi trường
-   vì thế chưa tái lập được đầy đủ. Pin lại ngay sau lần cài thành công đầu tiên, lấy số
-   từ `pip list`.
-10. **`finetune` cắt chuỗi**, nên mất phần đuôi của 1.409 protein (mục 8). Khi so `frozen`
-   với `finetune` thì hai cấu hình không thấy cùng một lượng thông tin protein.
+8. **`--mode prepare` không kiểm cache đã có, nên dựng lại từ đầu mỗi lần.** Lần chạy
+   24/10 tốn 374 s dựng lại hai cache fingerprint y hệt cái đã có từ hôm trước, chỉ để
+   thêm phần ESM2. Cần một chốt "bỏ qua nếu đã có, trừ khi `--force`" như Stage 2b. Chưa
+   làm; mỗi lần `prepare` sau này mất thêm ~6 phút vô ích.
+9. **`frozen` chia cửa sổ còn `finetune` cắt chuỗi**, nên 797 protein dài (mục 8) được
+   hai cấu hình thấy khác nhau. Đây là **yếu tố gây nhiễu cho ablation frozen-vs-finetune**:
+   chênh lệch kết quả sẽ lẫn giữa "train cùng ESM2 có lợi không" và "mất đuôi chuỗi có hại
+   không". Cách sửa sạch: dựng thêm **một biến thể cache thứ ba** — `frozen` nhưng
+   `long_sequence = "truncate"` ở đúng `max_residues` của `finetune` — rồi so `finetune`
+   với biến thể đó, giữ `frozen`+cửa sổ làm bản tốt nhất của đường đóng băng. Tốn thêm một
+   lần `prepare` (~8 phút) và một lần train. **Chưa làm**; không chắn đường train `frozen`.
 
 ## 12. Nhật ký quyết định
 
@@ -510,8 +636,24 @@ Ngày 23/10/2026, sau rà soát danh sách ở mục 11 của bản trước:
 | thêm baseline `random` có seed cố định, để ranking có mốc 50 % | đã làm (mục 4.4) |
 | bất đối xứng: **không** cưỡng chế, chỉ đo và ghi vào giới hạn | đã làm (mục 6.1) |
 | chọn một chuẩn pooling dùng chung: chỉ acid amin, bỏ CLS/EOS/PAD | đã làm (mục 8) |
-| ghi `torch` và `transformers` vào `requirements.txt` | đã làm, không pin (mục 7) |
+| ghi `torch` và `transformers` vào `requirements.txt` | đã làm; nay pin `torch==2.5.1` |
 | giữ `esm2_t12_35M_UR50D` cho v1 | giữ nguyên |
+
+Chạy trong ngày: `pytest` 350 passed / 1 skipped; `--mode baseline` (mục 4.5);
+`--mode prepare --skip-protein` (mục 8); `--mode smoke` ba đầu ra (mục 6.2). Phép kiểm tra
+chéo quan trọng nhất đã đạt: `twin` cho bất đối xứng đúng 0,0000. Hai số tôi từng nói sai
+và đã sửa: số phân tử cần fingerprint (958.926, không phải 1.306.158) và tỉ lệ đúng chiều
+của `endpoint_mean` (16,6 %, không phải 0 %).
+
+Ngày 24/10/2026: cài transformers 4.44.2, chạy `--mode prepare` đầy đủ. **Chiều embedding
+ESM2 = 480**, không phải 512 như nhắc trong buổi họp (mục 7). Số protein dùng thật là
+6.313, không phải 6.315 — hai protein của `protein_split.parquet` chỉ còn cặp trong các bản
+ghi `quarantine` đã bị loại. Thêm `.cache/` vào `.gitignore` vì `HF_HOME` được trỏ vào trong
+repo. Kế toán đầy đủ chênh lệch phân tử (mục 8 và `DATASET_REPORT` mục 6.2): nhóm "có cặp
+nhưng mất bản ghi" bằng 0, nhưng 321.462 phân tử không tạo được MMP nào và tính đầy đủ của
+nhóm đó chưa kiểm chứng. Sửa lại hai con số sai trong `docs/DATASET_REPORT.md` mục 6.2 cùng
+`docs/STAGE2B_DATASET.md` mục 11, và rút lại câu "không phải mất dữ liệu" đã viết vội ở lượt
+trước — phép kiểm tập con không chứng minh được điều đó.
 
 Tất cả là thay đổi code và tài liệu. **Chưa có lần chạy nào**, nên chưa có số đo nào của
 mô hình trong tài liệu này.

@@ -35,6 +35,8 @@ ASSAY_DELTA_SCHEMA = pa.schema([
     ("p_a", pa.float64()),
     ("p_b", pa.float64()),
     ("delta_p", pa.float64()),
+    ("p_std_a", pa.float64()),
+    ("p_std_b", pa.float64()),
     ("n_merged_a", pa.int64()),
     ("n_merged_b", pa.int64()),
     ("independent", pa.bool_()),
@@ -70,7 +72,9 @@ def assay_deltas(groups: pa.Table, pairs: Sequence[Pair], endpoint: str,
 
     Nhận: bảng bước 1 của một endpoint (đã thêm cột smiles); các cặp với row_x, row_y là
     chỉ số dòng của bảng đó (hai dòng cùng assay và protein); endpoint; độ dài pair_id.
-    Trả về: bảng theo ASSAY_DELTA_SCHEMA. 'independent' = cả hai phía có ít nhất một phép
+    Trả về: bảng theo ASSAY_DELTA_SCHEMA. p_std_a / p_std_b: STD của các phép đo khác nhau
+    trong cùng assay của từng phía (bước 1; null khi chỉ có một phép đo), mang theo để bước 4
+    gắn cờ replicate lệch nhiều. 'independent' = cả hai phía có ít nhất một phép
     đo không mang cờ potential_duplicate. 'multi_source_id' = ít nhất một phía là nhóm có
     nhiều molecule_source_id (cờ của bước 1, chỉ để báo cáo và tra lại, không lọc).
     """
@@ -115,6 +119,8 @@ def assay_deltas(groups: pa.Table, pairs: Sequence[Pair], endpoint: str,
         "p_a": pa.array(p_a, pa.float64()),
         "p_b": pa.array(p_b, pa.float64()),
         "delta_p": pa.array(p_b - p_a, pa.float64()),
+        "p_std_a": side_a["p_std"],
+        "p_std_b": side_b["p_std"],
         "n_merged_a": side_a["n_merged"],
         "n_merged_b": side_b["n_merged"],
         "independent": pa.array(independent_a & independent_b, pa.bool_()),

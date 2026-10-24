@@ -1,6 +1,6 @@
 """Stage 3: đọc dataset evaluator, lọc theo partition và theo lát cắt, đóng gói batch.
 
-Dataset đầu vào (`data/dataset/evaluator_training.parquet`) chỉ ĐỌC, không bao giờ ghi.
+Dataset đầu vào (stage3.inputs.evaluator trong config) chỉ ĐỌC, không bao giờ ghi.
 
 Module này không import torch: nó trả về mảng numpy gồm CHỈ SỐ vào các bảng cache
 (fingerprint phân tử, fingerprint nhóm thế, embedding protein) chứ không trả về vector.
@@ -29,11 +29,16 @@ TEST = "test"
 
 # Cột cần đọc từ dataset. Giữ đúng tên của Stage 2b; không đổi tên ở đây để truy lại được.
 PAIR_COLUMNS = ["pair_id", "endpoint", "protein_hash", "partition", "smiles_a", "smiles_b",
-                "variable_a", "variable_b", "delta_p_mean", "n_assays", "qc_status",
-                "unseen_pair", "plausible_range", "source_quality_warning"]
+                "variable_a", "variable_b", "delta_p_mean", "n_assays", "n_documents",
+                "n_distinct_values", "qc_status", "unseen_pair", "plausible_range",
+                "source_quality_warning"]
 
 # Khóa lát cắt mà config được phép dùng; khóa lạ là lỗi cấu hình, không bị bỏ qua im lặng.
-SLICE_KEYS = ("unseen_pair", "plausible_range", "no_source_warning", "min_n_assays")
+SLICE_KEYS = ("unseen_pair", "plausible_range", "no_source_warning", "min_n_assays",
+              "min_n_documents", "min_distinct_values")
+# Khóa lát cắt dạng "ít nhất N" -> cột số nguyên của dataset mà nó so.
+MINIMUM_KEYS = {"min_n_assays": "n_assays", "min_n_documents": "n_documents",
+                "min_distinct_values": "n_distinct_values"}
 
 
 @dataclass(frozen=True)
@@ -91,8 +96,8 @@ def slice_mask(table: pa.Table, filters: Mapping[str, Any]) -> np.ndarray:
             column = table.column("source_quality_warning")
             found = np.asarray(pc.is_null(column).to_numpy(zero_copy_only=False), dtype=bool)
             mask &= found if wanted else ~found
-        elif key == "min_n_assays":
-            values = np.asarray(table.column("n_assays").to_numpy(zero_copy_only=False))
+        elif key in MINIMUM_KEYS:
+            values = np.asarray(table.column(MINIMUM_KEYS[key]).to_numpy(zero_copy_only=False))
             mask &= values >= int(wanted)
         else:
             values = np.asarray(
@@ -110,7 +115,7 @@ def read_columns(config: Mapping[str, Any], root: Path, partition: str,
     Nhận: config, thư mục gốc, tên partition, danh sách cột, số dòng tối đa, allow_test.
     Trả về: bảng Arrow gồm đúng các cột đó (luôn kèm 'partition' để lọc được).
     Có hàm riêng vì baseline tầm thường chỉ cần hai cột (endpoint và nhãn) trên 8,4 triệu
-    dòng train; đọc cả 14 cột cho việc đó là tốn vô ích.
+    dòng train; đọc mọi cột cho việc đó là tốn vô ích.
     `limit` lấy các dòng ĐẦU TIÊN sau khi lọc partition, không lấy mẫu ngẫu nhiên: dataset
     được ghi theo thứ tự (endpoint, bucket protein) nên phần đầu vẫn đủ nhiều protein và
     nhiều cặp để kiểm tra pipeline, mà kết quả cố định giữa các lần chạy smoke.
