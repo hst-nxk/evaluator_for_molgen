@@ -39,6 +39,10 @@ ENV_NAME="nxk"
 LOG_NAME="server_run_all"
 # GPU phải còn trống ít nhất bằng trần VRAM (9 GiB) cộng phần dự phòng cho CUDA context.
 MIN_FREE_GPU_MIB=10240
+# Chế độ eval chỉ dự đoán: VRAM cao nhất ĐO ĐƯỢC ngày 25/10/2026 của 4 lần train frozen /
+# no_protein là 286-336 MiB, đã gồm cả bước dự đoán validation (batch 4096) như eval.
+# Ngưỡng này gấp khoảng 6 lần số đo đó.
+MIN_FREE_GPU_MIB_EVAL=2048
 SECONDS_PER_MINUTE=60
 SMOKE_CONFIGS=("no_protein" "frozen")
 # Thứ tự train theo docs/STAGE3_EVALUATOR.md, chưa gồm finetune.
@@ -139,8 +143,10 @@ gpu_free="$(echo "${gpu_line#*,}" | tr -d ' ')"
 if [[ -z "$gpu_index" || -z "$gpu_free" ]]; then
     fail "không đọc được bộ nhớ GPU"
 fi
-if (( gpu_free < MIN_FREE_GPU_MIB )); then
-    fail "GPU trống nhất (số $gpu_index) chỉ còn $gpu_free MiB < $MIN_FREE_GPU_MIB MiB"
+min_free="$MIN_FREE_GPU_MIB"
+[[ "$MODE" == "eval" ]] && min_free="$MIN_FREE_GPU_MIB_EVAL"
+if (( gpu_free < min_free )); then
+    fail "GPU trống nhất (số $gpu_index) chỉ còn $gpu_free MiB < $min_free MiB"
 fi
 export CUDA_VISIBLE_DEVICES="$gpu_index"
 echo "dùng GPU số $gpu_index (còn trống $gpu_free MiB lúc bắt đầu)"
