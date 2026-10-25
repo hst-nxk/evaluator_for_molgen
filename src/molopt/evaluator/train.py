@@ -84,6 +84,17 @@ def peak_gpu_memory_mib(device: str) -> float | None:
     return round(torch.cuda.max_memory_reserved() / BYTES_PER_MIB, 1)
 
 
+def load_best_checkpoint(path: Path, model: Any, protein_source: Any, device: str) -> None:
+    """Nạp lại trọng số của checkpoint tốt nhất vào model (và ESM2 nếu là finetune)."""
+    import torch
+
+    state = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(state["model"])
+    if "protein_encoder" in state:
+        protein_source.model.load_state_dict(state["protein_encoder"])
+    LOGGER.info("đã nạp lại checkpoint tốt nhất (epoch %s) để tính số cuối", state["epoch"])
+
+
 def set_seeds(seed: int) -> None:
     """Cố định seed của numpy và torch để hai lần chạy cùng cấu hình cho cùng kết quả.
 
@@ -803,6 +814,10 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
                 LOGGER.info("dừng sớm: %s epoch không cải thiện MAE validation", since_best)
                 break
 
+    if best_epoch >= 0:
+        # Số cuối cùng (theo lát cắt, theo endpoint, bất đối xứng) phải là của checkpoint
+        # TỐT NHẤT đã lưu, không phải của epoch cuối: dừng sớm nghĩa là epoch cuối kém hơn.
+        load_best_checkpoint(checkpoint_path, model, protein_source, device)
     final = evaluate(validation_arrays, predict(model, validation_arrays, caches,
                                                 protein_source, device,
                                                 int(settings["eval_batch_size"])),
@@ -824,6 +839,7 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "fingerprint_bits": {"ligand": caches.ligand_bits, "fragment": caches.fragment_bits},
         "uses_edit_branch": model.uses_edit_branch,
         "best_epoch": best_epoch, "best_validation_mae": None if best_epoch < 0 else best_mae,
+        "final_metrics_epoch": best_epoch if best_epoch >= 0 else len(history) - 1,
         "checkpoint": str(checkpoint_path) if best_epoch >= 0 else None,
         "history": history, "validation_metrics": final, "asymmetry": asymmetry,
         "seconds": round(time.perf_counter() - started, 1),

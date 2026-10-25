@@ -6,6 +6,9 @@
 #   setsid nohup bash scripts/server_run_all.sh > /dev/null 2>&1 &
 #   tail -f runs/server_run_all.log    # xem tiến độ; Ctrl+C chỉ thoát xem, không dừng chạy
 #
+# Chỉ đánh giá lại checkpoint TỐT NHẤT của mọi lần train đã có (không train):
+#   setsid nohup bash scripts/server_run_all.sh eval > /dev/null 2>&1 &
+#
 # Dừng giữa chừng:
 #   kill -- -$(cat .cache/server_run_all.pid)
 #
@@ -24,6 +27,11 @@
 # sau vẫn chạy; riêng smoke của cấu hình nào lỗi thì bỏ train của cấu hình đó.
 set -u -o pipefail
 
+MODE="${1:-all}"
+if [[ "$MODE" != "all" && "$MODE" != "eval" ]]; then
+    echo "Chế độ '$MODE' không hợp lệ: dùng 'all' (mặc định) hoặc 'eval'." >&2
+    exit 1
+fi
 PROJECT_ROOT="/mnt/disk4/khainx/evaluator_for_molgen"
 # Chỗ bạn thường đứng khi gõ `conda activate nxk`; chỉ dùng khi script phải tự kích hoạt env.
 CONDA_START_DIR="/mnt/disk4/khainx"
@@ -67,7 +75,7 @@ trap 'echo "=== [$(date "+%F %T")] script bị dừng bởi tín hiệu"; exit 1
 
 echo
 echo "################################################################################"
-echo "=== [$(date '+%F %T')] BẮT ĐẦU server_run_all (PID $$) trong $root"
+echo "=== [$(date '+%F %T')] BẮT ĐẦU server_run_all $MODE (PID $$) trong $root"
 
 fail() {
     echo "=== [$(date '+%F %T')] DỪNG: $*"
@@ -167,6 +175,28 @@ print_summary() {
     done
     echo "    Kết quả từng lần chạy: runs/evaluator/ (file .json, .log, .pt)"
 }
+
+if [[ "$MODE" == "eval" ]]; then
+    # Checkpoint lấy từ manifest của từng lần train (không lấy theo tên file .pt, vì smoke
+    # và train đặt tên checkpoint giống nhau).
+    shopt -s nullglob
+    manifests=(runs/evaluator/train_*.json)
+    (( ${#manifests[@]} > 0 )) || fail "chưa có manifest train nào trong runs/evaluator"
+    for manifest in "${manifests[@]}"; do
+        checkpoint="$(python -c 'import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["checkpoint"] or "")' "$manifest")"
+        if [[ -z "$checkpoint" || ! -f "$checkpoint" ]]; then
+            summary+=("eval $manifest: BỎ QUA (không có checkpoint)")
+            continue
+        fi
+        run_step "eval $(basename "$checkpoint")" \
+            python run_evaluator.py --mode eval --checkpoint "$checkpoint"
+    done
+    print_summary
+    echo "=== [$(date '+%F %T')] HẾT"
+    rm -f "$cache/$LOG_NAME.pid"
+    exit 0
+fi
 
 run_step "kiểm tra thư viện và GPU" python - <<'PY' || fail "môi trường chưa đúng"
 import sys
