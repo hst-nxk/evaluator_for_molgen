@@ -487,5 +487,180 @@
       "baselines_note": "Ba baseline tầm thường làm mốc dưới: zero luôn đoán Δp = 0; endpoint_mean đoán trung bình Δp của endpoint, ước lượng CHỈ trên train; random lấy mẫu có hoàn lại từ phân bố nhãn train với seed cố định (stage3.train.seed). zero và endpoint_mean cho dự đoán không đổi trong mỗi query nên tỉ lệ đúng chiều của chúng bằng 0 theo quy ước hòa-tính-sai, KHÔNG phải 50 %; phần so sánh được của hai cái đó là MAE/RMSE/R². random cho dự đoán liên tục và độc lập với dòng đang xét nên hầu như không có hòa, và tỉ lệ đúng chiều của nó là mốc 50 % thật để so; lấy mẫu từ phân bố nhãn train chứ không từ một phân bố tự chọn như N(0,1) để không thêm tham số tùy ý.",
       "note": "Ranking CHỈ trong cùng một query = (phân tử tham chiếu, protein, endpoint). expand_both_directions = true: mỗi dòng (A, B, Δp) sinh hai hướng A->B (Δp) và B->A (−Δp), vì dataset lưu cặp theo chiều khóa A < B nên nếu chỉ nhóm theo smiles_a thì query bị cắt vụn theo thứ tự khóa chứ không theo hóa học. min_candidates = 2: query một ứng viên không xếp hạng được nên bị loại khỏi MẪU SỐ của ranking, vẫn tính regression. top_k chỉ tính trên query có ít nhất k ứng viên, và mẫu số được ghi riêng cho từng k. Mọi chỉ số ranking báo cáo CẢ macro (trung bình theo query) và micro (gộp mọi cặp ứng viên)."
     }
+  },
+  "audit": {
+    "paths": {
+      "runs_dir": "runs/audit"
+    },
+    "columns": {
+      "curation": "source_curation",
+      "dedup_reason": "dedup_reason"
+    },
+    "quantiles": [
+      0,
+      0.01,
+      0.05,
+      0.25,
+      0.5,
+      0.75,
+      0.95,
+      0.99,
+      0.999,
+      1.0
+    ],
+    "literature": {
+      "within_error": 0.3,
+      "meaningful": 1.0,
+      "unit_copy": 3.0,
+      "source": "Landrum & Riniker 2024, J. Chem. Inf. Model. 64(5), 1560-1567, DOI 10.1021/acs.jcim.4c00049",
+      "note": "Ba mức lấy nguyên từ bài: 0,3 log = 'expected window for experimental error' (khoảng 2 lần; bài dẫn tài liệu 9-11); 1,0 log = 'truly meaningful activity difference' (bài tự ghi là giới hạn quy ước); cặp lệch đúng 3,0 log là cùng một số bị chép sai đơn vị, bài loại cùng với cặp bằng nhau tuyệt đối. Bài so p của MỘT hợp chất giữa hai assay; audit dùng cùng mức cho Δp của một CẶP, nên tỉ lệ không so thẳng với bài được. Bài dùng chung mức cho IC50 và Ki, không có mức riêng theo endpoint. Kramer 2012 (σ pKi 0,54) và Kalliokoski 2013 (σ pIC50 0,68) chỉ cho độ nhiễu, không cho ngưỡng. 'Bằng nhau' và '≈ 3,0' so với dung sai stage2b.qc.collapse_tolerance."
+    },
+    "note": "Audit 27/10/2026 theo yêu cầu buổi họp 26/10/2026 (python run_audit.py --task ...). CHỈ ĐỌC data/, chỉ ghi vào runs/audit. Mọi ngưỡng trong mục này dùng để BÁO CÁO và gắn nhãn, không lọc hay xóa dòng nào. quantiles phải chứa 0,01, 0,25, 0,5, 0,75, 0,95, 0,99, 0,999 và 1,0 vì báo cáo đọc các nhãn p1, p25, p50, p75, p95, p99, p99.9, p100.",
+    "duplicates": {
+      "value_decimals": 2,
+      "provenance_reason": "provenance_without_counterpart",
+      "round_p_tolerance": 1e-09,
+      "seed": 20261027,
+      "examples_per_level": 3,
+      "key_levels": [
+        {
+          "name": "khoa_dedup",
+          "label": "InChIKey + endpoint + protein + qualifier + giá trị + tài liệu",
+          "columns": [
+            "inchikey",
+            "endpoint",
+            "protein",
+            "qualifier",
+            "value",
+            "document"
+          ]
+        },
+        {
+          "name": "bo_tai_lieu",
+          "label": "bỏ tài liệu: InChIKey + endpoint + protein + qualifier + giá trị",
+          "columns": [
+            "inchikey",
+            "endpoint",
+            "protein",
+            "qualifier",
+            "value"
+          ]
+        },
+        {
+          "name": "bo_tai_lieu_protein",
+          "label": "bỏ tài liệu và protein: InChIKey + endpoint + qualifier + giá trị",
+          "columns": [
+            "inchikey",
+            "endpoint",
+            "qualifier",
+            "value"
+          ]
+        }
+      ],
+      "note": "So độ phân biệt giữa các record bằng numpy: mỗi cột khóa được mã hóa thành số nguyên (pyarrow dictionary_encode), pActivity làm tròn value_decimals chữ số (0,01 log = cùng ngưỡng gộp replicate của Stage 2b), rồi np.lexsort + cumsum cho mã nhóm. Ba mức khóa đi từ chặt (đúng khóa dedup) tới lỏng; mức lỏng hơn cho thấy bản trùng mà khóa dedup KHÔNG bắt được (vd. thiếu tài liệu, protein khác hash). Phần 'twin' kiểm tra từng dòng BindingDB đã bị loại có thật sự có bản ChEMBL cùng khóa không. round_p_tolerance: pActivity cách số nguyên ≤ giá trị này được coi là giá trị tròn (vd. 5,00 = 10 µM), hay trùng ngẫu nhiên giữa các nguồn."
+    },
+    "thresholds": {
+      "assay_buckets": [
+        2,
+        3,
+        6
+      ],
+      "histogram": {
+        "min": 0,
+        "max": 4,
+        "bins": 80
+      },
+      "note": "Đọc evidence_records, không lọc gì. Mức so sánh lấy từ audit.literature, không có ngưỡng nào tự đặt. assay_buckets chỉ là cách chia bảng theo số assay (2, 3-5, ≥ 6). Ngưỡng hiện tại của pipeline (stage2b.qc.dispersion_thresholds 1,0 / 1,4) chỉ được in ra để đối chiếu và được ghi rõ là CHƯA có nguồn."
+    },
+    "molecules": {
+      "workers": 8,
+      "chunk_size": 5000,
+      "peptide_smarts": "[NX3][CX4][CX3](=O)[NX3][CX4][CX3](=O)",
+      "cutoffs": {
+        "heavy_atoms": [
+          35,
+          50,
+          70,
+          100
+        ],
+        "total_atoms": [
+          100,
+          150,
+          200,
+          300
+        ],
+        "mw": [
+          500,
+          700,
+          900,
+          1200
+        ]
+      },
+      "fragment_bucket_edges": [
+        1,
+        2,
+        3,
+        4,
+        6,
+        8,
+        11
+      ],
+      "histograms": {
+        "heavy_atoms": {
+          "min": 0,
+          "max": 150,
+          "bins": 150
+        },
+        "total_atoms": {
+          "min": 0,
+          "max": 400,
+          "bins": 200
+        },
+        "mw": {
+          "min": 0,
+          "max": 2000,
+          "bins": 200
+        },
+        "fragment_heavy_atoms": {
+          "min": 0,
+          "max": 12,
+          "bins": 12
+        },
+        "fragment_fraction": {
+          "min": 0,
+          "max": 1,
+          "bins": 50
+        }
+      },
+      "note": "Đo trên evaluator_training, mỗi SMILES khác nhau tính một lần (RDKit, song song workers tiến trình). total_atoms tính cả H (đề xuất ~300 của sếp), heavy_atoms không tính H. cutoffs chỉ là ngưỡng ỨNG VIÊN để xem tác động (số cặp mất theo partition); chọn ngưỡng sau khi xem số liệu và tài liệu. peptide_smarts: hai đơn vị khung amide -N-C-C(=O)- nối tiếp (giống định nghĩa 'peptide-like' đã dùng khi đo nhóm phân tử lớn)."
+    },
+    "stats": {
+      "count_edges": [
+        1,
+        2,
+        3,
+        5,
+        10,
+        50
+      ],
+      "histograms": {
+        "delta_p": {
+          "min": -5,
+          "max": 5,
+          "bins": 100
+        },
+        "p_activity": {
+          "min": 0,
+          "max": 14,
+          "bins": 140
+        },
+        "log_counts": {
+          "min": 0,
+          "max": 6,
+          "bins": 60
+        }
+      },
+      "note": "Không có ngưỡng tự đặt. Khoảng |Δp|, mức STD replicate và mức chép sai đơn vị lấy từ audit.literature (0,3 / 1,0 / 3,0) và stage2b.qc.collapse_tolerance. p < 0 là vô lý về vật lý (nồng độ trên 1 mol/L). plausible_p_range [2, 12] là khoảng sẵn có của pipeline, chưa có nguồn, được in kèm nhãn đó. count_edges và histograms chỉ là cách chia cột để hiển thị."
+    }
   }
 }

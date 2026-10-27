@@ -2,6 +2,8 @@ rdkit==2026.9.1
 pyarrow==25.0.1
 pytest==8.4.2
 numpy==2.2.6
+# matplotlib: chỉ dùng cho hình của run_audit.py (backend Agg, chạy được trên server).
+matplotlib==3.9.2
 
 # Stage 3 (evaluator).
 # torch: đã cài và kiểm chứng trên máy này ngày 23/10/2026 — 2.5.1+cu121, CUDA build 12.1,
