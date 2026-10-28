@@ -5,13 +5,15 @@ Chạy từ thư mục gốc của repo:
     python scripts\\dedup_cross_source.py --force    # ghi đè output cũ
 
 Luồng dữ liệu:
-    data/observations/*.parquet   (đầu vào Stage 1, chỉ đọc)
+    <paths.observations_dir>/*.parquet   (đầu vào Stage 1, chỉ đọc)
     -> lượt tổng quan: đếm giá trị source_curation, gom các dòng của ca kiểm chứng
     -> chia theo chữ cái đầu của InChIKey; mỗi phân vùng:
          ghép ứng viên trong cùng phân tử + endpoint + tài liệu (PMID/DOI/patent),
          chấm từng cặp theo protein và giá trị, gán mức căn cứ 1/2/3
-    -> data/dedup/cross_source_duplicates.parquet   (một dòng cho mỗi cặp hoặc dòng lẻ)
-    -> data/dedup/*_observations_dedup.parquet      (bản sao đủ 57 cột + 5 cột dedup_*)
+    -> <stage2a.paths.dedup_dir>/cross_source_duplicates.parquet
+         (một dòng cho mỗi cặp hoặc dòng lẻ)
+    -> <stage2a.paths.dedup_dir>/*_observations_dedup.parquet
+         (bản sao đủ cột observation + 5 cột dedup_*)
     -> runs/stage2a/dedup_<thời điểm>.{log,txt,json} (log, báo cáo đọc được, số liệu)
 
 Mức căn cứ (giảm dần độ chắc chắn):
@@ -70,7 +72,6 @@ UNCERTAIN = "uncertain"
 SEQUENCE = "sequence"
 ACCESSION = "accession"
 EXACT = "exact"
-CLOSE = "close"
 DIFFERS = "differs"
 QUALIFIER_DIFFERS = "qualifier_differs"
 MISSING = "missing"
@@ -307,15 +308,18 @@ def compare_proteins(chembl_hash: str | None, chembl_accession: str | None,
 def compare_values(chembl_qualifier: str | None, chembl_molar: float | None,
                    bindingdb_qualifier: str | None, bindingdb_molar: float | None,
                    exact_relative_tolerance: float,
-                   close_p_tolerance: float) -> tuple[str, float | None]:
+                   equal_p_tolerance: float) -> tuple[str, float | None]:
     """So giá trị đã quy về mol/L; trả về (nhãn, |Δp|).
 
-    Nhận: qualifier và nồng độ mol/L của mỗi bên, dung sai tương đối cho "bằng nhau",
-    dung sai |Δp| cho "gần bằng".
-    Trả về: nhãn ('exact', 'close', 'differs', 'qualifier_differs', 'missing') và
+    Nhận: qualifier và nồng độ mol/L của mỗi bên; dung sai tương đối cho "bằng nhau
+    tuyệt đối"; dung sai |Δp| cho "bằng nhau ở độ phân giải của pChEMBL".
+    Trả về: nhãn ('exact', 'differs', 'qualifier_differs', 'missing') và
     |log10(c1) - log10(c2)| (None nếu thiếu giá trị).
-    Vì sao có nhãn 'close': hai nguồn có thể làm tròn khác nhau (12,3 nM và 12 nM).
-    Cặp 'close' không được coi là duplicate, chỉ ghi uncertain để người đọc tự quyết.
+    Vì sao |Δp| ≤ equal_p_tolerance cũng là 'exact': ChEMBL lưu pchembl_value kiểu
+    NUMERIC(4,2) (schema ChEMBL 37), nên hai giá trị lệch không quá 0,01 là cùng một con
+    số ở độ phân giải đó; hai nguồn chỉ làm tròn khác nhau (vd. 85,2 nM và 85 nM).
+    Landrum & Riniker 2024 (JCIM 64, 1560) và Nelen et al. 2025 (J. Cheminform. 17, 8)
+    coi các giá trị bằng nhau như vậy là bản chép, không phải hai phép đo.
     """
     if chembl_molar is None or bindingdb_molar is None:
         return MISSING, None
@@ -325,10 +329,8 @@ def compare_values(chembl_qualifier: str | None, chembl_molar: float | None,
     if chembl_qualifier != bindingdb_qualifier:
         return QUALIFIER_DIFFERS, difference
     if math.isclose(chembl_molar, bindingdb_molar, rel_tol=exact_relative_tolerance,
-                    abs_tol=0.0):
+                    abs_tol=0.0) or difference <= equal_p_tolerance:
         return EXACT, difference
-    if difference <= close_p_tolerance:
-        return CLOSE, difference
     return DIFFERS, difference
 
 
@@ -778,7 +780,7 @@ def evaluate_pair(chembl_row: Mapping[str, Any], bindingdb_row: Mapping[str, Any
         value_match, difference = compare_values(
             chembl_row["qualifier"], chembl_row["molar"], bindingdb_row["qualifier"],
             bindingdb_row["molar"], settings["value_exact_relative_tolerance"],
-            settings["value_close_p_tolerance"])
+            settings["value_equal_p_tolerance"])
     except ValueError as error:
         raise ValueError(f"cặp {chembl_row['observation_id']} / "
                          f"{bindingdb_row['observation_id']}: {error}") from error

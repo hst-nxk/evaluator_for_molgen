@@ -57,6 +57,50 @@ def test_unknown_assay_does_not_block_protein(config: dict[str, Any]) -> None:
     assert row["activity_status"] == "resolved"
 
 
+def test_salt_row_gets_parent_identifiers_and_source_kept(config: dict[str, Any]) -> None:
+    salt = "C[NH+](C)CCOC(=O)c1ccccc1.[Cl-]"
+    row = observations(config, {"reactant_set_id": "9", "ligand_smiles": salt, "Ki": "5"})["Ki"]
+    free_base = observations(config, {"reactant_set_id": "10", "ligand_smiles":
+                                      "CN(C)CCOC(=O)c1ccccc1", "Ki": "5"})["Ki"]
+    assert row["molecule_source_smiles"] == salt
+    assert row["molecule_inchikey"] == free_base["molecule_inchikey"]
+    assert row["molecule_input_inchikey"] != free_base["molecule_input_inchikey"]
+    assert row["molecule_parent_fragments"] == 1
+
+
+def test_bindingdb_molecule_type_comes_from_chembl_lookup(config: dict[str, Any]) -> None:
+    asked: list[str] = []
+
+    def lookup(chembl_id: str) -> str | None:
+        asked.append(chembl_id)
+        return "Protein"
+
+    good, bad = (records_for({"reactant_set_id": rsid, "chembl_id": chembl_id, "Ki": "5"},
+                             config, RESOLVED_ASSAY)[0]
+                 for rsid, chembl_id in (("9", " CHEMBL2 "), ("10", "not-an-id")))
+    row = pipeline.build_observation(good, config, lookup)
+    assert (row["molecule_chembl_id"], row["molecule_chembl_type"]) == ("CHEMBL2", "Protein")
+    row = pipeline.build_observation(bad, config, lookup)
+    assert (row["molecule_chembl_id"], row["molecule_chembl_type"]) == (None, None)
+    assert asked == ["CHEMBL2"]
+
+
+def test_chembl_molecule_type_is_taken_from_its_own_row(config: dict[str, Any]) -> None:
+    record = {name: None for name in pipeline.SOURCE_COLUMN_NAMES}
+    record.update({"source_database": "chembl", "native_measurement_id": "1", "endpoint": "Ki",
+                   "molecule_source_smiles": "CCO", "molecule_source_chembl_id": "CHEMBL545",
+                   "molecule_source_type": "Small molecule", "activity_value_source": "5",
+                   "activity_unit_source": "nM", "activity_qualifier_source": "="})
+
+    def never(chembl_id: str) -> str | None:
+        raise AssertionError("ChEMBL rows must not be looked up")
+
+    row = pipeline.build_observation(record, config, never)
+    assert (row["molecule_chembl_id"], row["molecule_chembl_type"]) == (
+        "CHEMBL545", "Small molecule")
+    assert set(row) == set(pipeline.OBSERVATION_SCHEMA.names)
+
+
 def test_record_with_unexpected_keys_is_rejected(config: dict[str, Any]) -> None:
     record = records_for({"reactant_set_id": "9", "Ki": "5"}, config, RESOLVED_ASSAY)[0]
     with pytest.raises(ValueError, match="bindingdb:9"):

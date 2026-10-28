@@ -3,8 +3,9 @@
     "raw_chembl_dir": "raw/chembl37",
     "raw_bindingdb_dir": "raw/bindingdb202610",
     "chembl_db": "work/chembl_37/chembl_37_sqlite/chembl_37.db",
-    "observations_dir": "data/observations",
-    "runs_dir": "runs/observations"
+    "observations_dir": "data/observations_v2",
+    "runs_dir": "runs/observations",
+    "version_note": "v2 (29/10/2026): định danh phân tử là parent theo ChEMBL Structure Pipeline (mục structure), thêm cột loại phân tử ChEMBL và cột kiểm InChIKey nguồn; ghi vào thư mục mới. v1 (data/observations, chạy 18-19/10/2026) giữ nguyên, chỉ đọc, để đối chiếu."
   },
   "releases": {
     "chembl": "37",
@@ -68,6 +69,7 @@
       "ligand_smiles": "Ligand SMILES",
       "ligand_inchikey": "Ligand InChI Key",
       "monomer_id": "BindingDB MonomerID",
+      "chembl_id": "ChEMBL ID of Ligand",
       "target_name": "Target Name",
       "target_organism": "Target Source Organism According to Curator or DataSource",
       "ph": "pH",
@@ -104,7 +106,15 @@
     "sdf_not_read": "chembl_37.sdf.gz",
     "fetch_size": 20000,
     "id_batch_size": 10000,
-    "id_batch_size_note": "Must stay below SQLite's bound-parameter limit (32766 for SQLite >= 3.32)."
+    "id_batch_size_note": "Must stay below SQLite's bound-parameter limit (32766 for SQLite >= 3.32).",
+    "molecule_type_cache_size": 2000000,
+    "molecule_type_cache_size_note": "Số mã ChEMBL được nhớ kết quả tra molecule_type (dòng BindingDB). ChEMBL 37 có khoảng 2,9 triệu phân tử nên 2 triệu đủ phủ các mã lặp lại; chỉ là cache, không ảnh hưởng kết quả."
+  },
+  "structure": {
+    "chembl_structure_pipeline_version": "1.2.4",
+    "method": "ChEMBL Structure Pipeline: standardize_mol rồi get_parent_mol(neutralize=True, check_exclusion=True). Bỏ mảnh muối/dung môi theo danh sách của gói, trung hòa điện tích (giữ N bậc bốn), bỏ đồng vị, chuẩn hóa nhóm chức (nitro, sulfoxide, ...).",
+    "source": "Bento et al. 2020, J. Cheminform. 12:51, DOI 10.1186/s13321-020-00456-1: 'a GetParent component that removes any salts and solvents from the compound to create its parent'.",
+    "note": "molecule_canonical_smiles và molecule_inchikey là của parent; molecule_input_canonical_smiles và molecule_input_inchikey là của cấu trúc nguồn đọc thẳng. Phiên bản gói được kiểm lúc chạy; khác phiên bản thì dừng."
   },
   "run": {
     "chunk_rows": 100000,
@@ -124,8 +134,9 @@
   },
   "stage2a": {
     "paths": {
-      "dedup_dir": "data/dedup",
-      "runs_dir": "runs/stage2a"
+      "dedup_dir": "data/dedup_v2",
+      "runs_dir": "runs/stage2a",
+      "version_note": "v2 (29/10/2026) dựng từ data/observations_v2, ghi vào thư mục mới; v1 (data/dedup) giữ nguyên, chỉ đọc."
     },
     "columns": {
       "observation_id": "observation_id",
@@ -181,7 +192,8 @@
       "patent_kind_code_pattern": "^([A-Z]+[0-9]+)[A-Z][0-9]?$",
       "patent_kind_code_replacement": "\\1",
       "value_exact_relative_tolerance": 1e-9,
-      "value_close_p_tolerance": 0.05,
+      "value_equal_p_tolerance": 0.01,
+      "value_equal_p_tolerance_note": "Hai giá trị ChEMBL/BindingDB lệch |Δp| ≤ 0,01 là CÙNG một số (exact = bản sao), không còn mức 'gần bằng' 0,05. Căn cứ: ChEMBL lưu pchembl_value kiểu NUMERIC(4,2) (schema chembl_37), nên 0,01 là độ phân giải báo cáo của pChEMBL; Landrum & Riniker 2024 (J. Chem. Inf. Model. 64, 1560, DOI 10.1021/acs.jcim.4c00049) và Nelen et al. 2025 (J. Cheminform. 17, 8, DOI 10.1186/s13321-025-00956-y) coi giá trị giống hệt giữa hai assay là dấu hiệu chép số liệu và loại khi curation.",
       "value_key_decimals": 6,
       "partition_alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
       "letters_per_partition": 1,
@@ -241,14 +253,14 @@
   },
   "stage2b": {
     "inputs": {
-      "chembl": "data/dedup/chembl37_observations_dedup.parquet",
-      "bindingdb": "data/dedup/bindingdb202610_observations_dedup.parquet"
+      "chembl": "data/dedup_v2/chembl37_observations_dedup.parquet",
+      "bindingdb": "data/dedup_v2/bindingdb202610_observations_dedup.parquet"
     },
     "paths": {
-      "dataset_dir": "data/dataset_v2",
-      "full_dir": "data/dataset_v2/full",
+      "dataset_dir": "data/dataset_v3",
+      "full_dir": "data/dataset_v3/full",
       "runs_dir": "runs/dataset",
-      "version_note": "v2 (24/10/2026) ghi vào thư mục mới; v1 (data/dataset, dựng 21-22/10/2026) giữ nguyên, chỉ đọc, để đối chiếu. Thay đổi của v2 và lý do: docs/AUDIT_20261024.md mục 6 và docs/STAGE2B_DATASET.md mục v2."
+      "version_note": "v3 (29/10/2026) dựng từ data/dedup_v2 (observation v2, định danh parent), ghi vào thư mục mới; v2 (data/dataset_v2, 24/10/2026) và v1 (data/dataset, 21-22/10/2026) giữ nguyên, chỉ đọc, để đối chiếu. Thay đổi của v2 và lý do: docs/AUDIT_20261024.md mục 6 và docs/STAGE2B_DATASET.md mục v2."
     },
     "files": {
       "molecules": "molecules.parquet",
@@ -305,7 +317,7 @@
       "merge_tolerance": 0.01,
       "float_slack": 1e-9,
       "std_ddof": 1,
-      "note": "Bước 1. Giá trị pActivity trong cùng nhóm (nguồn, assay, protein, endpoint, phân tử) lệch nhau ≤ merge_tolerance được gộp làm một phép đo (quyết định ở docs/STAGE2A_DEDUP_AUDIT.md mục 5.6). float_slack bù sai số dấu phẩy động khi so với ngưỡng."
+      "note": "Bước 1. Giá trị pActivity trong cùng nhóm (nguồn, assay, protein, endpoint, phân tử) lệch nhau ≤ merge_tolerance được gộp làm một phép đo (quyết định ở docs/STAGE2A_DEDUP_AUDIT.md mục 5.6). 0,01 = độ phân giải của pchembl_value (NUMERIC(4,2) trong schema ChEMBL), cùng mức 'giống hệt' với stage2a.dedup.value_equal_p_tolerance. float_slack bù sai số dấu phẩy động khi so với ngưỡng."
     },
     "identity": {
       "relative_stereo_suffix": "-REL",
@@ -316,16 +328,18 @@
       "max_cuts": 1,
       "max_cut_bonds": 400,
       "cut_smarts": "[#6+0;!$(*=,#[!#6])]!@!=!#[*]",
-      "max_cut_bonds_note": "v2. maxCutBonds của rdMMPA KHÔNG giới hạn kích thước phép sửa: nếu số liên kết khớp cut_smarts của phân tử vượt maxCutBonds thì FragmentMol trả về RỖNG cho cả phân tử, nên phân tử lớn mất hết cặp. Kích thước phép sửa do max_variable_heavy_atoms và min_core_fraction quyết định. v1 dùng 20 (mặc định RDKit) và mất 194.400 Δp assay (+1,46 %), 166.585 bản ghi (đo ngày 24/10/2026, docs/AUDIT_20261024.md mục 3.3). Phân tử nhiều liên kết cắt nhất trong dữ liệu có 340; 400 vượt mức đó, và mmp.check_cut_bonds báo lỗi nếu có phân tử vượt, nên không mất cặp thầm lặng. cut_smarts là mẫu mặc định của rdMMPA, ghi rõ ra để kiểm tra dùng đúng một định nghĩa.",
-      "min_core_fraction": 0.6,
-      "max_variable_heavy_atoms": 10,
+      "max_cut_bonds_note": "v2. maxCutBonds của rdMMPA KHÔNG giới hạn kích thước phép sửa: nếu số liên kết khớp cut_smarts của phân tử vượt maxCutBonds thì FragmentMol trả về RỖNG cho cả phân tử, nên phân tử lớn mất hết cặp. Kích thước phép sửa do max_variable_heavy_atoms, min_core_to_variable_ratio và max_variable_size_difference quyết định. v1 dùng 20 (mặc định RDKit) và mất 194.400 Δp assay (+1,46 %), 166.585 bản ghi (đo ngày 24/10/2026, docs/AUDIT_20261024.md mục 3.3). Phân tử nhiều liên kết cắt nhất trong dữ liệu có 340; 400 vượt mức đó, và mmp.check_cut_bonds báo lỗi nếu có phân tử vượt, nên không mất cặp thầm lặng. cut_smarts là mẫu mặc định của rdMMPA, ghi rõ ra để kiểm tra dùng đúng một định nghĩa.",
+      "min_core_to_variable_ratio": 2.0,
+      "max_variable_heavy_atoms": 13,
+      "max_variable_size_difference": 8,
+      "size_rule_source": "Hu X, Hu Y, Vogt M, Stumpfe D, Bajorath J. MMP-Cliffs: systematic identification of activity cliffs on the basis of matched molecular pairs. J. Chem. Inf. Model. 2012, 52(5), 1138-1145, DOI 10.1021/ci3001138. Quy tắc MMP giới hạn kích thước: lõi chung ≥ 2 lần mỗi mảnh thay thế; mảnh thay thế ≤ 13 nguyên tử nặng; hai mảnh thay thế chênh nhau ≤ 8 nguyên tử nặng. Thay cho quy tắc v2 tự đặt (lõi ≥ 60 %, biến đổi ≤ 10).",
       "attachment_points": 1,
       "attachment_degree": 1,
       "workers": 8,
       "groups_per_task": 2000,
       "fragment_cache_size": 200000,
       "pending_tasks_per_worker": 2,
-      "note": "Bước 2. RDKit rdMMPA.FragmentMol với min_cuts/max_cuts/max_cut_bonds. Lõi chung ≥ min_core_fraction số nguyên tử nặng của cả A và B; phần biến đổi ≤ max_variable_heavy_atoms mỗi bên; mỗi mảnh đúng attachment_points điểm nối và nguyên tử nối có bậc attachment_degree. workers: số tiến trình con; fragment_cache_size: số phân tử nhớ kết quả cắt trong mỗi tiến trình."
+      "note": "Bước 2. RDKit rdMMPA.FragmentMol với min_cuts/max_cuts/max_cut_bonds. Kích thước theo size_rule_source: lõi chung ≥ min_core_to_variable_ratio lần phần biến đổi của mỗi bên; phần biến đổi ≤ max_variable_heavy_atoms mỗi bên; hai phần biến đổi chênh nhau ≤ max_variable_size_difference (cách cắt vi phạm bị bỏ trước khi chọn cách cắt tốt nhất); mỗi mảnh đúng attachment_points điểm nối và nguyên tử nối có bậc attachment_degree. workers: số tiến trình con; fragment_cache_size: số phân tử nhớ kết quả cắt trong mỗi tiến trình."
     },
     "delta": {
       "pair_id_length": 24,
@@ -333,11 +347,11 @@
       "note": "Bước 3. pair_id = 24 ký tự hex đầu của SHA-256('endpoint|protein|A|B'). Δp trong assay được ghi thành protein_buckets file theo ký tự đầu của protein_sequence_hash, để bước 4 xử lý từng phần cho vừa bộ nhớ."
     },
     "qc": {
-      "dispersion_thresholds": {"Ki": 1.0, "Kd": 1.0, "IC50": 1.4, "EC50": 1.4},
+      "dispersion_thresholds": {"Ki": 1.0, "Kd": 1.0, "IC50": 1.0, "EC50": 1.0},
       "dispersion_ddof": 1,
       "collapse_tolerance": 0.01,
       "report_levels": [0.3, 1.0],
-      "note": "Bước 4 (v2). Trước khi tính thống kê, các Δp của một bản ghi lệch nhau ≤ collapse_tolerance được gộp làm MỘT giá trị (cùng quy tắc neo và cùng 0,01 với bước 1): đo ngày 24/10/2026, 69,3 % bản ghi ≥ 2 assay chỉ có một giá trị Δp, phần lớn là số liệu chép giữa các tài liệu, nên không được tính là bằng chứng thứ hai. Độ phân tán tính trên các giá trị khác nhau: ≥ 3 giá trị là STD (ddof = dispersion_ddof); 2 giá trị là |Δ_X − Δ_Y|. Cờ: single_assay (1 assay); identical_values (≥ 2 assay, 1 giá trị); quarantine (≥ 2 giá trị, phân tán > ngưỡng); pass (≥ 2 giá trị, phân tán ≤ ngưỡng). Ngưỡng giữ như v1: Ki/Kd 1,0; IC50/EC50 1,4. Căn cứ: ngưỡng được chọn trước khi xem nhãn, từ σ mỗi phép đo ở Stage 2a (Ki 0,50; Kd 0,57; IC50/EC50 0,73). Đo lại ngày 24/10/2026 trên cặp Δp từ hai tài liệu KHÁC nhau và khác giá trị, SD của hiệu là Ki ≈ 0,27; IC50 ≈ 0,38; EC50 ≈ 0,49, tức ngưỡng ≈ 3-4 SD của nhiễu giữa hai tài liệu độc lập (docs/AUDIT_20261024.md mục 4.4), KHÔNG phải '2σ' theo nghĩa thống kê của hiệu. report_levels chỉ để báo cáo, đối chiếu Nelen et al. 2025, không lọc."
+      "note": "Bước 4 (v2). Trước khi tính thống kê, các Δp của một bản ghi lệch nhau ≤ collapse_tolerance được gộp làm MỘT giá trị (cùng quy tắc neo và cùng 0,01 với bước 1): đo ngày 24/10/2026, 69,3 % bản ghi ≥ 2 assay chỉ có một giá trị Δp, phần lớn là số liệu chép giữa các tài liệu, nên không được tính là bằng chứng thứ hai. Độ phân tán = max − min của các giá trị khác nhau, tức |ΔΔp| lớn nhất giữa hai assay (2 giá trị: |Δ_X − Δ_Y|). Cờ: single_assay (1 assay); identical_values (≥ 2 assay, 1 giá trị); quarantine (≥ 2 giá trị, phân tán > ngưỡng); pass (≥ 2 giá trị, phân tán ≤ ngưỡng). Ngưỡng 1,0 log cho mọi endpoint (v3; v1/v2 dùng IC50/EC50 1,4 tự đặt, đã bỏ). Căn cứ: Nelen J, Pérez-Sánchez H, De Winter H, Van Rompaey D. Matched pairs demonstrate robustness against inter-assay variability. J. Cheminform. 2025, 17:8, DOI 10.1186/s13321-025-00956-y — tính ΔΔpChEMBL giữa các assay của cùng một cặp MMP (đúng đại lượng này), coi < 0,3 là trong nhiễu thí nghiệm và > 1,0 là 'significant discrepancies', dùng cùng ngưỡng cho Ki và IC50; hai mức lấy từ Landrum & Riniker 2024, J. Chem. Inf. Model. 64, 1560, DOI 10.1021/acs.jcim.4c00049. dispersion_ddof chỉ dùng cho cột mô tả delta_p_std. report_levels (0,3 / 1,0) chỉ để báo cáo, không lọc."
     },
     "export": {
       "eligible_qc": ["pass", "single_assay", "identical_values"],
@@ -352,6 +366,8 @@
       "chembl_assay_prefix": "chembl:",
       "protein_alphabet": "ACDEFGHIKLMNPQRSTVWYBXZUO",
       "observation_flag_note": "v2. Ba cột mô tả thêm, KHÔNG lọc dòng nào. min_target_confidence: confidence_score nhỏ nhất của ChEMBL trong các phép đo đóng góp (assay_context); 9 = 'Direct single protein target assigned', 8 = 'Homologous single protein target assigned' (protein đo có thể là đồng đẳng khác loài); null ChEMBL được coi là missing_confidence = 0 ('target unknown or has yet to be curated'); bản ghi chỉ có BindingDB thì null vì BindingDB không có trường tương đương. Đo ngày 24/10/2026 trên v1: 24,4 % dòng evaluator có ít nhất một assay mức 8. inactive_comment: ít nhất một phép đo đóng góp có activity_comment (so không phân biệt hoa thường) thuộc inactive_comments trên dòng qualifier '=', tức giá trị có thể là nồng độ cao nhất đã thử chứ không phải hằng số đo được (v1: 2.699 dòng evaluator). nonstandard_sequence: chuỗi protein (bỏ khoảng trắng, viết hoa — đúng chuẩn hóa của hash Stage 1) có ký tự ngoài protein_alphabet (20 acid amin chuẩn + B, X, Z, U, O), vd. chuỗi có chữ số hay tên nhóm hóa học như 'biotin-C6linker-'. Hai regex chỉ chọn trước dòng cần parse JSON; dòng đã chọn vẫn được parse đầy đủ.",
+      "large_molecule_weight": 1000.0,
+      "large_molecule_note": "Cột large_molecule chỉ có ở evidence: A hoặc B có MolWt (RDKit) ≥ large_molecule_weight Da; bản ghi mang cờ không vào hai file training. Nguồn: Doak et al. 2014, Chem. Biol. 21, 1115, DOI 10.1016/j.chembiol.2014.08.013.",
       "generator_min_gain": 0.3,
       "plausible_p_range": [2.0, 12.0],
       "min_protein_length": 50,
@@ -364,7 +380,8 @@
     },
     "split": {
       "partitions": ["train", "validation", "test"],
-      "target_ratios": {"train": 0.8, "validation": 0.1, "test": 0.1},
+      "target_ratios": {"train": 0.85, "validation": 0.05, "test": 0.1},
+      "target_ratios_note": "v3: validation 0,05 theo quyết định họp 26/10/2026 (validation khoảng 500.000 cặp, phần còn lại cho train; v2 có 10.684.298 cặp nên 0,05 ≈ 534.000). test giữ 0,1. Đây là quyết định thiết kế của nhóm, không phải ngưỡng lấy từ tài liệu.",
       "seed": 20261021,
       "old_split_file": "E:/data/molopt_benchmark_split_candidate_v2/P50_GLOBAL_NW_50_CANDIDATE_20260910_V2/protein_to_partition.parquet",
       "clustering": {
@@ -401,11 +418,11 @@
   },
   "stage3": {
     "inputs": {
-      "evaluator": "data/dataset_v2/evaluator_training.parquet",
-      "proteins": "data/dataset_v2/full/proteins.parquet"
+      "evaluator": "data/dataset_v3/evaluator_training.parquet",
+      "proteins": "data/dataset_v3/full/proteins.parquet"
     },
     "paths": {
-      "cache_dir": "work/evaluator_cache_v2",
+      "cache_dir": "work/evaluator_cache_v3",
       "runs_dir": "runs/evaluator"
     },
     "files": {
@@ -472,7 +489,9 @@
       "top_k": [1, 3, 10],
       "min_candidates": 2,
       "expand_both_directions": true,
-      "direction_tolerance": 0.0,
+      "direction_tolerance": 0.3,
+      "change_class_threshold": 0.3,
+      "threshold_source": "0,3 log = sai số thí nghiệm dự kiến giữa hai phép đo (khoảng 2 lần nồng độ): Landrum GA, Riniker S. Combining IC50 or Ki values from different sources is a source of significant noise. J. Chem. Inf. Model. 2024, 64(5), 1560-1567, DOI 10.1021/acs.jcim.4c00049; Nelen et al. 2025, J. Cheminform. 17:8, DOI 10.1186/s13321-025-00956-y dùng cùng mức cho ΔΔpChEMBL của cặp MMP. direction_tolerance: hai ứng viên có nhãn lệch ≤ 0,3 bị loại khỏi mẫu số của tỉ lệ đúng chiều (v2 dùng 0, nên số liệu ranking không so trực tiếp với lần chạy cũ). change_class_threshold: chia nhãn và dự đoán thành kém hơn (< −0,3) / ngang (|Δp| ≤ 0,3) / tốt hơn (> 0,3), báo accuracy, F1 từng lớp, macro-F1 và ma trận nhầm lẫn. Cả hai CHỈ dùng để đánh giá, không lọc dòng training nào.",
       "measure_asymmetry": true,
       "asymmetry_rows": 200000,
       "baselines": ["zero", "endpoint_mean", "random"],
@@ -494,7 +513,8 @@
     },
     "columns": {
       "curation": "source_curation",
-      "dedup_reason": "dedup_reason"
+      "dedup_reason": "dedup_reason",
+      "assay_description": "assay_description"
     },
     "quantiles": [
       0,
@@ -570,7 +590,7 @@
         "max": 4,
         "bins": 80
       },
-      "note": "Đọc evidence_records, không lọc gì. Mức so sánh lấy từ audit.literature, không có ngưỡng nào tự đặt. assay_buckets chỉ là cách chia bảng theo số assay (2, 3-5, ≥ 6). Ngưỡng hiện tại của pipeline (stage2b.qc.dispersion_thresholds 1,0 / 1,4) chỉ được in ra để đối chiếu và được ghi rõ là CHƯA có nguồn."
+      "note": "Đọc evidence_records, không lọc gì. Mức so sánh lấy từ audit.literature, không có ngưỡng nào tự đặt. assay_buckets chỉ là cách chia bảng theo số assay (2, 3-5, ≥ 6). Ngưỡng cách ly của pipeline (stage2b.qc.dispersion_thresholds, 1,0 cho mọi endpoint theo Nelen et al. 2025) được in ra để đối chiếu với số bản ghi > 1,0 của mục 1."
     },
     "molecules": {
       "workers": 8,
@@ -633,6 +653,15 @@
         }
       },
       "note": "Đo trên evaluator_training, mỗi SMILES khác nhau tính một lần (RDKit, song song workers tiến trình). total_atoms tính cả H (đề xuất ~300 của sếp), heavy_atoms không tính H. cutoffs chỉ là ngưỡng ỨNG VIÊN để xem tác động (số cặp mất theo partition); chọn ngưỡng sau khi xem số liệu và tài liệu. peptide_smarts: hai đơn vị khung amide -N-C-C(=O)- nối tiếp (giống định nghĩa 'peptide-like' đã dùng khi đo nhóm phân tử lớn)."
+    },
+    "followup": {
+      "residue_smarts": "[NX3][CX4][CX3](=O)",
+      "residue_bins": [2, 3, 4, 5, 6, 8, 10],
+      "overlap_bins": [0, 0.5, 0.9, 1],
+      "top_molecules": 30,
+      "examples": 5,
+      "description_chars": 160,
+      "note": "Audit bổ sung 27/10/2026 trước dataset_v3, chỉ đọc. Không có ngưỡng lọc nào ở đây: residue_smarts là mẫu một gốc amino acid (N–Cα–C=O) để ĐẾM số gốc của phân tử đã khớp audit.molecules.peptide_smarts, chỉ để xem phân bố; residue_bins và overlap_bins chỉ là cách chia cột của bảng; top_molecules, examples, description_chars là số dòng/ký tự in ra. Mốc chênh nhãn ở mục 1 lấy từ stage2b.qc.collapse_tolerance và audit.literature."
     },
     "stats": {
       "count_edges": [

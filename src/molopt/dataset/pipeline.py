@@ -39,6 +39,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+from rdkit import Chem
+from rdkit.Chem import Descriptors
 
 from molopt.dataset import aggregate, delta, mmp, split
 
@@ -658,8 +660,9 @@ def fragment_settings(settings: Mapping[str, Any]) -> mmp.FragmentSettings:
     return mmp.FragmentSettings(
         min_cuts=settings["min_cuts"], max_cuts=settings["max_cuts"],
         max_cut_bonds=settings["max_cut_bonds"], cut_smarts=settings["cut_smarts"],
-        min_core_fraction=settings["min_core_fraction"],
+        min_core_to_variable_ratio=settings["min_core_to_variable_ratio"],
         max_variable_heavy_atoms=settings["max_variable_heavy_atoms"],
+        max_variable_size_difference=settings["max_variable_size_difference"],
         attachment_points=settings["attachment_points"],
         attachment_degree=settings["attachment_degree"])
 
@@ -1077,6 +1080,8 @@ FLAG_COLUMNS = ["unseen_pair", "plausible_range", "short_protein", "inactive_com
                 "nonstandard_sequence"]
 # Cột cảnh báo của nguồn: chuỗi nguyên văn, không phải cờ bool, nên đếm riêng FLAG_COLUMNS.
 WARNING_COLUMN = "source_quality_warning"
+# Cờ phân tử lớn: chỉ có trong evidence; bản ghi mang cờ bị loại khỏi hai file training.
+LARGE_MOLECULE_COLUMN = "large_molecule"
 # Cột mô tả bằng chứng (số, không phải cờ bool), có ở cả hai file training. Không lọc gì.
 EVIDENCE_COLUMNS = ["n_assays", "n_distinct_values", "n_documents", "qc_status",
                     "min_target_confidence", "p_a_range", "max_replicate_std"]
@@ -1146,6 +1151,40 @@ def unseen_pair_column(records: pa.Table, codes: Mapping[str, int],
     """
     pairs = pair_codes(records, codes, grow=False)
     return pa.array(~np.isin(pairs, train_codes), pa.bool_())
+
+
+def molecular_weights(smiles: Sequence[str], cache: MutableMapping[str, float]) -> np.ndarray:
+    """Khối lượng phân tử trung bình (RDKit Descriptors.MolWt, Da) của từng SMILES.
+
+    Nhận: danh sách SMILES; cache SMILES -> khối lượng, dùng chung mọi bucket vì cùng một
+    phân tử gặp lại ở nhiều protein.
+    Trả về: mảng float64 cùng thứ tự. SMILES không đọc được -> ValueError (Stage 1 đã chuẩn
+    hóa nên không được xảy ra; không bỏ qua thầm).
+    """
+    out = np.empty(len(smiles), dtype=np.float64)
+    for index, text in enumerate(smiles):
+        weight = cache.get(text)
+        if weight is None:
+            molecule = Chem.MolFromSmiles(text)
+            if molecule is None:
+                raise ValueError(f"SMILES không đọc được: {text!r}")
+            weight = float(Descriptors.MolWt(molecule))
+            cache[text] = weight
+        out[index] = weight
+    return out
+
+
+def large_molecule_column(records: pa.Table, cache: MutableMapping[str, float],
+                          limit: float) -> pa.Array:
+    """Cờ large_molecule: A hoặc B có khối lượng phân tử ≥ limit (Da).
+
+    Căn cứ ngưỡng 1000 Da: không gian thuốc uống "beyond rule of 5" có MW < 1000 Da
+    (Doak et al. 2014, Chem. Biol. 21, 1115, DOI 10.1016/j.chembiol.2014.08.013), nên
+    phân tử từ 1000 Da trở lên nằm ngoài phạm vi "small molecule" của dự án.
+    """
+    weight_a = molecular_weights(records.column("smiles_a").to_pylist(), cache)
+    weight_b = molecular_weights(records.column("smiles_b").to_pylist(), cache)
+    return pa.array((weight_a >= limit) | (weight_b >= limit), pa.bool_())
 
 
 def value_bounds(path: Path, pair_ids: pa.Array) -> tuple[np.ndarray, np.ndarray]:
@@ -1427,9 +1466,10 @@ def oriented_generator_rows(records: pa.Table, min_gain: float) -> pa.Table:
 def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     """Bước 5: hai file training (evaluator, generator) và một file evidence.
 
-    Phần training chỉ gồm bản ghi đủ điều kiện (qc_status thuộc export.eligible_qc); phần
-    evidence giữ MỌI bản ghi, kể cả quarantine, nối với training bằng pair_id. Bộ lọc chỉ
-    quyết định tính đủ điều kiện, không xóa evidence.
+    Phần training chỉ gồm bản ghi đủ điều kiện (qc_status thuộc export.eligible_qc và
+    không mang cờ large_molecule); phần evidence giữ MỌI bản ghi, kể cả quarantine và phân
+    tử lớn, nối với training bằng pair_id. Bộ lọc chỉ quyết định tính đủ điều kiện, không
+    xóa evidence.
     Split được đọc từ protein_split.parquet; hàm này không tự dựng split.
     """
     settings = config["stage2b"]
@@ -1442,6 +1482,8 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     min_gain = settings["export"]["generator_min_gain"]
     low, high = settings["export"]["plausible_p_range"]
     min_length = settings["export"]["min_protein_length"]
+    weight_limit = float(settings["export"]["large_molecule_weight"])
+    weights: dict[str, float] = {}
     proteins = pq.read_table(full.file("proteins"),
                              columns=["protein_hash", "sequence_length", "protein_sequence"])
     lengths = dict(zip(proteins.column("protein_hash").to_pylist(),
@@ -1486,14 +1528,20 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
                 records = records.append_column("nonstandard_sequence", pa.array(
                     [key in unusual for key in records.column("protein_hash").to_pylist()],
                     pa.bool_()))
+                large = large_molecule_column(records, weights, weight_limit)
+                records = records.append_column(LARGE_MOLECULE_COLUMN, large)
+                counts[f"{LARGE_MOLECULE_COLUMN}_true"] += int(pc.sum(large).as_py() or 0)
                 for flag in FLAG_COLUMNS:
                     counts[f"{flag}_true"] += int(pc.sum(records.column(flag)).as_py() or 0)
                 warning_counts.update(
                     value for value in records.column(WARNING_COLUMN).to_pylist()
                     if value is not None)
                 evidence = records
-                training = records.filter(pc.is_in(records.column("qc_status"),
-                                                   value_set=pa.array(eligible, pa.string())))
+                qc_eligible = pc.is_in(records.column("qc_status"),
+                                       value_set=pa.array(eligible, pa.string()))
+                counts["eligible_qc_large_molecule"] += int(
+                    pc.sum(pc.and_(qc_eligible, large)).as_py() or 0)
+                training = records.filter(pc.and_(qc_eligible, pc.invert(large)))
                 evaluator = training.select(EVALUATOR_COLUMNS)
                 generator = oriented_generator_rows(training, min_gain)
                 for key, table in (("evidence_records", evidence), ("evaluator", evaluator),
@@ -1520,6 +1568,14 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
         "parameters": settings["export"],
         "rows": dict(counts),
         "flags": {flag: counts[f"{flag}_true"] for flag in FLAG_COLUMNS},
+        "large_molecule": {
+            "limit_dalton": weight_limit,
+            "evidence_records": counts[f"{LARGE_MOLECULE_COLUMN}_true"],
+            "excluded_from_training": counts["eligible_qc_large_molecule"],
+            "distinct_molecules_weighed": len(weights),
+            "distinct_large_molecules": sum(value >= weight_limit
+                                            for value in weights.values()),
+        },
         "source_quality_warning": {
             "observations_with_warning": len(comments),
             "records_with_warning": sum(warning_counts.values()),
@@ -1553,6 +1609,10 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     warning_table = [[value, fmt_int(number), fmt_pct(number, counts["evidence_records"])]
                      for value, number in by_count]
     log_lines(["Bước 5 — xuất dataset:", *format_table(["file", "dòng"], rows), "",
+               f"Phân tử lớn (MW ≥ {weight_limit:g} Da, A hoặc B): "
+               f"{fmt_int(counts[f'{LARGE_MOLECULE_COLUMN}_true'])} bản ghi evidence; "
+               f"{fmt_int(counts['eligible_qc_large_molecule'])} bản ghi đủ điều kiện QC "
+               "bị loại khỏi training.", "",
                "Cờ mô tả trên evidence (không lọc gì):",
                *format_table(["cờ", "số dòng True", "tỷ lệ"], flags), "",
                f"{WARNING_COLUMN} — cảnh báo của chính nguồn, nguyên văn, không lọc gì "
@@ -1938,7 +1998,11 @@ def qc_summary(layout: Layout, config: Mapping[str, Any],
 
 def check_export(config: Mapping[str, Any], root: Path, layout: Layout,
                  endpoints: Sequence[str]) -> dict[str, Any]:
-    """Phần xuất khớp phần bản ghi: evidence đủ mọi bản ghi, training chỉ bản ghi đủ điều kiện."""
+    """Phần xuất khớp phần bản ghi: evidence đủ mọi bản ghi, training chỉ bản ghi đủ điều kiện.
+
+    Đủ điều kiện = qc_status thuộc eligible_qc và không mang cờ large_molecule; số này đếm
+    trên chính file evidence, vì cờ phân tử lớn chỉ có ở đó.
+    """
     settings = config["stage2b"]
     _, dataset = layouts(config, root)
     files = {key: dataset.file(key) for key in ("evidence_records", "evaluator", "generator")}
@@ -1947,14 +2011,15 @@ def check_export(config: Mapping[str, Any], root: Path, layout: Layout,
                 "note": "chưa chạy --mode export", "files": {k: str(v) for k, v in files.items()}}
     eligible = set(settings["export"]["eligible_qc"])
     min_gain = settings["export"]["generator_min_gain"]
-    records = eligible_rows = 0
-    for endpoint in endpoints:
-        for path in layout.bucket_files("records_dir", endpoint):
-            table = pq.read_table(path, columns=["qc_status"])
-            records += table.num_rows
-            eligible_rows += sum(1 for status in table.column("qc_status").to_pylist()
-                                 if status in eligible)
-    evidence = pq.ParquetFile(files["evidence_records"]).metadata.num_rows
+    records = sum(pq.ParquetFile(path).metadata.num_rows for endpoint in endpoints
+                  for path in layout.bucket_files("records_dir", endpoint))
+    evidence_table = pq.read_table(files["evidence_records"],
+                                   columns=["qc_status", LARGE_MOLECULE_COLUMN])
+    eligible_rows = int(pc.sum(pc.and_(
+        pc.is_in(evidence_table.column("qc_status"),
+                 value_set=pa.array(sorted(eligible), pa.string())),
+        pc.invert(evidence_table.column(LARGE_MOLECULE_COLUMN)))).as_py() or 0)
+    evidence = evidence_table.num_rows
     evaluator = pq.ParquetFile(files["evaluator"]).metadata.num_rows
     generator_table = pq.read_table(files["generator"], columns=["gain", "partition"])
     gains = np.asarray(generator_table.column("gain").to_numpy(zero_copy_only=False),

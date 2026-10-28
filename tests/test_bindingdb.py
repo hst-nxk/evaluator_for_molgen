@@ -126,6 +126,13 @@ def test_one_record_per_non_empty_endpoint_with_verbatim_values(config: dict[str
     assert {record["activity_value_source"] for record in records} == {">10000", "3.2"}
 
 
+def test_ligand_chembl_id_kept_verbatim_and_type_left_empty(config: dict[str, Any]) -> None:
+    record = records_for({"reactant_set_id": "55", "chembl_id": " CHEMBL25", "Ki": "5"},
+                         config, RESOLVED_ASSAY)[0]
+    assert record["molecule_source_chembl_id"] == " CHEMBL25"
+    assert record["molecule_source_type"] is None
+
+
 def test_row_wider_than_header_is_rejected() -> None:
     with pytest.raises(ValueError, match="line 4"):
         bindingdb.check_row_width(["a", "b", "c"], 2, 4, "BindingDB_All.tsv")

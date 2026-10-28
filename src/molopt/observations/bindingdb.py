@@ -455,6 +455,10 @@ def build_records(
         "molecule_source_smiles": get("ligand_smiles"),
         "molecule_source_inchikey": get("ligand_inchikey"),
         "molecule_source_chirality": None,
+        # Mã ChEMBL mà BindingDB tự ghi cho phân tử (nguyên văn); loại phân tử BindingDB
+        # không có -> None (pipeline tra ChEMBL theo mã này).
+        "molecule_source_chembl_id": get("chembl_id"),
+        "molecule_source_type": None,
         "protein_sequence": protein.sequence,
         "protein_sequence_origin": SEQUENCE_ORIGIN_CHAIN_1 if protein.sequence else None,
         "protein_accession": protein.accession,

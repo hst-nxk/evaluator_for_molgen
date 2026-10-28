@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 from molopt.observations import chembl
 
@@ -47,6 +48,31 @@ def test_text_or_none_keeps_values_verbatim() -> None:
     assert chembl.text_or_none(12345) == "12345"
     assert chembl.text_or_none(" ") is None
     assert chembl.text_or_none(None) is None
+
+
+def test_molecule_type_lookup_by_chembl_id(tmp_path: Path) -> None:
+    db_path = tmp_path / "mini.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute("CREATE TABLE molecule_dictionary (chembl_id TEXT, molecule_type TEXT)")
+    connection.executemany("INSERT INTO molecule_dictionary VALUES (?, ?)",
+                           [("CHEMBL1", "Small molecule"), ("CHEMBL2", "Protein"),
+                            ("CHEMBL3", None)])
+    connection.commit()
+    connection.close()
+    lookup = chembl.MoleculeTypeLookup(db_path, cache_size=10)
+    try:
+        assert lookup("CHEMBL1") == "Small molecule"
+        assert lookup("CHEMBL2") == "Protein"
+        assert lookup("CHEMBL3") is None
+        assert lookup("CHEMBL404") is None
+    finally:
+        lookup.close()
+
+
+def test_molecule_type_lookup_does_not_open_database_until_needed(tmp_path: Path) -> None:
+    lookup = chembl.MoleculeTypeLookup(tmp_path / "absent.db", cache_size=10)
+    lookup.close()
+    assert lookup.connection is None
 
 
 def test_selected_activity_ids_are_ascending_and_limited() -> None:

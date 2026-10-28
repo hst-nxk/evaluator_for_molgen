@@ -154,6 +154,45 @@ def test_format_metrics_prints_a_dash_for_an_undefined_value() -> None:
     assert "R2 -" in lines[0] and "Spearman -" in lines[0]
 
 
+def test_change_class_puts_the_threshold_itself_in_neutral() -> None:
+    values = np.array([-0.31, -0.3, 0.0, 0.3, 0.31])
+    assert metrics.change_class(values, 0.3).tolist() == [0, 1, 1, 1, 2]
+
+
+def test_change_class_metrics_on_a_hand_computed_example() -> None:
+    # Thật: kém, ngang, tốt, tốt. Dự đoán: kém, kém, ngang, tốt.
+    truth = np.array([-1.0, 0.1, 0.5, 2.0])
+    prediction = np.array([-0.5, -0.5, 0.2, 1.0])
+    result = metrics.change_class_metrics(truth, prediction, 0.3)
+    assert result["confusion"] == [[1, 0, 0], [1, 0, 0], [0, 1, 1]]
+    assert result["accuracy"] == pytest.approx(0.5)
+    assert result["worse_f1"] == pytest.approx(2 / 3)
+    assert result["neutral_f1"] == pytest.approx(0.0)
+    assert result["better_f1"] == pytest.approx(2 / 3)
+    assert result["macro_f1"] == pytest.approx(4 / 9)
+    assert result["better_recall"] == pytest.approx(0.5)
+    assert (result["worse_rows"], result["neutral_rows"], result["better_rows"]) == (1, 1, 2)
+
+
+def test_change_class_metrics_leaves_an_absent_class_out_of_macro_f1() -> None:
+    # Không có dòng "kém" nào, cả thật lẫn dự đoán: F1 của lớp đó là None.
+    result = metrics.change_class_metrics(np.array([0.0, 1.0]), np.array([0.0, 1.0]), 0.3)
+    assert result["worse_f1"] is None
+    assert result["macro_f1"] == pytest.approx(1.0)
+
+
+def test_change_class_metrics_on_an_empty_slice() -> None:
+    result = metrics.change_class_metrics(np.array([]), np.array([]), 0.3)
+    assert result["n"] == 0 and result["accuracy"] is None and result["macro_f1"] is None
+
+
+def test_format_metrics_prints_the_three_class_line() -> None:
+    classes = metrics.change_class_metrics(np.array([-1.0, 1.0]), np.array([-1.0, 1.0]), 0.3)
+    lines = metrics.format_metrics("thử", {"n": 2, "mae": 0.0, "rmse": 0.0, "r2": 1.0,
+                                           "spearman": 1.0}, classes=classes)
+    assert "ba lớp (±0.30)" in lines[-1] and "macro-F1 1.0000" in lines[-1]
+
+
 def test_asymmetry_metrics_is_zero_for_a_perfectly_antisymmetric_model() -> None:
     # Đây chính là điều kiến trúc twin bảo đảm, nên số đo phải ra đúng 0.
     forward = np.array([1.0, -2.0, 0.5])

@@ -138,21 +138,19 @@ def test_collapse_replicates_separates_assays_and_molecules() -> None:
 # --------------------------------------------------------------------------- bước 4
 
 
-def test_dispersion_uses_std_from_three_assays() -> None:
-    sizes = np.array([3])
-    spread = aggregate.dispersion(sizes, np.array([0.5]), np.array([0.0]), np.array([2.0]))
-    assert spread == pytest.approx([0.5])
+def test_dispersion_uses_range_for_three_assays() -> None:
+    # Ba giá trị 0,0 / 0,4 / 2,0: cặp assay lệch nhiều nhất là 2,0 (không dùng STD).
+    spread = aggregate.dispersion(np.array([3]), np.array([0.0]), np.array([2.0]))
+    assert spread == pytest.approx([2.0])
 
 
 def test_dispersion_uses_range_for_two_assays() -> None:
-    spread = aggregate.dispersion(np.array([2]), np.array([np.nan]), np.array([1.0]),
-                                  np.array([2.5]))
+    spread = aggregate.dispersion(np.array([2]), np.array([1.0]), np.array([2.5]))
     assert spread == pytest.approx([1.5])
 
 
 def test_dispersion_is_nan_for_one_assay() -> None:
-    spread = aggregate.dispersion(np.array([1]), np.array([np.nan]), np.array([1.0]),
-                                  np.array([1.0]))
+    spread = aggregate.dispersion(np.array([1]), np.array([1.0]), np.array([1.0]))
     assert math.isnan(spread[0])
 
 
@@ -259,7 +257,10 @@ def test_aggregate_deltas_summarises_each_record() -> None:
     assert record["delta_p_max"] == pytest.approx(2.0)
     assert record["delta_p_values"] == [1.0, 2.0, 0.0]
     assert record["assay_keys"] == ["s:e:1", "s:e:2", "s:e:3"]
-    assert record["qc_status"] == aggregate.QC_PASS
+    # Độ phân tán = max − min = 2,0 > 1,0 nên cách ly (STD 1,0 thì đã cho qua).
+    assert record["qc_status"] == aggregate.QC_QUARANTINE
+    (relaxed,) = aggregate_rows(rows, threshold=2.0)
+    assert relaxed["qc_status"] == aggregate.QC_PASS
 
 
 def test_aggregate_deltas_marks_copied_values_as_identical() -> None:

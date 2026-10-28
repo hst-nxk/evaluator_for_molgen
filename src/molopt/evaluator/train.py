@@ -441,6 +441,8 @@ def evaluate(arrays: data.PairArrays, prediction: np.ndarray, keys: Mapping[str,
         slice_result: dict[str, Any] = {
             "rows": int(rows.size),
             "regression": metrics.regression_metrics(truth[rows], predicted[rows]),
+            "change_classes": metrics.change_class_metrics(
+                truth[rows], predicted[rows], float(settings["change_class_threshold"])),
         }
         if rows.size:
             if settings["expand_both_directions"]:
@@ -611,7 +613,8 @@ def run_baselines(config: Mapping[str, Any], root: Path, stamp: str) -> dict[str
             if slice_name == "by_endpoint" or not isinstance(block, dict):
                 continue
             for line in metrics.format_metrics(f"baseline {name} / {slice_name}",
-                                               block["regression"], block.get("ranking")):
+                                               block["regression"], block.get("ranking"),
+                                               block.get("change_classes")):
                 LOGGER.info("%s", line)
 
     _, runs_dir = layout(config, root)
@@ -793,7 +796,8 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
                         "seconds": round(time.perf_counter() - epoch_started, 1)})
         for line in metrics.format_metrics(f"epoch {epoch} validation",
                                            scores["all"]["regression"],
-                                           scores["all"].get("ranking")):
+                                           scores["all"].get("ranking"),
+                                           scores["all"].get("change_classes")):
             LOGGER.info("%s", line)
         LOGGER.info("epoch %s: train loss %.4f", epoch, loss)
         if mae is not None and mae < best_mae:
@@ -897,7 +901,7 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
         if name == "by_endpoint" or not isinstance(block, dict):
             continue
         for line in metrics.format_metrics(f"validation/{name}", block["regression"],
-                                           block.get("ranking")):
+                                           block.get("ranking"), block.get("change_classes")):
             LOGGER.info("%s", line)
     asymmetry = asymmetry_report(model, arrays, caches, protein_source, device, config)
     if asymmetry is not None:

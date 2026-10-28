@@ -292,7 +292,7 @@ def report_lines(payload: Mapping[str, Any]) -> list[str]:
             [[row["n_assays"], common.number(row["records"]), common.number(row["identical"]),
               common.percent(row["percent"])] for row in block["identical"]["by_n_assays"]])
         lines.append("")
-    lines += ["## 4. Đối chiếu: ngưỡng pipeline đang dùng (CHƯA có nguồn tài liệu)",
+    lines += ["## 4. Đối chiếu: ngưỡng cách ly của pipeline (stage2b.qc.dispersion_thresholds)",
               f"Ngưỡng: {payload['current_thresholds']}"]
     lines += common.table_lines(
         ["endpoint", "bản ghi ≥ 2 giá trị", "đang bị cách ly", "%"],

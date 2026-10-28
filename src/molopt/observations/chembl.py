@@ -18,6 +18,7 @@ Vị trí trong luồng raw -> observations:
 from __future__ import annotations
 
 # Chỉ dùng thư viện chuẩn: SQLite, array.
+import functools
 import json
 import logging
 import sqlite3
@@ -56,8 +57,10 @@ REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
     "target_dictionary": ("tid", "chembl_id", "pref_name", "target_type", "organism"),
     "target_components": ("tid", "component_id"),
     "component_sequences": ("component_id", "accession", "sequence"),
-    "molecule_dictionary": ("molregno", "chembl_id", "chirality"),
+    "molecule_dictionary": ("molregno", "chembl_id", "chirality", "molecule_type"),
     "compound_structures": ("molregno", "canonical_smiles", "standard_inchi_key"),
+    # Chỉ verify dùng: parent do chính ChEMBL tính, để đối chiếu parent của pipeline.
+    "molecule_hierarchy": ("molregno", "parent_molregno"),
     "docs": ("doc_id", "chembl_id", "pubmed_id", "doi", "patent_id"),
     "source": ("src_id", "src_short_name"),
 }
@@ -95,7 +98,7 @@ SELECT
     td.target_type, td.organism AS target_organism,
     tc.component_count, comp.sequence AS component_sequence,
     comp.accession AS component_accession,
-    md.chembl_id AS molecule_chembl_id, md.chirality,
+    md.chembl_id AS molecule_chembl_id, md.chirality, md.molecule_type,
     cs.canonical_smiles, cs.standard_inchi_key,
     d.chembl_id AS doc_chembl_id, d.pubmed_id, d.doi, d.patent_id
 FROM activities AS act
@@ -323,6 +326,10 @@ def build_record(row: sqlite3.Row, release: str) -> dict[str, Any]:
         "molecule_source_smiles": row["canonical_smiles"],
         "molecule_source_inchikey": row["standard_inchi_key"],
         "molecule_source_chirality": text_or_none(row["chirality"]),
+        # Mã ChEMBL của phân tử (trùng molecule_source_id ở nguồn này) và loại phân tử do
+        # ChEMBL gán (molecule_dictionary.molecule_type: 'Small molecule', 'Protein', ...).
+        "molecule_source_chembl_id": row["molecule_chembl_id"],
+        "molecule_source_type": row["molecule_type"],
         # Protein.
         "protein_sequence": protein.sequence,
         "protein_sequence_origin": protein.origin,
@@ -355,6 +362,41 @@ def build_record(row: sqlite3.Row, release: str) -> dict[str, Any]:
         "activity_qualifier_source": text_or_none(row["standard_relation"]),
         "activity_context": json.dumps(activity_context, ensure_ascii=False),
     }
+
+
+# Loại phân tử theo mã ChEMBL; chembl_id là khóa UNIQUE của molecule_dictionary.
+MOLECULE_TYPE_QUERY = "SELECT molecule_type FROM molecule_dictionary WHERE chembl_id = ?"
+
+
+class MoleculeTypeLookup:
+    """Tra molecule_type của ChEMBL theo mã ChEMBL (dùng cho dòng BindingDB).
+
+    Kết nối SQLite chỉ mở ở lần tra đầu tiên, để chạy được khi không có phân tử nào cần
+    tra (vd. test); có cache theo mã. Gọi close() khi xong.
+    Trả về của __call__: chuỗi molecule_type; None khi mã không có trong ChEMBL này
+    (vd. mã đã bị gỡ) hoặc ô molecule_type rỗng.
+    """
+
+    def __init__(self, db_path: Path, cache_size: int) -> None:
+        self.db_path = db_path
+        self.connection: sqlite3.Connection | None = None
+        self.cached = functools.lru_cache(maxsize=cache_size)(self.query)
+
+    def query(self, chembl_id: str) -> str | None:
+        """Một lần tra trong molecule_dictionary (không cache)."""
+        if self.connection is None:
+            self.connection = open_chembl_readonly(self.db_path)
+        row = self.connection.execute(MOLECULE_TYPE_QUERY, (chembl_id,)).fetchone()
+        return text_or_none(row[0]) if row else None
+
+    def __call__(self, chembl_id: str) -> str | None:
+        return self.cached(chembl_id)
+
+    def close(self) -> None:
+        """Đóng kết nối nếu đã mở."""
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
 
 
 # --------------------------------------------------------------------------- records

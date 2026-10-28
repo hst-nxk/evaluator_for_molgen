@@ -8,7 +8,7 @@
 # hàm trong gói src/molopt/observations theo chế độ người dùng chọn:
 #   inspect : in danh sách file raw, schema, vị trí các cột cần dùng (không đọc dòng dữ liệu)
 #   smoke   : chạy thử một mẫu nhỏ của cả hai nguồn vào runs/observations/smoke_<thời điểm>/
-#   full    : chạy toàn bộ, ghi Parquet vào data/observations/
+#   full    : chạy toàn bộ, ghi Parquet vào paths.observations_dir (hiện là data/observations_v2/)
 #   verify  : đối chiếu output của full ngược về raw, ghi báo cáo JSON
 # (Ghi chú tiếng Việt đặt bằng comment thay vì trong docstring ở trên, vì docstring của
 #  module được dùng làm nội dung `--help` qua argparse(description=__doc__).)

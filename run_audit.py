@@ -1,6 +1,7 @@
 """CLI audit dữ liệu theo yêu cầu buổi họp 26/10/2026 (chỉ đọc data/, chỉ ghi runs/audit).
 
-    python run_audit.py --task duplicates|thresholds|molecules|stats|all
+    python run_audit.py --task duplicates|thresholds|molecules|stats|followup|all
+    python run_audit.py --task followup --parts peptide relative   # chỉ chạy vài phần
 """
 # ---------------------------------------------------------------------------------------
 # Mỗi task trả lời một yêu cầu:
@@ -10,6 +11,8 @@
 #   thresholds : (3) độ phân tán Δp giữa các assay, số bản ghi Δp y hệt, tác động ngưỡng
 #   molecules  : (4) kích thước phân tử (nguyên tử nặng, tổng nguyên tử có H, MW), peptide,
 #                kích thước nhóm thế, số cặp mất theo từng ngưỡng ứng viên
+#   followup   : việc tồn 27/10 trước dataset_v3: dòng trùng do -REL, peptide còn lại
+#                sau ngưỡng MW, assay bị nhập hai lần trong cùng một nguồn
 # Kết quả: runs/audit/<task>_<thời điểm>.json, .txt, .log và thư mục _figures.
 # molecules dùng ProcessPoolExecutor (spawn trên Windows) nên main() phải nằm sau
 # `if __name__ == "__main__"`.
@@ -28,10 +31,11 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from molopt.audit import common, duplicates, molecules, stats, thresholds  # noqa: E402
+from molopt.audit import (common, duplicates, followup, molecules, stats,  # noqa: E402
+                          thresholds)
 
 CONFIG_PATH = ROOT / "config.json"
-TASKS = ("duplicates", "stats", "thresholds", "molecules")
+TASKS = ("duplicates", "stats", "thresholds", "molecules", "followup")
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
@@ -50,8 +54,12 @@ def setup_logging(log_path: Path) -> None:
                                   logging.FileHandler(log_path, encoding="utf-8")])
 
 
-def run_task(task: str, config: dict[str, Any], stamp: str) -> None:
-    """Chạy một task và ghi báo cáo <task>_<stamp>.json/.txt."""
+def run_task(task: str, config: dict[str, Any], stamp: str,
+             parts: list[str] | None = None) -> None:
+    """Chạy một task và ghi báo cáo <task>_<stamp>.json/.txt.
+
+    `parts` chỉ dùng cho followup (None = mọi phần).
+    """
     output_dir = common.runs_dir(config, ROOT)
     name = f"{task}_{stamp}"
     figures = output_dir / f"{name}_figures"
@@ -62,6 +70,8 @@ def run_task(task: str, config: dict[str, Any], stamp: str) -> None:
         payload, lines = stats.run(config, ROOT, figures)
     elif task == "thresholds":
         payload, lines = thresholds.run(config, ROOT, figures)
+    elif task == "followup":
+        payload, lines = followup.run(config, ROOT, parts or tuple(followup.PARTS))
     else:
         payload, lines = molecules.run(config, ROOT, figures, name)
     common.write_report(output_dir, name, payload, lines)
@@ -72,13 +82,15 @@ def main() -> int:
     """Nhận tham số dòng lệnh, chạy task tương ứng. Trả về mã thoát 0."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", choices=(*TASKS, "all"), required=True)
+    parser.add_argument("--parts", nargs="+", choices=tuple(followup.PARTS),
+                        help="chỉ với --task followup: các phần cần chạy (mặc định cả ba)")
     args = parser.parse_args()
 
     config = load_config(CONFIG_PATH)
     stamp = datetime.now().strftime(TIMESTAMP_FORMAT)
     setup_logging(common.runs_dir(config, ROOT) / f"{args.task}_{stamp}.log")
     for task in TASKS if args.task == "all" else (args.task,):
-        run_task(task, config, stamp)
+        run_task(task, config, stamp, args.parts)
     return 0
 
 

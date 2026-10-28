@@ -7,24 +7,35 @@ results in separate derived columns.
 Vị trí trong luồng raw -> observations:
     chembl.py / bindingdb.py  đọc raw, trả về bản ghi với giá trị nguồn nguyên văn
     -> normalize.py (file này) tính các giá trị suy ra: qualifier, nồng độ mol/L,
-       pActivity, canonical SMILES, InChIKey, thông tin lập thể, observation_id,
-       PMID dạng số nguyên, hash chuỗi protein
+       pActivity, cấu trúc parent (ChEMBL Structure Pipeline), canonical SMILES,
+       InChIKey, thông tin lập thể, observation_id, PMID dạng số nguyên, hash chuỗi protein
     -> pipeline.py ghép giá trị nguồn + giá trị suy ra thành một dòng observation.
 
-Mọi hàm ở đây là hàm thuần (không đọc file, không có trạng thái), dùng chung cho cả
-hai nguồn, nên ChEMBL và BindingDB được chuẩn hóa theo đúng một quy tắc và có thể
-kiểm thử bằng unit test mà không cần dữ liệu raw.
+Mọi hàm ở đây là hàm thuần (không đọc file dữ liệu, không có trạng thái), dùng chung
+cho cả hai nguồn, nên ChEMBL và BindingDB được chuẩn hóa theo đúng một quy tắc và có
+thể kiểm thử bằng unit test mà không cần dữ liệu raw.
+
+Cấu trúc phân tử: định danh (canonical SMILES, InChIKey) tính trên PARENT của ChEMBL
+Structure Pipeline (Bento et al. 2020, J. Cheminform. 12:51,
+DOI 10.1186/s13321-020-00456-1): standardize_mol rồi get_parent_mol, bỏ muối và dung
+môi, trung hòa điện tích, bỏ đồng vị. Lý do: ion đối không tham gia phép đo; cùng một
+chất ở dạng muối, dạng base tự do hay dạng proton hóa phải có cùng một định danh, và
+phân tử còn ion đối không ghép được cặp MMP (cắt một liên kết cho ba mảnh). Cấu trúc
+nguồn đọc thẳng (chưa chuẩn hóa) vẫn được giữ ở cột molecule_input_* để đối chiếu.
 """
 
 from __future__ import annotations
 
-# Hash, toán, regex; RDKit để xử lý phân tử.
+# Hash, toán, regex; RDKit để xử lý phân tử; ChEMBL Structure Pipeline để lấy parent.
 import hashlib
 import math
 import re
 from collections.abc import Collection, Mapping
 from typing import NamedTuple
 
+import chembl_structure_pipeline
+from chembl_structure_pipeline import standardizer as chembl_standardizer
+from chembl_structure_pipeline.exclude_flag import exclude_flag
 from rdkit import Chem, RDLogger
 
 # RDKit failures are recorded per row in structure_status/structure_reason,
@@ -56,6 +67,23 @@ RDKIT_ERRORS = (RuntimeError, ValueError)
 # Lý do lỗi tối đa 80 ký tự; nhiều lý do nối bằng ';'.
 MAX_ERROR_DETAIL_CHARS = 80
 REASON_SEPARATOR = ";"
+# Một phân tử liền (không có dấu '.').
+SINGLE_FRAGMENT = 1
+# InChIKey: 14 ký tự đầu mã hóa khung nối nguyên tử (connectivity), phần sau là các lớp
+# lập thể, đồng vị, proton.
+INCHIKEY_SKELETON_CHARS = 14
+# Giá trị của cột molecule_source_inchikey_check (InChIKey nguồn so với InChIKey RDKit
+# tính trên CHÍNH cấu trúc nguồn, trước chuẩn hóa).
+INCHIKEY_MATCH = "match"
+INCHIKEY_OTHER_LAYERS_DIFFER = "skeleton_match_other_layers_differ"
+INCHIKEY_SKELETON_DIFFERS = "skeleton_differs"
+# Mã phân tử ChEMBL, vd. 'CHEMBL25'.
+CHEMBL_MOLECULE_ID_PATTERN = re.compile(r"^CHEMBL\d+$")
+# Ghi chú trong structure_reason khi chuẩn hóa thay đổi cấu trúc theo cách cần biết.
+REASON_FRAGMENTS_REMOVED = "salt_or_solvent_fragments_removed"
+REASON_ISOTOPES_REMOVED = "isotopes_removed"
+REASON_EXCLUDED = "chembl_exclude_flag_parent_not_stripped"
+REASON_MULTIPLE_FRAGMENTS = "parent_has_multiple_fragments"
 
 
 class ActivityResult(NamedTuple):
@@ -69,15 +97,39 @@ class ActivityResult(NamedTuple):
 
 
 class StructureResult(NamedTuple):
-    """Kết quả xử lý cấu trúc một phân tử bằng RDKit (xem describe_structure)."""
+    """Kết quả xử lý cấu trúc một phân tử (xem describe_structure).
+
+    canonical_smiles, inchikey, stereo_centers, unspecified_stereo_centers: của PARENT.
+    input_canonical_smiles, input_inchikey: của cấu trúc nguồn đọc thẳng, chưa chuẩn hóa.
+    cx_extension, stereo_groups: của chuỗi/cấu trúc nguồn (chuẩn hóa không giữ chúng).
+    parent_fragments: số mảnh rời của parent (> 1: hỗn hợp, hoặc nhóm bị loại trừ).
+    parent_excluded: cờ exclude của ChEMBL (kim loại, > 7 nguyên tử B): không bỏ muối.
+    """
     canonical_smiles: str | None
     inchikey: str | None
+    input_canonical_smiles: str | None
+    input_inchikey: str | None
     cx_extension: str | None
     stereo_groups: str | None
     stereo_centers: int | None
     unspecified_stereo_centers: int | None
+    parent_fragments: int | None
+    parent_excluded: bool | None
     status: str
     reason: str | None
+
+
+def check_structure_pipeline_version(expected: str) -> None:
+    """Dừng nếu bản ChEMBL Structure Pipeline đang cài khác bản ghi trong config.
+
+    Nhận: phiên bản kỳ vọng (config structure.chembl_structure_pipeline_version).
+    Vì sao cần: danh sách muối/dung môi và quy tắc chuẩn hóa nằm trong gói; khác phiên
+    bản thì parent có thể khác, nên dữ liệu không tái lập được nếu không khóa phiên bản.
+    """
+    installed = chembl_structure_pipeline.__version__
+    if installed != expected:
+        raise RuntimeError(f"chembl_structure_pipeline {installed} is installed but config "
+                           f"requires {expected}; install the pinned version first")
 
 
 def make_observation_id(source_database: str, native_measurement_id: str, endpoint: str) -> str:
@@ -322,29 +374,114 @@ def count_stereo_centers(molecule: Chem.Mol) -> tuple[int, int]:
     return len(centers), unspecified
 
 
+def chembl_molecule_id(text: str | None) -> str | None:
+    """Mã phân tử ChEMBL đã kiểm dạng ('CHEMBL25'), hoặc None.
+
+    Nhận: chuỗi nguồn (molecule_dictionary.chembl_id của ChEMBL, hoặc cột 'ChEMBL ID of
+    Ligand' của BindingDB). Trả về: chuỗi đã bỏ khoảng trắng hai đầu nếu đúng dạng
+    CHEMBL + số; mọi dạng khác (rỗng, nhiều mã, ký tự lạ) -> None, không đoán. Chuỗi
+    nguồn nguyên văn vẫn nằm ở cột molecule_source_chembl_id.
+    """
+    if text is None:
+        return None
+    stripped = text.strip()
+    return stripped if CHEMBL_MOLECULE_ID_PATTERN.match(stripped) else None
+
+
+def compare_source_inchikey(source_inchikey: str | None,
+                            input_inchikey: str | None) -> str | None:
+    """So InChIKey nguồn ghi sẵn với InChIKey RDKit tính trên chính cấu trúc nguồn.
+
+    Nhận: InChIKey của nguồn; InChIKey của cấu trúc nguồn đọc thẳng (chưa chuẩn hóa).
+    Trả về: 'match'; 'skeleton_match_other_layers_differ' (14 ký tự đầu giống, khác ở lớp
+    lập thể/đồng vị/proton, vd. BindingDB ghi InChIKey không có lập thể trong khi SMILES
+    có); 'skeleton_differs' (SMILES và InChIKey của nguồn mô tả hai khung khác nhau);
+    None khi thiếu một trong hai. Chỉ gắn cờ, không loại dòng nào.
+    """
+    if not source_inchikey or not input_inchikey:
+        return None
+    source = source_inchikey.strip()
+    if source == input_inchikey:
+        return INCHIKEY_MATCH
+    if source[:INCHIKEY_SKELETON_CHARS] == input_inchikey[:INCHIKEY_SKELETON_CHARS]:
+        return INCHIKEY_OTHER_LAYERS_DIFFER
+    return INCHIKEY_SKELETON_DIFFERS
+
+
+def chembl_parent(molecule: Chem.Mol) -> tuple[Chem.Mol, bool]:
+    """Parent theo ChEMBL Structure Pipeline: standardize_mol -> get_parent_mol.
+
+    Nhận: phân tử RDKit đọc từ SMILES nguồn (không bị sửa).
+    Trả về: (parent chưa sanitize, cờ exclude của ChEMBL).
+    Tương đương get_parent_mol(standardize_mol(m), neutralize=True, check_exclusion=True)
+    của gói. Riêng phân tử chỉ có MỘT mảnh, gói đọc lại file danh sách muối và dịch lại
+    163 mẫu SMARTS ở mỗi lần gọi dù kết quả luôn là "giữ nguyên mảnh, trung hòa điện
+    tích"; nhánh đó được viết lại đúng theo code của gói (standardizer.py,
+    get_fragment_parent_mol) để không tốn hàng giờ trên 3 triệu phân tử. Test
+    test_single_fragment_parent_equals_package so kết quả với gói trên nhiều phân tử.
+    """
+    standardized = chembl_standardizer.standardize_mol(Chem.Mol(molecule))
+    isotope_parent = chembl_standardizer.get_isotope_parent_mol(standardized)
+    pieces = Chem.GetMolFrags(isotope_parent, asMols=True, sanitizeFrags=False)
+    if len(pieces) == SINGLE_FRAGMENT:
+        # Gói: một mảnh thì kết quả là chính mảnh đó (khớp muối/dung môi thì "giữ tất
+        # cả"), cờ exclude tính trên mảnh đó, rồi trung hòa điện tích.
+        return (chembl_standardizer.uncharge_mol(pieces[0]),
+                exclude_flag(pieces[0], includeRDKitSanitization=False))
+    return chembl_standardizer.get_fragment_parent_mol(isotope_parent, check_exclusion=True,
+                                                       neutralize=True)
+
+
+def sanitized_copy(molecule: Chem.Mol) -> Chem.Mol:
+    """Bản sao đã sanitize (vòng, thơm, hóa trị) để tính SMILES/InChI.
+
+    Gói ChEMBL trả về mảnh chưa sanitize; sanitize không đổi cấu trúc, chỉ tính lại
+    thông tin RDKit cần. Lỗi (RDKIT_ERRORS) để hàm gọi ghi lý do.
+    """
+    copy = Chem.Mol(molecule)
+    Chem.SanitizeMol(copy)
+    return copy
+
+
+def identifiers(molecule: Chem.Mol) -> tuple[str, str]:
+    """(canonical SMILES có lập thể, InChIKey) của một phân tử đã sanitize.
+
+    Ném ValueError khi kết quả rỗng hoặc InChIKey sai dạng (hàm gọi chuyển thành status).
+    """
+    smiles = Chem.MolToSmiles(molecule, isomericSmiles=True)
+    if not smiles:
+        raise ValueError("empty canonical SMILES")
+    inchikey = Chem.MolToInchiKey(molecule)
+    if not inchikey or not INCHIKEY_PATTERN.match(inchikey):
+        raise ValueError(f"invalid InChIKey {inchikey!r}")
+    return smiles, inchikey
+
+
 def describe_structure(source_smiles: str | None) -> StructureResult:
-    """RDKit canonical isomeric SMILES, InChIKey and stereo metadata for a source (CX)SMILES.
+    """Parent ChEMBL, canonical SMILES, InChIKey và thông tin lập thể của một (CX)SMILES nguồn.
 
-    The source string itself is stored separately by the caller; canonical SMILES and
-    InChIKey drop enhanced-stereo markers, so rows with relative/racemic groups are flagged.
-
-    Nhận: chuỗi SMILES/CXSMILES nguồn.
-    Trả về: StructureResult gồm canonical SMILES, InChIKey, phần CX, nhóm lập thể, số tâm
-    lập thể, status và lý do.
-    Vì sao cần: hai nguồn viết SMILES theo kiểu khác nhau; canonical SMILES và InChIKey
-    do cùng một RDKit tính cho phép nhận ra cùng một phân tử ở hai nguồn.
+    Nhận: chuỗi SMILES/CXSMILES nguồn (cột nguồn được lưu nguyên văn ở chỗ khác).
+    Trả về: StructureResult; định danh chính là của parent, định danh của cấu trúc nguồn
+    đọc thẳng nằm ở input_*.
+    Vì sao cần: hai nguồn viết SMILES theo kiểu khác nhau, có dạng muối, dạng proton hóa;
+    parent do cùng một quy trình tính cho phép nhận ra cùng một chất ở mọi dạng.
 
     Cách quyết định status:
-    - Các bước BẮT BUỘC (đọc SMILES, canonical SMILES, InChIKey): RDKit ném lỗi ->
-      unresolved (không biết phân tử có hỏng không, chỉ biết công cụ không xử lý được);
-      RDKit trả kết quả rỗng/sai dạng -> invalid (chuỗi nguồn hỏng).
-    - Bước PHỤ (đếm tâm lập thể): lỗi ở đây KHÔNG làm hỏng định danh; status vẫn
-      resolved, chỉ ghi lý do stereo_annotation_failed.
+    - Các bước BẮT BUỘC (đọc SMILES; định danh của cấu trúc nguồn; parent; định danh của
+      parent): RDKit/gói ném lỗi -> unresolved (công cụ không xử lý được, không kết luận
+      phân tử hỏng); RDKit trả rỗng/sai dạng khi đọc -> invalid (chuỗi nguồn hỏng).
+      Không bao giờ dùng cấu trúc chưa chuẩn hóa thay cho parent.
+    - Bước PHỤ (đếm tâm lập thể): lỗi KHÔNG làm hỏng định danh; status vẫn resolved, chỉ
+      ghi lý do stereo_annotation_failed.
+    - Ghi chú (không đổi status): đã bỏ mảnh muối/dung môi, đã bỏ đồng vị, cờ exclude,
+      parent còn nhiều mảnh, nhóm lập thể tương đối/racemic.
     """
 
-    def failed(status: str, reason: str, extension: str | None = None) -> StructureResult:
-        # Kết quả thất bại: không có định danh phân tử, nhưng vẫn giữ phần CX nếu đã tách.
-        return StructureResult(None, None, extension, None, None, None, status, reason)
+    def failed(status: str, reason: str, extension: str | None = None,
+               input_ids: tuple[str | None, str | None] = (None, None)) -> StructureResult:
+        # Không có định danh parent; vẫn giữ phần CX và định danh nguồn nếu đã tính được.
+        return StructureResult(None, None, *input_ids, extension, None, None, None, None,
+                               None, status, reason)
 
     # --- Không có SMILES nguồn.
     if source_smiles is None or not source_smiles.strip():
@@ -358,38 +495,45 @@ def describe_structure(source_smiles: str | None) -> StructureResult:
         return failed(UNRESOLVED, f"rdkit_parse_error:{short_error(error)}", extension)
     if molecule is None:
         return failed(INVALID, "rdkit_parse_failed", extension)
-    # --- Bước bắt buộc 2: canonical SMILES có lập thể (isomeric).
+    # --- Bước bắt buộc 2: định danh của cấu trúc nguồn đọc thẳng (để đối chiếu với
+    # InChIKey nguồn và để biết chuẩn hóa đã đổi gì).
     try:
-        # Giữ ký hiệu lập thể trong SMILES.
-        canonical_smiles = Chem.MolToSmiles(molecule, isomericSmiles=True)
+        input_ids = identifiers(molecule)
     except RDKIT_ERRORS as error:
-        return failed(UNRESOLVED, f"canonical_smiles_failed:{short_error(error)}", extension)
-    if not canonical_smiles:
-        return failed(INVALID, "empty_canonical_smiles", extension)
-    # --- Bước bắt buộc 3: InChIKey, kiểm tra đúng dạng chuẩn.
+        return failed(UNRESOLVED, f"input_identifiers_failed:{short_error(error)}", extension)
+    # --- Bước bắt buộc 3: parent theo ChEMBL Structure Pipeline, rồi định danh của parent.
     try:
-        inchikey = Chem.MolToInchiKey(molecule)
+        parent, excluded = chembl_parent(molecule)
+        parent = sanitized_copy(parent)
+        canonical_smiles, inchikey = identifiers(parent)
     except RDKIT_ERRORS as error:
-        return failed(UNRESOLVED, f"inchikey_failed:{short_error(error)}", extension)
-    if not inchikey or not INCHIKEY_PATTERN.match(inchikey):
-        return failed(INVALID, "invalid_inchikey", extension)
+        return failed(UNRESOLVED, f"chembl_parent_failed:{short_error(error)}", extension,
+                      input_ids)
 
-    # Stereo metadata is optional: if RDKit cannot annotate it (e.g. CIP digraph too
-    # large), the identifiers above stay valid and the failure is recorded as the reason.
-    # --- Bước phụ: đếm tâm lập thể, bọc riêng. Chỉ bắt RuntimeError/ValueError (không
-    # bắt mọi exception), để lỗi lập trình khác vẫn làm chương trình dừng. Ở lần chạy
-    # 18/10/2026 có 31 dòng rơi vào nhánh này (phân tử SMILES 215-298 ký tự).
-    # Ghi chú phụ; dòng vẫn resolved.
     reasons = []
+    # --- Ghi chú về những gì chuẩn hóa đã làm (để audit đếm được, không đổi status).
+    input_fragments = len(Chem.GetMolFrags(molecule))
+    parent_fragments = len(Chem.GetMolFrags(parent))
+    if parent_fragments < input_fragments:
+        reasons.append(REASON_FRAGMENTS_REMOVED)
+    if any(atom.GetIsotope() for atom in molecule.GetAtoms()):
+        reasons.append(REASON_ISOTOPES_REMOVED)
+    if excluded:
+        reasons.append(REASON_EXCLUDED)
+    if parent_fragments > SINGLE_FRAGMENT:
+        reasons.append(f"{REASON_MULTIPLE_FRAGMENTS}:{parent_fragments}")
+    # --- Bước phụ: đếm tâm lập thể của parent, bọc riêng. Chỉ bắt RuntimeError/ValueError
+    # (không bắt mọi exception), để lỗi lập trình khác vẫn làm chương trình dừng. Ở lần
+    # chạy 18/10/2026 có 31 dòng rơi vào nhánh này (phân tử SMILES 215-298 ký tự).
     try:
-        stereo_centers, unspecified = count_stereo_centers(molecule)
+        stereo_centers, unspecified = count_stereo_centers(parent)
     except RDKIT_ERRORS as error:
         stereo_centers = unspecified = None
         reasons.append(f"stereo_annotation_failed:{short_error(error)}")
-    # --- Gắn cờ nếu có nhóm lập thể tương đối/racemic mà canonical ID không mã hóa được.
+    # --- Nhóm lập thể nâng cao đọc từ cấu trúc nguồn (chuẩn hóa không mang chúng theo).
     if has_relative_stereo(molecule):
         reasons.append("relative_or_racemic_stereo_groups_not_encoded_in_canonical_ids")
-    # --- Kết quả: luôn resolved ở đây; các ghi chú (nếu có) nối bằng ";".
-    return StructureResult(canonical_smiles, inchikey, extension,
+    return StructureResult(canonical_smiles, inchikey, *input_ids, extension,
                            describe_stereo_groups(molecule), stereo_centers, unspecified,
-                           RESOLVED, REASON_SEPARATOR.join(reasons) or None)
+                           parent_fragments, excluded, RESOLVED,
+                           REASON_SEPARATOR.join(reasons) or None)

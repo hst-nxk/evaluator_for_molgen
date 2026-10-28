@@ -26,7 +26,8 @@ Có bốn chế độ chạy qua `python run_observations.py --mode ...`:
   dữ liệu.
 - `smoke` chạy thử 5.000 dòng mỗi nguồn vào một thư mục mới
   `runs/observations/smoke_<thời điểm>/`.
-- `full` chạy toàn bộ vào `data/observations/`.
+- `full` chạy toàn bộ vào `paths.observations_dir`, hiện là `data/observations_v2/`
+  (bản v1 ở `data/observations/` giữ nguyên, chỉ đọc).
 - `verify` đối chiếu output của `full` ngược về raw.
 
 ---
@@ -322,11 +323,24 @@ hợp:
 pActivity = −log₁₀(nồng độ tính bằng mol/L). Ví dụ 300 nM = 3×10⁻⁷ M cho
 pActivity ≈ 6,52.
 
-### 5.4. Cấu trúc phân tử: canonical SMILES, InChIKey, CXSMILES
+### 5.4. Cấu trúc phân tử: parent, canonical SMILES, InChIKey, CXSMILES
+
+**Vì sao phải lấy parent.** Cùng một chất có thể được ghi ở nhiều dạng: dạng muối
+(`C[NH+](C)CCOC(=O)c1ccccc1.[Cl-]`), dạng bazơ tự do (`CN(C)CCOC(=O)c1ccccc1`), dạng
+proton hóa, hoặc có đánh dấu đồng vị. Nếu định danh lấy thẳng từ SMILES nguồn thì các
+dạng này thành các phân tử khác nhau: bước MMP không ghép được phân tử muối (SMILES có
+hơn một mảnh), và dạng proton hóa với dạng trung hòa tạo ra cặp "giả" chỉ khác nhau ở
+điện tích. Vì vậy định danh chính (`molecule_canonical_smiles`, `molecule_inchikey`) là
+của **parent** do ChEMBL Structure Pipeline tính. Nguồn: Bento et al. 2020, J.
+Cheminform. 12:51, DOI 10.1186/s13321-020-00456-1, "a GetParent component that removes
+any salts and solvents from the compound to create its parent". Phiên bản gói được ghim
+(`chembl_structure_pipeline==1.2.4`, `config.structure`); lúc chạy `extract` và `verify`,
+`check_structure_pipeline_version` dừng chương trình nếu phiên bản cài khác phiên bản
+trong config.
 
 `describe_structure` nhận chuỗi SMILES nguồn: `compound_structures.canonical_smiles` ở
 ChEMBL, `Ligand SMILES` ở BindingDB. Chuỗi nguồn luôn được giữ nguyên trong
-`molecule_source_smiles`. Các bước:
+`molecule_source_smiles`. Không bước nào xóa dòng. Các bước:
 
 1. Chuỗi trống → `unresolved`, `missing_source_smiles`.
 2. `cx_extension` cắt phần mở rộng CXSMILES, tức mọi thứ sau `" |"` như `|r|` hay
@@ -334,22 +348,61 @@ ChEMBL, `Ligand SMILES` ở BindingDB. Chuỗi nguồn luôn được giữ nguy
 3. `Chem.MolFromSmiles` đọc chuỗi. Nếu RDKit ném lỗi → `unresolved`,
    `rdkit_parse_error:<lỗi>`. Nếu trả về `None` (SMILES không hợp lệ) → `invalid`,
    `rdkit_parse_failed`.
-4. `Chem.MolToSmiles(..., isomericSmiles=True)` cho canonical SMILES có lập thể. Lỗi →
-   `unresolved`, `canonical_smiles_failed:<lỗi>`. Rỗng → `invalid`.
-5. `Chem.MolToInchiKey` cho InChIKey. Lỗi → `unresolved`, `inchikey_failed:<lỗi>`.
-   Không đúng dạng `XXXXXXXXXXXXXX-XXXXXXXXXX-X` → `invalid`, `invalid_inchikey`.
-6. Đếm tâm lập thể (`count_stereo_centers`, dùng `FindMolChiralCenters` với thuật toán
-   CIP mới), gồm tổng số tâm và số tâm chưa xác định. Bước này nằm trong
+4. Định danh của **cấu trúc nguồn đọc thẳng** (chưa chuẩn hóa): canonical SMILES có lập
+   thể và InChIKey, ghi vào `molecule_input_canonical_smiles` và
+   `molecule_input_inchikey`. Lỗi, kết quả rỗng hoặc InChIKey sai dạng
+   `XXXXXXXXXXXXXX-XXXXXXXXXX-X` → `unresolved`, `input_identifiers_failed:<lỗi>`.
+5. **Parent** (`chembl_parent`): `standardize_mol` (chuẩn hóa nhóm chức, trung hòa,
+   bỏ H tường minh), rồi bỏ đồng vị, rồi bỏ mảnh dung môi và muối theo danh sách của gói
+   và trung hòa điện tích (N bậc bốn giữ nguyên điện tích). Kết quả tương đương
+   `get_parent_mol(standardize_mol(m), neutralize=True, check_exclusion=True)`. Riêng phân
+   tử chỉ có một mảnh, code tự làm đúng các thao tác gói làm cho trường hợp đó (giữ mảnh,
+   tính cờ exclude, trung hòa), vì gói đọc lại file muối và dịch lại 163 mẫu SMARTS ở mỗi
+   lần gọi; test `test_single_fragment_parent_equals_package` so hai đường trên nhiều
+   phân tử. Parent được sanitize rồi tính canonical SMILES và InChIKey như bước 4. Lỗi
+   → `unresolved`, `chembl_parent_failed:<lỗi>`; khi đó định danh parent để trống nhưng
+   định danh của cấu trúc nguồn (bước 4) vẫn được giữ. Code không bao giờ dùng cấu trúc
+   chưa chuẩn hóa thay cho parent.
+6. Ghi chú về những gì bước 5 đã làm, nối vào `structure_reason`, không đổi status:
+   - `salt_or_solvent_fragments_removed`: parent ít mảnh hơn cấu trúc nguồn.
+   - `isotopes_removed`: cấu trúc nguồn có nguyên tử đánh dấu đồng vị.
+   - `chembl_exclude_flag_parent_not_stripped`: gói gắn cờ exclude (ví dụ có kim loại
+     ngoài danh sách cho phép, hoặc quá 7 nguyên tử B). Theo quy tắc của gói, phân tử
+     này không bị bỏ mảnh muối. Cột `molecule_parent_excluded` = true.
+   - `parent_has_multiple_fragments:N`: parent vẫn còn N > 1 mảnh (hỗn hợp, hoặc muối
+     không có trong danh sách). Cột `molecule_parent_fragments` ghi số mảnh. Bước MMP
+     chỉ ghép được phân tử một mảnh, nên các dòng này không vào được cặp nào.
+7. Đếm tâm lập thể **của parent** (`count_stereo_centers`, dùng `FindMolChiralCenters`
+   với thuật toán CIP mới), gồm tổng số tâm và số tâm chưa xác định. Bước này nằm trong
    `try/except (RuntimeError, ValueError)` riêng. Nếu RDKit thất bại, như lỗi "Digraph
    generation failed: more than 100000 nodes found" ở phân tử rất lớn, hai cột đếm để
-   trống, lý do ghi `stereo_annotation_failed:<lỗi>`, nhưng status vẫn `resolved`. Canonical
-   SMILES và InChIKey đã tính xong ở bước 4–5 vẫn hợp lệ; chỉ phần mô tả phụ bị thiếu.
-7. `describe_stereo_groups` ghi các nhóm lập thể nâng cao (enhanced stereo: ABSOLUTE,
-   OR, AND) mà RDKit đọc được vào `molecule_stereo_groups`. Nếu có nhóm OR hoặc AND,
-   tức lập thể tương đối hoặc racemic, lý do ghi thêm
+   trống, lý do ghi `stereo_annotation_failed:<lỗi>`, nhưng status vẫn `resolved`.
+8. `describe_stereo_groups` ghi các nhóm lập thể nâng cao (enhanced stereo: ABSOLUTE,
+   OR, AND) mà RDKit đọc được từ **cấu trúc nguồn** vào `molecule_stereo_groups`. Nếu có
+   nhóm OR hoặc AND, tức lập thể tương đối hoặc racemic, lý do ghi thêm
    `relative_or_racemic_stereo_groups_not_encoded_in_canonical_ids`. Canonical SMILES và
    InChIKey không mã hóa các nhóm này, nên người dùng cần biết hai định danh đó đang
    biểu diễn quá chắc chắn về lập thể. Nhiều lý do được nối bằng dấu `;`.
+
+**Đối chiếu InChIKey của nguồn.** `compare_source_inchikey` so InChIKey nguồn ghi sẵn
+(`molecule_source_inchikey`) với InChIKey RDKit tính trên cấu trúc nguồn đọc thẳng (bước
+4), và ghi vào `molecule_source_inchikey_check`: `match`;
+`skeleton_match_other_layers_differ` (14 ký tự đầu giống, khác ở lớp lập thể/đồng
+vị/proton; phần lớn dòng BindingDB rơi vào đây vì BindingDB ghi InChIKey không lập thể
+trong khi SMILES có lập thể); `skeleton_differs` (SMILES và InChIKey của chính nguồn mô
+tả hai khung khác nhau); null khi thiếu một trong hai. Cột này chỉ là cờ, không loại dòng
+nào. Lần kiểm độc lập ngày 28/10/2026 trên observation v1 đếm được 3.675 dòng BindingDB
+và 41 dòng ChEMBL có khung khác nhau.
+
+**Loại phân tử theo ChEMBL.** `molecule_chembl_id` là mã ChEMBL đã kiểm dạng
+(`CHEMBL` + số, `chembl_molecule_id`): ở ChEMBL lấy từ `molecule_dictionary.chembl_id`,
+ở BindingDB lấy từ cột `ChEMBL ID of Ligand`. Chuỗi nguồn nguyên văn nằm ở
+`molecule_source_chembl_id`; dạng khác (rỗng, nhiều mã) → null, không đoán.
+`molecule_chembl_type` là `molecule_dictionary.molecule_type` (ví dụ `Small molecule`,
+`Protein`): dòng ChEMBL lấy ngay trong câu truy vấn chính; dòng BindingDB tra ChEMBL 37
+theo mã trên (`chembl.MoleculeTypeLookup`, cache `chembl.molecule_type_cache_size`).
+Phân tử BindingDB không có mã ChEMBL thì cột này null. Bước này không lọc theo loại
+phân tử; việc giới hạn phạm vi small molecule thuộc Stage 2b.
 
 Với RDKit 2026.09.1 đang dùng, cờ `|r|` (mọi tâm đều là lập thể tương đối) **không**
 được chuyển thành stereo group. Các dòng có `|r|` vì thế giữ dấu này trong
@@ -359,6 +412,17 @@ tường minh như `|&1:1|` hay `|o1:1|`.
 
 Kết quả `describe_structure` được cache trong `pipeline.py` (`lru_cache`, 200.000 mục).
 Cùng một SMILES xuất hiện ở nhiều phép đo chỉ phải tính một lần.
+
+**Kiểm tra trong `verify` cho phần cấu trúc.** Ngoài đối chiếu từng trường với raw
+(mẫu ngẫu nhiên, gồm cả các cột mới ở trên, tính lại độc lập từ raw), `verify` ghi thêm:
+- `counts_by_source_structure_flag`: đếm theo nguồn kết quả so InChIKey nguồn, parent có
+  khác cấu trúc nguồn không, số mảnh của parent, cờ exclude, có mã ChEMBL không, và loại
+  phân tử.
+- `chembl_parent_agreement`: với các dòng ChEMBL trong mẫu, so InChIKey parent của
+  pipeline với InChIKey parent do chính ChEMBL lưu (activity → molregno →
+  `molecule_hierarchy.parent_molregno` → `compound_structures.standard_inchi_key`). ChEMBL
+  cũng dùng Structure Pipeline để tạo parent nhưng tính InChI bằng công cụ riêng, nên đây
+  là số đo để báo cáo, không phải điều kiện đạt/không đạt.
 
 ### 5.5. `observation_id`
 
@@ -403,7 +467,7 @@ từng mục đích.
 
 ## 6. Hai nguồn ra hai file riêng, không gộp
 
-`run_extract` ghi mỗi nguồn ra một file Parquet riêng trong `data/observations/`:
+`run_extract` ghi mỗi nguồn ra một file Parquet riêng trong `paths.observations_dir`:
 `chembl37_observations.parquet` và `bindingdb202610_observations.parquet`. Hai file
 không được gộp và không được khử trùng lặp với nhau, vì BindingDB chứa một lượng lớn dữ
 liệu nhập lại từ ChEMBL. Ở lần chạy này, 1.657.429 trên 3.246.509 observation BindingDB
@@ -412,7 +476,7 @@ cùng một phép đo hay không, phải so phân tử, protein, tài liệu, gi
 thuộc bước sau. Gộp sớm ở đây sẽ hoặc đếm trùng một phép đo hai lần, hoặc buộc phải ra
 quyết định khử trùng lặp khi chưa có đủ căn cứ.
 
-Hai file dùng **cùng một schema** (`OBSERVATION_SCHEMA` trong `pipeline.py`, 57 cột cùng
+Hai file dùng **cùng một schema** (`OBSERVATION_SCHEMA` trong `pipeline.py`, 66 cột cùng
 tên, cùng kiểu, cùng thứ tự). Cột nào một nguồn không có thì để trống (null). Nhờ vậy
 bước sau có thể đọc cả hai bằng cùng một code, hoặc nối chúng lại khi cần.
 
@@ -447,6 +511,8 @@ từng phép đo):
 | `molecule_source_smiles` | string | SMILES nguyên văn | `compound_structures.canonical_smiles` | `Ligand SMILES` (có thể là CXSMILES) |
 | `molecule_source_inchikey` | string | InChIKey do nguồn cung cấp | `compound_structures.standard_inchi_key` | `Ligand InChI Key` |
 | `molecule_source_chirality` | string | Cờ chirality của nguồn | `molecule_dictionary.chirality` | — |
+| `molecule_source_chembl_id` | string | Mã ChEMBL của phân tử, nguyên văn | `molecule_dictionary.chembl_id` | `ChEMBL ID of Ligand` |
+| `molecule_source_type` | string | Loại phân tử do nguồn ghi | `molecule_dictionary.molecule_type` | — |
 | `protein_sequence` | string | Chuỗi protein của chính phép đo | `variant_sequences.sequence`, hoặc `component_sequences.sequence` khi không có variant | `BindingDB Target Chain Sequence 1` (chỉ khi có 1 chain) |
 | `protein_sequence_origin` | string | Chuỗi lấy từ đâu | `chembl_variant_sequences` / `chembl_component_sequences` | `bindingdb_target_chain_1` |
 | `protein_accession` | string | Accession UniProt | `variant_sequences.accession` hoặc `component_sequences.accession` | SwissProt Primary ID chain 1, nếu không có thì TrEMBL Primary ID |
@@ -483,11 +549,16 @@ từng phép đo):
 |---|---|---|
 | `document_pmid` | string | PMID dạng số nguyên thuần, null nếu không phải số nguyên |
 | `protein_sequence_hash` | string | SHA-256 của chuỗi protein (bỏ khoảng trắng, viết hoa) |
-| `molecule_canonical_smiles` | string | Canonical isomeric SMILES của RDKit |
-| `molecule_inchikey` | string | InChIKey do RDKit tính |
+| `molecule_canonical_smiles` | string | Canonical isomeric SMILES của **parent** (mục 5.4) |
+| `molecule_inchikey` | string | InChIKey của **parent** do RDKit tính |
+| `molecule_input_canonical_smiles` | string | Canonical isomeric SMILES của cấu trúc nguồn đọc thẳng, chưa chuẩn hóa |
+| `molecule_input_inchikey` | string | InChIKey của cấu trúc nguồn đọc thẳng |
+| `molecule_source_inchikey_check` | string | So InChIKey nguồn với `molecule_input_inchikey`: `match` / `skeleton_match_other_layers_differ` / `skeleton_differs`; null nếu thiếu |
+| `molecule_parent_fragments` | int32 | Số mảnh của parent (1 là bình thường); null nếu không có parent |
+| `molecule_parent_excluded` | bool | Cờ exclude của ChEMBL Structure Pipeline; null nếu không có parent |
 | `molecule_cx_extension` | string | Phần mở rộng CXSMILES nguyên văn (ví dụ `\|r\|`). Với ChEMBL luôn null, vì nguồn không có CXSMILES |
 | `molecule_stereo_groups` | string | Nhóm lập thể nâng cao mà RDKit đọc được, dạng `TYPE:atom,atom;...` |
-| `molecule_stereo_centers` | int32 | Tổng số tâm lập thể; null nếu RDKit không gán được |
+| `molecule_stereo_centers` | int32 | Tổng số tâm lập thể của parent; null nếu RDKit không gán được |
 | `molecule_unspecified_stereo_centers` | int32 | Số tâm lập thể chưa xác định cấu hình; null nếu RDKit không gán được |
 | `structure_status` | string | resolved / unresolved / invalid (mục 5.4) |
 | `structure_reason` | string | Lý do; nhiều lý do nối bằng `;` |
@@ -497,10 +568,17 @@ từng phép đo):
 | `activity_censored` | bool | true nếu qualifier là dạng bị chặn; null nếu qualifier không xác định |
 | `activity_status` | string | resolved / unresolved / invalid (mục 5.2) |
 | `activity_reason` | string | Lý do của status |
+| `molecule_chembl_id` | string | Mã ChEMBL đã kiểm dạng; null nếu không có hoặc sai dạng |
+| `molecule_chembl_type` | string | `molecule_dictionary.molecule_type` của ChEMBL 37 cho mã trên; null nếu không tra được |
 
 ---
 
 ## 8. Kết quả lần chạy ngày 18–19/10/2026
+
+Số liệu mục này là của bản v1 (`data/observations/`), chạy TRƯỚC khi thêm bước lấy
+parent và các cột loại phân tử ở mục 5.4. Bản v2 (`data/observations_v2/`) cần chạy
+lại `full` và `verify`; số dòng phải giữ nguyên vì bước mới không bỏ dòng nào, còn
+các phân bố liên quan đến cấu trúc sẽ thay đổi.
 
 Lần chạy `full` bắt đầu lúc 22:00 ngày 18/10/2026. Nhánh ChEMBL xong lúc 23:04, nhánh
 BindingDB xong lúc 23:53. Sau đó `verify` chạy từ 23:57 đến 00:01 ngày 19/10/2026. Báo

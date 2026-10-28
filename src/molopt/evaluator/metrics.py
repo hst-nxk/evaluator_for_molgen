@@ -91,6 +91,56 @@ def regression_metrics(truth: np.ndarray, prediction: np.ndarray) -> dict[str, f
     }
 
 
+CHANGE_CLASSES = ("worse", "neutral", "better")
+
+
+def change_class(values: np.ndarray, threshold: float) -> np.ndarray:
+    """Ba lớp của Δp: 0 = kém hơn (< −threshold), 1 = ngang (|Δp| ≤ threshold),
+    2 = tốt hơn (> threshold)."""
+    return np.where(values > threshold, 2, np.where(values < -threshold, 0, 1)).astype(np.int8)
+
+
+def change_class_metrics(truth: np.ndarray, prediction: np.ndarray,
+                         threshold: float) -> dict[str, object]:
+    """Đánh giá mô hình như bài toán ba lớp kém hơn / ngang / tốt hơn.
+
+    Nhận: nhãn thật, dự đoán, ngưỡng coi là "ngang" (log). Trả về: accuracy, recall và F1
+    từng lớp, macro-F1, ma trận nhầm lẫn [thật][dự đoán] và số dòng mỗi lớp thật.
+    Vì sao cần: Δp lệch nhau ≤ 0,3 log nằm trong sai số thí nghiệm (Landrum & Riniker 2024,
+    J. Chem. Inf. Model. 64, 1560; Nelen et al. 2025, J. Cheminform. 17, 8), nên đoán sai
+    chiều trong vùng đó không có nghĩa; ba lớp tách rõ "kém hơn" khỏi "ngang" và "tốt hơn".
+    Lớp không có dòng nào (cả thật lẫn dự đoán) có F1 None và không vào macro-F1.
+    """
+    if truth.shape != prediction.shape:
+        raise ValueError(f"lệch độ dài: {truth.shape} và {prediction.shape}")
+    size = len(CHANGE_CLASSES)
+    result: dict[str, object] = {"n": int(truth.size), "threshold": float(threshold)}
+    if truth.size == 0:
+        result.update({"accuracy": UNDEFINED, "macro_f1": UNDEFINED})
+        return result
+    actual = change_class(truth, threshold)
+    guessed = change_class(prediction, threshold)
+    confusion = np.zeros((size, size), dtype=np.int64)
+    np.add.at(confusion, (actual, guessed), 1)
+    scores = []
+    for index, name in enumerate(CHANGE_CLASSES):
+        hit = int(confusion[index, index])
+        real, predicted = int(confusion[index].sum()), int(confusion[:, index].sum())
+        recall = hit / real if real else UNDEFINED
+        precision = hit / predicted if predicted else UNDEFINED
+        f1 = (2.0 * hit / (real + predicted)) if (real + predicted) else UNDEFINED
+        if f1 is not None:
+            scores.append(f1)
+        result[f"{name}_rows"] = real
+        result[f"{name}_recall"] = recall
+        result[f"{name}_precision"] = precision
+        result[f"{name}_f1"] = f1
+    result["accuracy"] = float(np.trace(confusion) / truth.size)
+    result["macro_f1"] = float(np.mean(scores)) if scores else UNDEFINED
+    result["confusion"] = confusion.tolist()
+    return result
+
+
 def expand_directions(reference: np.ndarray, candidate: np.ndarray, truth: np.ndarray,
                       prediction: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray,
                                                        np.ndarray]:
@@ -325,7 +375,8 @@ def format_asymmetry(label: str, scores: Mapping[str, float | None]) -> list[str
 
 
 def format_metrics(label: str, regression: Mapping[str, float | None],
-                   ranking: Mapping[str, object] | None = None) -> list[str]:
+                   ranking: Mapping[str, object] | None = None,
+                   classes: Mapping[str, object] | None = None) -> list[str]:
     """Các dòng văn bản gọn để ghi log; None in thành '-' chứ không in thành 0."""
 
     def show(value: object, digits: int = 4) -> str:
@@ -352,4 +403,10 @@ def format_metrics(label: str, regression: Mapping[str, float | None],
                                 if name.startswith('top_') and name.count('_') == 1)]
         if tops:
             lines.append("    " + " | ".join(tops))
+    if classes is not None:
+        lines.append(f"    ba lớp (±{show(classes.get('threshold'), 2)}):"
+                     f" accuracy {show(classes.get('accuracy'))}"
+                     f" | macro-F1 {show(classes.get('macro_f1'))} | "
+                     + " | ".join(f"{name} F1 {show(classes.get(f'{name}_f1'))}"
+                                  for name in CHANGE_CLASSES))
     return lines

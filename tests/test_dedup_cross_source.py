@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import dedup_cross_source as dedup  # noqa: E402  (scripts/ không phải package)
 
 EXACT_TOLERANCE = 1e-9
-CLOSE_TOLERANCE = 0.05
+EQUAL_TOLERANCE = 0.01
 
 
 @pytest.fixture()
@@ -66,25 +66,28 @@ def test_value_key_is_rounded_p_activity() -> None:
 
 @pytest.mark.parametrize(("chembl", "bindingdb", "expected"), [
     (("=", 1e-8), ("=", 1.0e-8), dedup.EXACT),
-    (("=", 1e-8), ("=", 1.1e-8), dedup.CLOSE),
+    # 10 nM và 10,2 nM: |Δp| = 0,0086 ≤ 0,01 -> cùng giá trị ở độ phân giải pChEMBL.
+    (("=", 1e-8), ("=", 1.02e-8), dedup.EXACT),
+    # 10 nM và 11 nM: |Δp| = 0,041 > 0,01 -> khác giá trị.
+    (("=", 1e-8), ("=", 1.1e-8), dedup.DIFFERS),
     (("=", 1e-8), ("=", 1e-6), dedup.DIFFERS),
     (("=", 1e-8), (">", 1e-8), dedup.QUALIFIER_DIFFERS),
     (("=", None), ("=", 1e-8), dedup.MISSING),
 ])
 def test_compare_values(chembl: tuple, bindingdb: tuple, expected: str) -> None:
-    label, _ = dedup.compare_values(*chembl, *bindingdb, EXACT_TOLERANCE, CLOSE_TOLERANCE)
+    label, _ = dedup.compare_values(*chembl, *bindingdb, EXACT_TOLERANCE, EQUAL_TOLERANCE)
     assert label == expected
 
 
 def test_compare_values_reports_p_difference() -> None:
     _, difference = dedup.compare_values("=", 1e-8, "=", 1e-6, EXACT_TOLERANCE,
-                                         CLOSE_TOLERANCE)
+                                         EQUAL_TOLERANCE)
     assert difference == pytest.approx(2.0)
 
 
 def test_compare_values_rejects_non_positive_concentration() -> None:
     with pytest.raises(ValueError, match="không dương"):
-        dedup.compare_values("=", 0.0, "=", 1e-8, EXACT_TOLERANCE, CLOSE_TOLERANCE)
+        dedup.compare_values("=", 0.0, "=", 1e-8, EXACT_TOLERANCE, EQUAL_TOLERANCE)
 
 
 @pytest.mark.parametrize(("arguments", "expected"), [
@@ -102,8 +105,8 @@ def test_compare_proteins(arguments: tuple, expected: str) -> None:
      (dedup.LEVEL_CURATION, dedup.DUPLICATE, dedup.REASON_CURATION)),
     ((False, dedup.ACCESSION, dedup.EXACT),
      (dedup.LEVEL_PUBLICATION, dedup.DUPLICATE, dedup.REASON_PUBLICATION)),
-    ((True, dedup.SEQUENCE, dedup.CLOSE),
-     (dedup.LEVEL_PARTIAL, dedup.UNCERTAIN, "value_close")),
+    ((True, dedup.SEQUENCE, dedup.DIFFERS),
+     (dedup.LEVEL_PARTIAL, dedup.UNCERTAIN, "value_differs")),
     ((True, dedup.MISSING, dedup.EXACT),
      (dedup.LEVEL_PARTIAL, dedup.UNCERTAIN, "protein_missing")),
 ])

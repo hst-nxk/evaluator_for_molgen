@@ -21,9 +21,11 @@ Cặp MMP (single cut, như mmpdb):
       maxCutBonds;
     - A và B là một cặp khi có cùng constant (SMILES chính tắc, gồm vị trí nối) và khác
       variable;
-    - constant ≥ min_core_fraction số nguyên tử nặng của phân tử: vì constant giống hệt ở
-      A và B, điều kiện "≥ 60 % của cả A và B" kiểm tra được trên từng phân tử khi cắt;
-    - variable ≤ max_variable_heavy_atoms nguyên tử nặng;
+    - giới hạn kích thước theo Hu et al. 2012 (MMP-Cliffs, J. Chem. Inf. Model. 52, 1138;
+      DOI 10.1021/ci3001138): variable ≤ max_variable_heavy_atoms (13) nguyên tử nặng;
+      constant ≥ min_core_to_variable_ratio (2) lần variable, kiểm tra trên từng phân tử vì
+      constant giống hệt ở A và B; hai variable của một cặp chênh nhau ≤
+      max_variable_size_difference (8) nguyên tử nặng, kiểm tra khi ghép cặp;
     - mỗi mảnh đúng một điểm nối, và nguyên tử nối (dummy) có bậc 1.
     Khi một cặp (A, B) có nhiều cách cắt hợp lệ (vd. cắt ở hai liên kết liền nhau trên
     cùng nhánh thay đổi), giữ cách cắt có phần biến đổi nhỏ nhất (quy ước "biến đổi tối
@@ -57,8 +59,9 @@ class FragmentSettings:
     max_cuts: int
     max_cut_bonds: int
     cut_smarts: str
-    min_core_fraction: float
+    min_core_to_variable_ratio: float
     max_variable_heavy_atoms: int
+    max_variable_size_difference: int
     attachment_points: int
     attachment_degree: int
 
@@ -171,13 +174,12 @@ def fragment_molecule(smiles: str, settings: FragmentSettings) -> FragmentResult
     Nhận: SMILES chính tắc (Stage 1); tham số.
     Trả về: FragmentResult. SMILES không đọc được -> failed = True, không có cách chia nào.
     Mỗi lần cắt cho hai cách chia (mảnh nào là constant). Giữ cách chia khi variable
-    ≤ max_variable_heavy_atoms và constant ≥ min_core_fraction × tổng số nguyên tử nặng.
+    ≤ max_variable_heavy_atoms và constant ≥ min_core_to_variable_ratio × variable.
     Cách chia trùng nhau (do đối xứng, hai liên kết tương đương) chỉ giữ một.
     """
     molecule = Chem.MolFromSmiles(smiles)
     if molecule is None:
         return FragmentResult((), 0, True)
-    total = molecule.GetNumHeavyAtoms()
     results = rdMMPA.FragmentMol(molecule, minCuts=settings.min_cuts,
                                  maxCuts=settings.max_cuts,
                                  maxCutBonds=settings.max_cut_bonds,
@@ -194,7 +196,8 @@ def fragment_molecule(smiles: str, settings: FragmentSettings) -> FragmentResult
         for (constant, constant_heavy), (variable, variable_heavy) in (
                 (pieces[0], pieces[1]), (pieces[1], pieces[0])):
             if (variable_heavy <= settings.max_variable_heavy_atoms
-                    and constant_heavy >= settings.min_core_fraction * total):
+                    and constant_heavy
+                    >= settings.min_core_to_variable_ratio * variable_heavy):
                 cuts.add(Cut(constant, variable, variable_heavy))
     return FragmentResult(tuple(sorted(cuts, key=lambda cut: (cut.constant, cut.variable))),
                           violations, False)
@@ -211,11 +214,14 @@ def cut_score(first: Cut, second: Cut) -> tuple[int, int, str, str, str]:
 
 
 def find_pairs(molecules: Sequence[GroupMolecule],
-               fragments: Callable[[str], FragmentResult]
-               ) -> tuple[list[Pair], set[tuple[int, int]]]:
+               fragments: Callable[[str], FragmentResult],
+               max_size_difference: int) -> tuple[list[Pair], set[tuple[int, int]]]:
     """Mọi cặp MMP trong một nhóm (assay, protein, endpoint).
 
-    Nhận: các phân tử của nhóm (mỗi khóa định danh một dòng); hàm cắt (có cache).
+    Nhận: các phân tử của nhóm (mỗi khóa định danh một dòng); hàm cắt (có cache); chênh
+    lệch tối đa số nguyên tử nặng giữa hai variable của một cặp (Hu et al. 2012). Cách cắt
+    vượt mức chênh lệch bị bỏ trước khi chọn cách cắt tốt nhất, nên cặp vẫn được giữ nếu
+    còn cách cắt khác hợp lệ.
     Trả về: (danh sách cặp, tập (row_x, row_y) bị loại vì một bên có cờ |r| còn bên kia
     không). Mỗi cặp không thứ tự xuất hiện một lần, với row_x < row_y.
     Hai phân tử khác khóa nhưng cùng cấu trúc (dạng |r| và dạng tuyệt đối) cho cùng mọi
@@ -236,6 +242,8 @@ def find_pairs(molecules: Sequence[GroupMolecule],
             for (row_j, variable_j), cut_j in items[index + 1:]:
                 if row_i == row_j or variable_i == variable_j:
                     continue
+                if abs(cut_i.variable_heavy - cut_j.variable_heavy) > max_size_difference:
+                    continue
                 key = (min(row_i, row_j), max(row_i, row_j))
                 if relative[row_i] != relative[row_j]:
                     lost.add(key)
@@ -250,9 +258,10 @@ def find_pairs(molecules: Sequence[GroupMolecule],
 
 # --------------------------------------------------------------------------- tiến trình con
 
-# Hàm cắt có cache của tiến trình hiện tại; đặt bởi init_worker (kể cả khi chạy một tiến
-# trình), vì kích thước cache đọc từ config lúc chạy.
+# Hàm cắt có cache và mức chênh lệch kích thước của tiến trình hiện tại; đặt bởi
+# init_worker (kể cả khi chạy một tiến trình), vì cả hai đọc từ config lúc chạy.
 _FRAGMENTS: Callable[[str], FragmentResult] | None = None
+_MAX_SIZE_DIFFERENCE: int | None = None
 
 
 @dataclass
@@ -266,10 +275,11 @@ class TaskResult:
 
 
 def init_worker(settings: FragmentSettings, cache_size: int) -> None:
-    """Đặt hàm cắt có cache LRU cho tiến trình hiện tại."""
-    global _FRAGMENTS
+    """Đặt hàm cắt có cache LRU và mức chênh lệch kích thước cho tiến trình hiện tại."""
+    global _FRAGMENTS, _MAX_SIZE_DIFFERENCE
     _FRAGMENTS = functools.lru_cache(maxsize=cache_size)(
         functools.partial(fragment_molecule, settings=settings))
+    _MAX_SIZE_DIFFERENCE = settings.max_variable_size_difference
 
 
 def process_task(task: Iterable[tuple[int, Sequence[GroupMolecule]]]) -> TaskResult:
@@ -279,7 +289,7 @@ def process_task(task: Iterable[tuple[int, Sequence[GroupMolecule]]]) -> TaskRes
     Đếm vi phạm điểm nối và SMILES lỗi theo số lần cắt thực sự (lần gặp đầu của mỗi SMILES
     trong tiến trình), nên con số là cận dưới khi cache bị đẩy ra rồi cắt lại.
     """
-    if _FRAGMENTS is None:
+    if _FRAGMENTS is None or _MAX_SIZE_DIFFERENCE is None:
         raise RuntimeError("init_worker chưa được gọi trong tiến trình này")
     pairs: list[tuple[int, Pair]] = []
     lost: list[tuple[int, int, int]] = []
@@ -292,7 +302,7 @@ def process_task(task: Iterable[tuple[int, Sequence[GroupMolecule]]]) -> TaskRes
                 result = _FRAGMENTS(molecule.smiles)
                 violations += result.attachment_violations
                 failed += int(result.failed)
-        found, dropped = find_pairs(members, _FRAGMENTS)
+        found, dropped = find_pairs(members, _FRAGMENTS, _MAX_SIZE_DIFFERENCE)
         pairs.extend((group, pair) for pair in found)
         lost.extend((group, row_x, row_y) for row_x, row_y in sorted(dropped))
         molecules += len(members)

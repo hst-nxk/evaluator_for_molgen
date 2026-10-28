@@ -12,7 +12,6 @@ Vị trí trong luồng raw -> observations: đây là phần điều phối.
 from __future__ import annotations
 
 # Thư viện chuẩn, cộng pyarrow để dựng bảng và đọc/ghi Parquet.
-import json
 import logging
 import math
 import random
@@ -52,7 +51,7 @@ PMID_PATTERN = re.compile(r"^\d+$")
 EMBEDDED_QUALIFIER_SOURCES = frozenset({bindingdb.SOURCE_DATABASE})
 
 # Columns supplied by the readers (raw values, resolved per measurement).
-# 40 cột mà mọi reader phải trả về: đúng tên, không thừa, không thiếu.
+# 42 cột mà mọi reader phải trả về: đúng tên, không thừa, không thiếu.
 SOURCE_FIELDS: list[tuple[str, pa.DataType]] = [
     # Nguồn và ID phép đo.
     ("source_database", pa.string()),
@@ -69,6 +68,8 @@ SOURCE_FIELDS: list[tuple[str, pa.DataType]] = [
     ("molecule_source_smiles", pa.string()),
     ("molecule_source_inchikey", pa.string()),
     ("molecule_source_chirality", pa.string()),
+    ("molecule_source_chembl_id", pa.string()),
+    ("molecule_source_type", pa.string()),
     # Protein của đúng phép đo này.
     ("protein_sequence", pa.string()),
     ("protein_sequence_origin", pa.string()),
@@ -103,21 +104,30 @@ SOURCE_FIELDS: list[tuple[str, pa.DataType]] = [
 ]
 
 # Columns computed here from the source columns (never written back over them).
-# 17 cột pipeline tự tính bằng normalize.py.
+# 24 cột pipeline tự tính bằng normalize.py.
 DERIVED_FIELDS: list[tuple[str, pa.DataType]] = [
     # ID, PMID đã chuẩn hóa, hash chuỗi protein.
     ("observation_id", pa.string()),
     ("document_pmid", pa.string()),
     ("protein_sequence_hash", pa.string()),
-    # Cấu trúc phân tử (RDKit).
+    # Cấu trúc phân tử: định danh của PARENT (ChEMBL Structure Pipeline), dùng ở mọi
+    # bước sau; định danh của cấu trúc nguồn đọc thẳng để đối chiếu.
     ("molecule_canonical_smiles", pa.string()),
     ("molecule_inchikey", pa.string()),
+    ("molecule_input_canonical_smiles", pa.string()),
+    ("molecule_input_inchikey", pa.string()),
+    ("molecule_source_inchikey_check", pa.string()),
+    ("molecule_parent_fragments", pa.int32()),
+    ("molecule_parent_excluded", pa.bool_()),
     ("molecule_cx_extension", pa.string()),
     ("molecule_stereo_groups", pa.string()),
     ("molecule_stereo_centers", pa.int32()),
     ("molecule_unspecified_stereo_centers", pa.int32()),
     ("structure_status", pa.string()),
     ("structure_reason", pa.string()),
+    # Mã ChEMBL đã kiểm dạng và loại phân tử do ChEMBL gán (BindingDB: tra theo mã).
+    ("molecule_chembl_id", pa.string()),
+    ("molecule_chembl_type", pa.string()),
     # Giá trị đo đã quy đổi.
     ("activity_qualifier", pa.string()),
     ("activity_concentration_molar", pa.float64()),
@@ -130,8 +140,10 @@ DERIVED_FIELDS: list[tuple[str, pa.DataType]] = [
 # Schema chung của cả hai file output: observation_id đứng đầu, rồi các cột nguồn, rồi
 # các cột suy ra còn lại. Hai nguồn dùng đúng schema này (cột nguồn không có -> null).
 OBSERVATION_SCHEMA = pa.schema(DERIVED_FIELDS[:1] + SOURCE_FIELDS + DERIVED_FIELDS[1:])
-# Tên 40 cột nguồn, dùng để kiểm tra bản ghi. 40 + 17 = 57 cột.
+# Tên 42 cột nguồn, dùng để kiểm tra bản ghi. 42 + 24 = 66 cột.
 SOURCE_COLUMN_NAMES = frozenset(name for name, _ in SOURCE_FIELDS)
+# Hàm tra loại phân tử theo mã ChEMBL (chembl.MoleculeTypeLookup); None = không tra.
+MoleculeTypes = Callable[[str], "str | None"]
 
 # RDKit là bước chậm nhất; cache theo chuỗi SMILES để mỗi phân tử chỉ tính một lần.
 # Cùng một chuỗi SMILES chỉ chạy RDKit một lần.
@@ -173,11 +185,29 @@ def derive_activity(
                                     exact, censored)
 
 
-def build_observation(record: Mapping[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
+def derive_molecule_type(record: Mapping[str, Any], chembl_id: str | None,
+                         molecule_types: MoleculeTypes | None) -> str | None:
+    """Loại phân tử do ChEMBL gán cho phân tử của bản ghi.
+
+    Nhận: bản ghi nguồn, mã ChEMBL đã kiểm dạng, hàm tra theo mã (None = không tra).
+    Trả về: dòng ChEMBL -> molecule_type của chính dòng đó (cùng câu join lúc đọc raw);
+    dòng BindingDB -> tra ChEMBL theo mã BindingDB ghi; không có mã, mã không có trong
+    ChEMBL, hoặc không có hàm tra -> None. Không đoán theo cấu trúc ở bước này.
+    """
+    if record["source_database"] == chembl.SOURCE_DATABASE:
+        return record["molecule_source_type"]
+    if chembl_id is None or molecule_types is None:
+        return None
+    return molecule_types(chembl_id)
+
+
+def build_observation(record: Mapping[str, Any], config: Mapping[str, Any],
+                      molecule_types: MoleculeTypes | None = None) -> dict[str, Any]:
     """Full observation row: source columns unchanged plus derived columns.
 
-    Nhận: một bản ghi từ chembl/bindingdb (đúng tập cột nguồn) và config.
-    Trả về: dict một dòng observation đủ 57 cột của OBSERVATION_SCHEMA.
+    Nhận: một bản ghi từ chembl/bindingdb (đúng tập cột nguồn), config, và hàm tra loại
+    phân tử theo mã ChEMBL (bắt buộc khi chạy BindingDB thật, xem run_extract).
+    Trả về: dict một dòng observation đủ 66 cột của OBSERVATION_SCHEMA.
     Vì sao cần: đây là chỗ duy nhất tạo cột suy ra, áp dụng giống nhau cho hai nguồn. Cột
     nguồn được giữ nguyên (**record), cột suy ra nằm cạnh, không ghi đè lên cột nguồn.
     """
@@ -198,6 +228,8 @@ def build_observation(record: Mapping[str, Any], config: Mapping[str, Any]) -> d
     # --- Cấu trúc phân tử (RDKit, có cache): canonical SMILES, InChIKey, structure_status.
     # Canonical SMILES, InChIKey, lập thể, status.
     structure = describe_structure_cached(record["molecule_source_smiles"])
+    # --- Mã ChEMBL đã kiểm dạng và loại phân tử ChEMBL.
+    chembl_id = normalize.chembl_molecule_id(record["molecule_source_chembl_id"])
     # --- Ghép cột nguồn + cột suy ra.
     # Cột nguồn giữ nguyên; cột suy ra thêm bên cạnh.
     return {
@@ -210,15 +242,23 @@ def build_observation(record: Mapping[str, Any], config: Mapping[str, Any]) -> d
         "document_pmid": normalize.normalize_integer_id(record["document_pmid_source"]),
         # SHA-256 của chuỗi protein.
         "protein_sequence_hash": normalize.sequence_hash(record["protein_sequence"]),
-        # Lấy từ kết quả RDKit.
+        # Lấy từ kết quả chuẩn hóa cấu trúc (parent) và từ cấu trúc nguồn đọc thẳng.
         "molecule_canonical_smiles": structure.canonical_smiles,
         "molecule_inchikey": structure.inchikey,
+        "molecule_input_canonical_smiles": structure.input_canonical_smiles,
+        "molecule_input_inchikey": structure.input_inchikey,
+        "molecule_source_inchikey_check": normalize.compare_source_inchikey(
+            record["molecule_source_inchikey"], structure.input_inchikey),
+        "molecule_parent_fragments": structure.parent_fragments,
+        "molecule_parent_excluded": structure.parent_excluded,
         "molecule_cx_extension": structure.cx_extension,
         "molecule_stereo_groups": structure.stereo_groups,
         "molecule_stereo_centers": structure.stereo_centers,
         "molecule_unspecified_stereo_centers": structure.unspecified_stereo_centers,
         "structure_status": structure.status,
         "structure_reason": structure.reason,
+        "molecule_chembl_id": chembl_id,
+        "molecule_chembl_type": derive_molecule_type(record, chembl_id, molecule_types),
         # Lấy từ kết quả derive_activity.
         "activity_qualifier": activity.qualifier,
         "activity_concentration_molar": activity.concentration_molar,
@@ -233,13 +273,15 @@ def build_observation(record: Mapping[str, Any], config: Mapping[str, Any]) -> d
 
 
 def write_observations(
-    records: Iterable[dict], output_path: Path, config: Mapping[str, Any], label: str
+    records: Iterable[dict], output_path: Path, config: Mapping[str, Any], label: str,
+    molecule_types: MoleculeTypes | None = None,
 ) -> int:
     """Build and write observations in fixed-size Parquet chunks; return the row count.
 
     Rows go to '<name>.partial' first and are renamed only after a complete run.
 
-    Nhận: iterator bản ghi của một nguồn, đường dẫn file output, config, nhãn để ghi log.
+    Nhận: iterator bản ghi của một nguồn, đường dẫn file output, config, nhãn để ghi log,
+    hàm tra loại phân tử theo mã ChEMBL (xem build_observation).
     Trả về: số dòng đã ghi.
     Vì sao cần:
     - Ghi theo khối (chunk_rows = 100.000 dòng) để bộ nhớ chỉ giữ một khối tại một thời
@@ -260,8 +302,8 @@ def write_observations(
     try:
         # --- Dựng từng dòng observation, gom thành khối, ghi khối khi đủ kích thước.
         for record in records:
-            # Bản ghi -> một dòng observation đủ 57 cột.
-            buffer.append(build_observation(record, config))
+            # Bản ghi -> một dòng observation đủ 66 cột.
+            buffer.append(build_observation(record, config, molecule_types))
             # Đủ một khối: ghi xuống file rồi làm rỗng buffer.
             if len(buffer) >= chunk_rows:
                 writer.write_table(pa.Table.from_pylist(buffer, schema=OBSERVATION_SCHEMA))
@@ -318,23 +360,32 @@ def run_extract(config: Mapping[str, Any], root: Path, output_dir: Path,
     Vì sao có cơ chế bỏ qua: nếu nguồn thứ hai lỗi, lần chạy lại không phải làm lại nguồn
     thứ nhất (mất khoảng 1 giờ). Chỉ bỏ qua ở mức cả file, không nối tiếp giữa chừng,
     để không bao giờ trộn output của hai phiên bản code trong cùng một file.
+    Phiên bản ChEMBL Structure Pipeline được kiểm trước khi đọc dòng nào.
     """
+    normalize.check_structure_pipeline_version(
+        config["structure"]["chembl_structure_pipeline_version"])
+    # Tra loại phân tử ChEMBL cho dòng BindingDB; kết nối chỉ mở khi có mã cần tra.
+    molecule_types = chembl.MoleculeTypeLookup(root / config["paths"]["chembl_db"],
+                                               config["chembl"]["molecule_type_cache_size"])
     counts = {}
-    # Mỗi nguồn: (tên, hàm đọc nguồn, tên file output).
-    for label, iter_records, file_name in source_outputs(config):
-        output_path = output_dir / file_name
-        # --- File hoàn chỉnh đã có và không --force: bỏ qua, chỉ đọc số dòng để báo cáo.
-        # Chỉ xét file tên chính thức; sửa code thì chạy lại với --force.
-        if output_path.is_file() and not force:
-            counts[label] = pq.ParquetFile(output_path).metadata.num_rows
-            LOGGER.info("[%s] skipped: %s already exists (%s rows); use --force to rebuild",
-                        label, output_path, f"{counts[label]:,}")
-            continue
-        # --- Chạy nguồn: đọc raw -> dựng observation -> ghi Parquet.
-        LOGGER.info("[%s] stage: extract (limit=%s)", label, limit)
-        # Generator: raw được đọc dần khi write_observations lặp qua.
-        counts[label] = write_observations(iter_records(config, root, limit),
-                                           output_path, config, label)
+    try:
+        # Mỗi nguồn: (tên, hàm đọc nguồn, tên file output).
+        for label, iter_records, file_name in source_outputs(config):
+            output_path = output_dir / file_name
+            # --- File hoàn chỉnh đã có và không --force: bỏ qua, chỉ đọc số dòng.
+            # Chỉ xét file tên chính thức; sửa code thì chạy lại với --force.
+            if output_path.is_file() and not force:
+                counts[label] = pq.ParquetFile(output_path).metadata.num_rows
+                LOGGER.info("[%s] skipped: %s already exists (%s rows); use --force to "
+                            "rebuild", label, output_path, f"{counts[label]:,}")
+                continue
+            # --- Chạy nguồn: đọc raw -> dựng observation -> ghi Parquet.
+            LOGGER.info("[%s] stage: extract (limit=%s)", label, limit)
+            # Generator: raw được đọc dần khi write_observations lặp qua.
+            counts[label] = write_observations(iter_records(config, root, limit),
+                                               output_path, config, label, molecule_types)
+    finally:
+        molecule_types.close()
     return counts
 
 
@@ -354,11 +405,11 @@ def run_smoke(config: Mapping[str, Any], root: Path) -> dict[str, int]:
 
 
 def run_full(config: Mapping[str, Any], root: Path, force: bool) -> dict[str, int]:
-    """All relevant observations into data/observations/ (Parquet only).
+    """All relevant observations into paths.observations_dir (Parquet only).
 
     Nhận: config, thư mục gốc, cờ force. Trả về: {tên nguồn: số dòng}.
     """
-    # Toàn bộ dữ liệu, ghi vào data/observations/.
+    # Toàn bộ dữ liệu, ghi vào paths.observations_dir (hiện là data/observations_v2/).
     return run_extract(config, root, root / config["paths"]["observations_dir"], None, force)
 
 
@@ -373,6 +424,24 @@ def iter_output_rows(path: Path, batch_rows: int) -> Iterator[dict[str, Any]]:
     # Đọc theo lô để không giữ cả file trong RAM.
     for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_rows):
         yield from batch.to_pylist()
+
+
+def structure_flags(row: Mapping[str, Any]) -> list[str]:
+    """Nhãn đếm cho một dòng: kết quả so InChIKey nguồn, parent có khác cấu trúc nguồn
+    không, số mảnh của parent (1 / >1), cờ exclude, có mã ChEMBL không, loại phân tử."""
+    resolved = row["structure_status"] == normalize.RESOLVED
+    fragments = row["molecule_parent_fragments"]
+    return [
+        f"source_inchikey_check|{row['molecule_source_inchikey_check']}",
+        "parent_changed|" + (str(row["molecule_canonical_smiles"]
+                                 != row["molecule_input_canonical_smiles"])
+                             if resolved else "no_structure"),
+        "parent_fragments|" + ("none" if fragments is None
+                               else "1" if fragments == normalize.SINGLE_FRAGMENT else ">1"),
+        f"parent_excluded|{row['molecule_parent_excluded']}",
+        f"chembl_id_present|{row['molecule_chembl_id'] is not None}",
+        f"chembl_type|{row['molecule_chembl_type']}",
+    ]
 
 
 def scan_outputs(paths: list[Path], config: Mapping[str, Any]) -> dict[str, Any]:
@@ -399,7 +468,7 @@ def scan_outputs(paths: list[Path], config: Mapping[str, Any]) -> dict[str, Any]
     scan: dict[str, Any] = {
         "rows_by_source": Counter(), "rows_by_source_endpoint": Counter(),
         "status_reasons": Counter(), "duplicate_ids": 0, "bad_pmids": [],
-        "sample": [], "accession_rows": [], "monomer_rows": [],
+        "sample": [], "accession_rows": [], "monomer_rows": [], "structure_flags": Counter(),
     }
     # Số thứ tự dòng, tính liền qua cả hai file.
     position = 0
@@ -415,6 +484,9 @@ def scan_outputs(paths: list[Path], config: Mapping[str, Any]) -> dict[str, Any]
                 reason_column = column.replace("_status", "_reason")
                 scan["status_reasons"][
                     f"{source}|{column}|{row[column]}|{row[reason_column]}"] += 1
+            # --- Đếm các cờ cấu trúc và loại phân tử (để báo cáo, không có ngưỡng).
+            for flag in structure_flags(row):
+                scan["structure_flags"][f"{source}|{flag}"] += 1
             # --- observation_id phải duy nhất trên cả hai file.
             if row["observation_id"] in seen_ids:
                 scan["duplicate_ids"] += 1
@@ -430,7 +502,8 @@ def scan_outputs(paths: list[Path], config: Mapping[str, Any]) -> dict[str, Any]
             if row["protein_accession"] == regression["accession_construct_check"]:
                 scan["accession_rows"].append(row)
             if (source == bindingdb.SOURCE_DATABASE
-                    and row["molecule_source_id"] == regression["bindingdb_monomer_enhanced_stereo"]):
+                    and row["molecule_source_id"]
+                    == regression["bindingdb_monomer_enhanced_stereo"]):
                 scan["monomer_rows"].append(row)
             position += 1
     return scan
@@ -538,6 +611,9 @@ def expected_bindingdb(observation: Mapping[str, Any], raw: Mapping[str, Any]) -
         "native_measurement_id": native_id,
         "molecule_source_id": raw_row["monomer_id"],
         "molecule_source_smiles": raw_row["ligand_smiles"],
+        "molecule_source_inchikey": raw_row["ligand_inchikey"],
+        "molecule_source_chembl_id": raw_row["chembl_id"],
+        "molecule_source_type": None,
         "protein_sequence": sequence,
         "protein_accession": accession.strip() if accession else None,
         "activity_value_source": raw_row[observation["endpoint"]],
@@ -560,9 +636,15 @@ CHEMBL_LOOKUPS = {
     "variant": "SELECT sequence, accession FROM variant_sequences WHERE variant_id = ?",
     "components": "SELECT component_id FROM target_components WHERE tid = ?",
     "component": "SELECT sequence, accession FROM component_sequences WHERE component_id = ?",
-    "molecule": "SELECT chembl_id FROM molecule_dictionary WHERE molregno = ?",
-    "structure": "SELECT canonical_smiles FROM compound_structures WHERE molregno = ?",
+    "molecule": "SELECT chembl_id, molecule_type FROM molecule_dictionary WHERE molregno = ?",
+    "structure": "SELECT canonical_smiles, standard_inchi_key FROM compound_structures "
+                 "WHERE molregno = ?",
     "document": "SELECT chembl_id, pubmed_id, doi FROM docs WHERE doc_id = ?",
+    # Loại phân tử theo mã ChEMBL (dòng BindingDB), viết riêng khỏi chembl.MoleculeTypeLookup.
+    "molecule_type_by_id": "SELECT molecule_type FROM molecule_dictionary WHERE chembl_id = ?",
+    # Parent do ChEMBL tính (molecule_hierarchy), để đối chiếu parent của pipeline.
+    "parent_molregno": "SELECT parent_molregno FROM molecule_hierarchy WHERE molregno = ?",
+    "activity_molregno": "SELECT molregno FROM activities WHERE activity_id = ?",
 }
 
 
@@ -622,18 +704,32 @@ def expected_chembl(observation: Mapping[str, Any], connection: Any) -> dict[str
         "protein_sequence": sequence,
         "protein_accession": accession,
         "molecule_source_id": molecule[0] if molecule else None,
+        "molecule_source_chembl_id": molecule[0] if molecule else None,
+        "molecule_source_type": molecule[1] if molecule else None,
         "molecule_source_smiles": structure[0] if structure else None,
+        "molecule_source_inchikey": structure[1] if structure else None,
         "document_id": document[0],
         "document_pmid_source": chembl.text_or_none(document[1]),
         "document_doi": document[2],
     }
 
 
+def expected_molecule_type(observation: Mapping[str, Any], expected: Mapping[str, Any],
+                           chembl_id: str | None, connection: Any) -> str | None:
+    """Loại phân tử kỳ vọng: ChEMBL lấy từ dòng molecule_dictionary đã tra lại; BindingDB
+    tra theo mã bằng truy vấn riêng của verify (không dùng chembl.MoleculeTypeLookup)."""
+    if observation["source_database"] == chembl.SOURCE_DATABASE:
+        return expected.get("molecule_source_type")
+    row = lookup_one(connection, "molecule_type_by_id", chembl_id)
+    return chembl.text_or_none(row[0]) if row else None
+
+
 def expected_derived(observation: Mapping[str, Any], expected: Mapping[str, Any],
-                     config: Mapping[str, Any]) -> dict[str, Any]:
+                     config: Mapping[str, Any], connection: Any) -> dict[str, Any]:
     """Derived columns recomputed from the raw-side values.
 
-    Nhận: dòng observation, các giá trị nguồn đọc lại từ raw (expected_*), config.
+    Nhận: dòng observation, các giá trị nguồn đọc lại từ raw (expected_*), config, kết nối
+    ChEMBL chỉ đọc (tra loại phân tử của dòng BindingDB).
     Trả về: dict các cột suy ra tính lại từ giá trị raw.
     Vì sao cần: kiểm tra rằng cột suy ra trong output đúng là kết quả của giá trị raw thật
     (không chỉ của giá trị đã lưu trong output).
@@ -649,6 +745,7 @@ def expected_derived(observation: Mapping[str, Any], expected: Mapping[str, Any]
                                raw_value("activity_unit_source"),
                                raw_value("activity_qualifier_source"), config)
     structure = normalize.describe_structure(raw_value("molecule_source_smiles"))
+    chembl_id = normalize.chembl_molecule_id(raw_value("molecule_source_chembl_id"))
     return {
         "observation_id": normalize.make_observation_id(
             source, raw_value("native_measurement_id"), raw_value("endpoint")),
@@ -656,7 +753,17 @@ def expected_derived(observation: Mapping[str, Any], expected: Mapping[str, Any]
         "protein_sequence_hash": normalize.sequence_hash(raw_value("protein_sequence")),
         "molecule_canonical_smiles": structure.canonical_smiles,
         "molecule_inchikey": structure.inchikey,
+        "molecule_input_canonical_smiles": structure.input_canonical_smiles,
+        "molecule_input_inchikey": structure.input_inchikey,
+        "molecule_source_inchikey_check": normalize.compare_source_inchikey(
+            raw_value("molecule_source_inchikey"), structure.input_inchikey),
+        "molecule_parent_fragments": structure.parent_fragments,
+        "molecule_parent_excluded": structure.parent_excluded,
         "structure_status": structure.status,
+        "structure_reason": structure.reason,
+        "molecule_chembl_id": chembl_id,
+        "molecule_chembl_type": expected_molecule_type(observation, expected, chembl_id,
+                                                       connection),
         "activity_qualifier": activity.qualifier,
         "activity_concentration_molar": activity.concentration_molar,
         "activity_p_activity": activity.p_activity,
@@ -709,12 +816,56 @@ def reconcile_sample(scan: Mapping[str, Any], bindingdb_raw: Mapping[str, Any],
         else:
             expected = expected_bindingdb(observation, bindingdb_raw)
         # Gộp giá trị nguồn và cột suy ra kỳ vọng.
-        expected = {**expected, **expected_derived(observation, expected, config)}
+        expected = {**expected, **expected_derived(observation, expected, config, connection)}
         mismatches += compare_row(observation, expected)
     # Mẫu rỗng không được tính là đạt.
     return {"rows_checked": len(scan["sample"]), "mismatch_count": len(mismatches),
             "mismatch_examples": mismatches[:MAX_REPORTED_MISMATCHES],
             "passed": bool(scan["sample"]) and not mismatches}
+
+
+def chembl_parent_inchikey(observation: Mapping[str, Any], connection: Any) -> str | None:
+    """InChIKey parent do ChEMBL tự tính cho phân tử của một dòng ChEMBL, hoặc None.
+
+    activity -> molregno -> molecule_hierarchy.parent_molregno -> compound_structures.
+    Không có dòng hierarchy thì phân tử là parent của chính nó (lấy cấu trúc của nó).
+    """
+    activity = lookup_one(connection, "activity_molregno",
+                          int(observation["native_measurement_id"]))
+    if activity is None:
+        return None
+    hierarchy = lookup_one(connection, "parent_molregno", activity[0])
+    parent_molregno = hierarchy[0] if hierarchy and hierarchy[0] is not None else activity[0]
+    structure = lookup_one(connection, "structure", parent_molregno)
+    return structure[1] if structure else None
+
+
+def check_chembl_parent_agreement(scan: Mapping[str, Any], connection: Any) -> dict[str, Any]:
+    """Mức khớp giữa parent của pipeline và parent ChEMBL tự tính, trên mẫu ngẫu nhiên.
+
+    Nhận: kết quả scan_outputs, kết nối ChEMBL.
+    Trả về: số dòng mẫu ChEMBL có cấu trúc, đếm theo normalize.compare_source_inchikey
+    (khớp hoàn toàn / cùng khung khác lớp / khác khung / ChEMBL không có parent), ví dụ.
+    Vì sao cần: kiểm tra ĐỘC LẬP bước chuẩn hóa. ChEMBL tạo parent bằng chính ChEMBL
+    Structure Pipeline (Bento et al. 2020) nhưng tính InChI bằng công cụ của họ, nên có
+    thể lệch nhỏ ở lớp lập thể; đây là số đo để báo cáo, không phải điều kiện đạt/không đạt.
+    """
+    counts: Counter = Counter()
+    examples = []
+    for observation in scan["sample"]:
+        if (observation["source_database"] != chembl.SOURCE_DATABASE
+                or observation["molecule_inchikey"] is None):
+            continue
+        reference = chembl_parent_inchikey(observation, connection)
+        outcome = (normalize.compare_source_inchikey(reference, observation["molecule_inchikey"])
+                   or "chembl_parent_missing")
+        counts[outcome] += 1
+        if outcome != normalize.INCHIKEY_MATCH and len(examples) < MAX_REPORTED_MISMATCHES:
+            examples.append(f"{observation['observation_id']}: pipeline "
+                            f"{observation['molecule_inchikey']} chembl {reference} "
+                            f"source {observation['molecule_source_smiles']}")
+    return {"rows_checked": sum(counts.values()), "outcomes": dict(counts),
+            "examples": examples}
 
 
 def check_accession_constructs(scan: Mapping[str, Any], bindingdb_raw: Mapping[str, Any],
@@ -771,12 +922,13 @@ def check_enhanced_stereo(scan: Mapping[str, Any],
             problems.append(f"{observation['observation_id']}: differs from raw "
                             f"{raw_row.get('ligand_smiles')!r}")
     return {"monomer_id": config["regression"]["bindingdb_monomer_enhanced_stereo"],
-            "rows_checked": len(scan["monomer_rows"]), "problems": problems[:MAX_REPORTED_MISMATCHES],
+            "rows_checked": len(scan["monomer_rows"]),
+            "problems": problems[:MAX_REPORTED_MISMATCHES],
             "passed": bool(scan["monomer_rows"]) and not problems}
 
 
 def run_verify(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
-    """Integrity checks of data/observations against raw; returns the report.
+    """Integrity checks of paths.observations_dir against raw; returns the report.
 
     Nhận: config, thư mục gốc.
     Trả về: báo cáo (dict) gồm năm phép kiểm tra và các bảng đếm; "passed" = True khi cả
@@ -784,6 +936,9 @@ def run_verify(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     Năm phép kiểm tra: bảo toàn số dòng + không trùng ID; đối chiếu mẫu ngẫu nhiên về raw;
     construct P03367; dấu "|r|" của monomer 13590; PMID dạng số nguyên.
     """
+    # --- Cùng phiên bản gói chuẩn hóa với lúc extract (cột suy ra được tính lại).
+    normalize.check_structure_pipeline_version(
+        config["structure"]["chembl_structure_pipeline_version"])
     # --- Cần đủ hai file output của full.
     output_dir = root / config["paths"]["observations_dir"]
     paths = [output_dir / file_name for _, _, file_name in source_outputs(config)]
@@ -811,6 +966,7 @@ def run_verify(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
         chembl_selected = chembl.count_selected_activities(connection, config["endpoints"])
         sample = reconcile_sample(scan, bindingdb_raw, connection, config)
         accession = check_accession_constructs(scan, bindingdb_raw, connection, config)
+        parent_agreement = check_chembl_parent_agreement(scan, connection)
     finally:
         connection.close()
 
@@ -838,9 +994,12 @@ def run_verify(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
         "regression_accession_construct": accession,
         "regression_enhanced_stereo": check_enhanced_stereo(scan, bindingdb_raw, config),
         "regression_pmid_integer_form": pmid,
+        # Thông tin, không tính vào "passed" (xem check_chembl_parent_agreement).
+        "chembl_parent_agreement": parent_agreement,
         "counts_by_source": dict(rows_by_source),
         "counts_by_source_endpoint": dict(scan["rows_by_source_endpoint"]),
         "counts_by_source_status_reason": dict(scan["status_reasons"]),
+        "counts_by_source_structure_flag": dict(scan["structure_flags"]),
     }
     # Chỉ đạt khi cả năm phép đều đạt.
     report["passed"] = all(report[key]["passed"] for key in (

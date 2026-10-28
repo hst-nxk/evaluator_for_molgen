@@ -124,12 +124,12 @@ mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$HF_HOME" "$TORCH_HOME" \
 
 # --- 4. Chốt dữ liệu --------------------------------------------------------------------
 for required in \
-    data/dataset_v2/evaluator_training.parquet \
-    data/dataset_v2/full/proteins.parquet \
-    work/evaluator_cache_v2/cache_manifest.json \
-    work/evaluator_cache_v2/fragment_fingerprints.parquet \
-    work/evaluator_cache_v2/molecule_fingerprints.parquet \
-    work/evaluator_cache_v2/protein_embeddings.parquet; do
+    data/dataset_v3/evaluator_training.parquet \
+    data/dataset_v3/full/proteins.parquet \
+    work/evaluator_cache_v3/cache_manifest.json \
+    work/evaluator_cache_v3/fragment_fingerprints.parquet \
+    work/evaluator_cache_v3/molecule_fingerprints.parquet \
+    work/evaluator_cache_v3/protein_embeddings.parquet; do
     [[ -f "$required" ]] || fail "thiếu $required"
 done
 echo "dữ liệu: đủ 6 file"

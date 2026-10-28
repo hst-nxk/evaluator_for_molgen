@@ -182,18 +182,18 @@ def collapse_replicates(rows: pa.Table, tolerance: float, slack: float,
 # --------------------------------------------------------------------------- bước 4
 
 
-def dispersion(sizes: np.ndarray, std: np.ndarray, minimum: np.ndarray,
-               maximum: np.ndarray) -> np.ndarray:
+def dispersion(sizes: np.ndarray, minimum: np.ndarray, maximum: np.ndarray) -> np.ndarray:
     """Độ phân tán của các giá trị Δp KHÁC NHAU của mỗi bản ghi (NaN khi chỉ có 1).
 
-    Nhận: số giá trị khác nhau (sau khi gộp bản sao), STD, min, max của chúng.
-    - ≥ 3 giá trị: STD;
-    - đúng 2 giá trị: |Δ_X − Δ_Y| = max − min (theo đề bài; lớn hơn STD ddof = 1 của hai
-      giá trị đúng √2 lần, tức chặt hơn khi so cùng ngưỡng);
-    - 1 giá trị: không tính được.
+    Nhận: số giá trị khác nhau (sau khi gộp bản sao), min và max của chúng.
+    Trả về: max − min, tức |ΔΔp| lớn nhất giữa hai assay bất kỳ của bản ghi.
+    Căn cứ: Nelen et al. 2025 (J. Cheminform. 17, 8; DOI 10.1186/s13321-025-00956-y) so
+    cặp chất tương tự giữa hai assay bằng "ΔΔpChEMBL", hiệu của hai độ chênh trong assay,
+    và đọc nó theo mức của Landrum & Riniker 2024 (JCIM 64, 1560). Bản ghi nhiều assay
+    vượt mức khi và chỉ khi có ít nhất một cặp assay vượt, tức max − min vượt mức. Cùng
+    một phép đo cho mọi số assay, không đổi sang STD khi có ≥ 3 giá trị.
     """
-    result = np.where(sizes >= 3, std, maximum - minimum)
-    return np.where(sizes >= 2, result, np.nan)
+    return np.where(sizes >= 2, maximum - minimum, np.nan)
 
 
 def qc_status(n_assays: np.ndarray, n_distinct: np.ndarray, spread: np.ndarray,
@@ -204,7 +204,8 @@ def qc_status(n_assays: np.ndarray, n_distinct: np.ndarray, spread: np.ndarray,
     - identical_values: ≥ 2 assay nhưng mọi Δp trùng nhau (lệch ≤ ngưỡng gộp), tức chỉ có
       MỘT giá trị — đo 24/10/2026, phần lớn trường hợp này là số liệu chép lại giữa các
       tài liệu (docs/AUDIT_20261024.md mục 4), nên không được coi là "được xác nhận";
-    - quarantine: ≥ 2 giá trị khác nhau và độ phân tán > ngưỡng;
+    - quarantine: ≥ 2 giá trị khác nhau và độ phân tán > ngưỡng (ngưỡng 1,0 log là mức
+      "significant discrepancies" của Nelen et al. 2025 và Landrum & Riniker 2024);
     - pass: ≥ 2 giá trị khác nhau và độ phân tán ≤ ngưỡng.
     """
     status = np.full(n_assays.size, QC_PASS, dtype=object)
@@ -240,8 +241,7 @@ def summarize_values(values: np.ndarray, tolerance: float, slack: float,
     size = distinct.size
     std = float(np.std(distinct, ddof=ddof)) if size > ddof else float("nan")
     minimum, maximum = float(distinct[0]), float(distinct[-1])
-    spread = float(dispersion(np.array([size]), np.array([std]), np.array([minimum]),
-                              np.array([maximum]))[0])
+    spread = float(dispersion(np.array([size]), np.array([minimum]), np.array([maximum]))[0])
     return (float(distinct.mean()), float(np.median(distinct)), std, minimum, maximum,
             spread, size)
 

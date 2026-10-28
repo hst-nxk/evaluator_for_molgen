@@ -24,8 +24,9 @@ def settings(config: dict[str, Any]) -> mmp.FragmentSettings:
         min_cuts=mmp_settings["min_cuts"], max_cuts=mmp_settings["max_cuts"],
         max_cut_bonds=mmp_settings["max_cut_bonds"],
         cut_smarts=mmp_settings["cut_smarts"],
-        min_core_fraction=mmp_settings["min_core_fraction"],
+        min_core_to_variable_ratio=mmp_settings["min_core_to_variable_ratio"],
         max_variable_heavy_atoms=mmp_settings["max_variable_heavy_atoms"],
+        max_variable_size_difference=mmp_settings["max_variable_size_difference"],
         attachment_points=mmp_settings["attachment_points"],
         attachment_degree=mmp_settings["attachment_degree"])
 
@@ -34,6 +35,13 @@ def settings(config: dict[str, Any]) -> mmp.FragmentSettings:
 def cutter(settings: mmp.FragmentSettings):
     """Hàm cắt dùng cho find_pairs trong các test (không cache)."""
     return lambda smiles: mmp.fragment_molecule(smiles, settings)
+
+
+@pytest.fixture()
+def pairs_of(settings: mmp.FragmentSettings, cutter):
+    """find_pairs với mức chênh lệch kích thước trong config."""
+    return lambda *items: mmp.find_pairs(molecules(*items), cutter,
+                                         settings.max_variable_size_difference)
 
 
 def molecules(*items: tuple[int, str, bool]) -> list[mmp.GroupMolecule]:
@@ -64,8 +72,8 @@ def test_is_relative_key_reads_the_suffix_back() -> None:
 
 
 def test_fragment_molecule_keeps_only_the_large_core(settings: mmp.FragmentSettings) -> None:
-    # Toluene có 7 nguyên tử nặng; lõi phải ≥ 60 % = 4,2 nên chỉ vòng benzen làm lõi được,
-    # còn nhóm metyl (1 nguyên tử) chỉ làm phần biến đổi.
+    # Toluene: lõi phải ≥ 2 lần phần biến đổi, nên vòng benzen (6) làm lõi cho metyl (1)
+    # được, còn metyl (1) không làm lõi cho vòng benzen (6) được.
     result = mmp.fragment_molecule(TOLUENE, settings)
     assert result.failed is False
     assert len(result.cuts) == 1
@@ -133,6 +141,25 @@ def test_fragment_molecule_respects_variable_size_limit(
     assert mmp.fragment_molecule(TOLUENE, small).cuts == ()
 
 
+def test_fragment_molecule_needs_core_twice_the_variable(
+        settings: mmp.FragmentSettings) -> None:
+    # Butylbenzen: cắt ở phenyl-butyl cho lõi 6 < 2 × 4 nên bị loại; cắt trong mạch butyl
+    # cho phần biến đổi 1, 2, 3 với lõi 9, 8, 7 nên được giữ. (Quy tắc cũ "lõi ≥ 60 %"
+    # giữ cả cách cắt phenyl-butyl.)
+    sizes = {cut.variable_heavy for cut in mmp.fragment_molecule("CCCCc1ccccc1", settings).cuts}
+    assert sizes == {1, 2, 3}
+
+
+def test_fragment_molecule_accepts_the_largest_variable_on_a_large_core(
+        settings: mmp.FragmentSettings) -> None:
+    # Lõi 28 nguyên tử nặng (naphtyl + 3 phenyl) gắn mạch 13 carbon: biến đổi 13 ≤ 13 và
+    # lõi 28 ≥ 2 × 13 nên cách cắt ở gốc mạch được giữ.
+    smiles = "c1ccc2ccccc2c1-c1ccc(cc1)-c1ccc(cc1)-c1ccc(cc1)" + "C" * 13
+    sizes = {cut.variable_heavy for cut in mmp.fragment_molecule(smiles, settings).cuts}
+    assert settings.max_variable_heavy_atoms == 13
+    assert 13 in sizes and max(sizes) == 13
+
+
 def test_cut_score_prefers_the_smaller_variable_part() -> None:
     small = mmp.Cut("core", "[*:1]C", 1)
     large = mmp.Cut("core", "[*:1]CCCC", 4)
@@ -142,9 +169,8 @@ def test_cut_score_prefers_the_smaller_variable_part() -> None:
 # --------------------------------------------------------------------------- tạo cặp
 
 
-def test_find_pairs_matches_analogs_on_the_same_core(cutter) -> None:
-    pairs, lost = mmp.find_pairs(molecules((0, TOLUENE, False), (1, ETHYLBENZENE, False)),
-                                 cutter)
+def test_find_pairs_matches_analogs_on_the_same_core(pairs_of) -> None:
+    pairs, lost = pairs_of((0, TOLUENE, False), (1, ETHYLBENZENE, False))
     assert lost == set()
     assert len(pairs) == 1
     pair = pairs[0]
@@ -152,32 +178,38 @@ def test_find_pairs_matches_analogs_on_the_same_core(cutter) -> None:
     assert pair.variable_x != pair.variable_y
 
 
-def test_find_pairs_drops_pairs_mixing_relative_stereo(cutter) -> None:
-    pairs, lost = mmp.find_pairs(molecules((0, TOLUENE, False), (1, ETHYLBENZENE, True)),
-                                 cutter)
+def test_find_pairs_drops_pairs_mixing_relative_stereo(pairs_of) -> None:
+    pairs, lost = pairs_of((0, TOLUENE, False), (1, ETHYLBENZENE, True))
     assert pairs == []
     assert lost == {(0, 1)}
 
 
-def test_find_pairs_keeps_pairs_when_both_sides_are_relative(cutter) -> None:
-    pairs, lost = mmp.find_pairs(molecules((0, TOLUENE, True), (1, ETHYLBENZENE, True)),
-                                 cutter)
+def test_find_pairs_keeps_pairs_when_both_sides_are_relative(pairs_of) -> None:
+    pairs, lost = pairs_of((0, TOLUENE, True), (1, ETHYLBENZENE, True))
     assert len(pairs) == 1 and lost == set()
 
 
-def test_find_pairs_needs_two_molecules(cutter) -> None:
-    assert mmp.find_pairs(molecules((0, TOLUENE, False)), cutter) == ([], set())
+def test_find_pairs_needs_two_molecules(pairs_of) -> None:
+    assert pairs_of((0, TOLUENE, False)) == ([], set())
 
 
-def test_find_pairs_ignores_molecules_without_a_common_core(cutter) -> None:
-    pairs, lost = mmp.find_pairs(molecules((0, TOLUENE, False), (1, "CCCCO", False)), cutter)
+def test_find_pairs_ignores_molecules_without_a_common_core(pairs_of) -> None:
+    pairs, lost = pairs_of((0, TOLUENE, False), (1, "CCCCO", False))
     assert pairs == [] and lost == set()
 
 
-def test_find_pairs_returns_each_unordered_pair_once(cutter) -> None:
-    pairs, _ = mmp.find_pairs(molecules((0, TOLUENE, False), (1, ETHYLBENZENE, False),
-                                        (2, "CCCc1ccccc1", False)), cutter)
+def test_find_pairs_returns_each_unordered_pair_once(pairs_of) -> None:
+    pairs, _ = pairs_of((0, TOLUENE, False), (1, ETHYLBENZENE, False),
+                        (2, "CCCc1ccccc1", False))
     assert sorted((pair.row_x, pair.row_y) for pair in pairs) == [(0, 1), (0, 2), (1, 2)]
+
+
+def test_find_pairs_respects_the_size_difference(cutter) -> None:
+    # Toluene (biến đổi metyl, 1) và propylbenzen (biến đổi propyl, 3) chung lõi phenyl,
+    # chênh 2 nguyên tử nặng.
+    items = molecules((0, TOLUENE, False), (1, "CCCc1ccccc1", False))
+    assert len(mmp.find_pairs(items, cutter, 2)[0]) == 1
+    assert mmp.find_pairs(items, cutter, 1) == ([], set())
 
 
 def test_process_task_requires_init_worker(settings: mmp.FragmentSettings) -> None:

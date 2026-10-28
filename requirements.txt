@@ -1,4 +1,8 @@
 rdkit==2026.9.1
+# Chuẩn hóa cấu trúc + lấy parent (bỏ muối/dung môi, trung hòa) ở Stage 1; phiên bản
+# phải trùng config structure.chembl_structure_pipeline_version (code kiểm lúc chạy).
+# Bento et al. 2020, J. Cheminform. 12:51, DOI 10.1186/s13321-020-00456-1.
+chembl_structure_pipeline==1.2.4
 pyarrow==25.0.1
 pytest==8.4.2
 numpy==2.2.6
