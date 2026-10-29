@@ -12,7 +12,8 @@
 #   molecules  : (4) kích thước phân tử (nguyên tử nặng, tổng nguyên tử có H, MW), peptide,
 #                kích thước nhóm thế, số cặp mất theo từng ngưỡng ứng viên
 #   followup   : việc tồn 27/10 trước dataset_v3: dòng trùng do -REL, peptide còn lại
-#                sau ngưỡng MW, assay bị nhập hai lần trong cùng một nguồn
+#                sau ngưỡng MW, assay bị nhập hai lần trong cùng một nguồn; và (29/10)
+#                số phân tử, số cặp nằm trong quy tắc 5 của Lipinski
 # Kết quả: runs/audit/<task>_<thời điểm>.json, .txt, .log và thư mục _figures.
 # molecules dùng ProcessPoolExecutor (spawn trên Windows) nên main() phải nằm sau
 # `if __name__ == "__main__"`.
@@ -83,7 +84,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", choices=(*TASKS, "all"), required=True)
     parser.add_argument("--parts", nargs="+", choices=tuple(followup.PARTS),
-                        help="chỉ với --task followup: các phần cần chạy (mặc định cả ba)")
+                        help="chỉ với --task followup: các phần cần chạy (mặc định mọi phần)")
     args = parser.parse_args()
 
     config = load_config(CONFIG_PATH)

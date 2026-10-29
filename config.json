@@ -303,7 +303,9 @@
       "document_pmid": "document_pmid",
       "document_doi": "document_doi",
       "document_patent": "document_patent_number",
-      "document_id": "document_id"
+      "document_id": "document_id",
+      "molecule_chembl_type": "molecule_chembl_type",
+      "assay_type": "assay_type"
     },
     "filter": {
       "resolved_status": "resolved",
@@ -367,7 +369,11 @@
       "protein_alphabet": "ACDEFGHIKLMNPQRSTVWYBXZUO",
       "observation_flag_note": "v2. Ba cột mô tả thêm, KHÔNG lọc dòng nào. min_target_confidence: confidence_score nhỏ nhất của ChEMBL trong các phép đo đóng góp (assay_context); 9 = 'Direct single protein target assigned', 8 = 'Homologous single protein target assigned' (protein đo có thể là đồng đẳng khác loài); null ChEMBL được coi là missing_confidence = 0 ('target unknown or has yet to be curated'); bản ghi chỉ có BindingDB thì null vì BindingDB không có trường tương đương. Đo ngày 24/10/2026 trên v1: 24,4 % dòng evaluator có ít nhất một assay mức 8. inactive_comment: ít nhất một phép đo đóng góp có activity_comment (so không phân biệt hoa thường) thuộc inactive_comments trên dòng qualifier '=', tức giá trị có thể là nồng độ cao nhất đã thử chứ không phải hằng số đo được (v1: 2.699 dòng evaluator). nonstandard_sequence: chuỗi protein (bỏ khoảng trắng, viết hoa — đúng chuẩn hóa của hash Stage 1) có ký tự ngoài protein_alphabet (20 acid amin chuẩn + B, X, Z, U, O), vd. chuỗi có chữ số hay tên nhóm hóa học như 'biotin-C6linker-'. Hai regex chỉ chọn trước dòng cần parse JSON; dòng đã chọn vẫn được parse đầy đủ.",
       "large_molecule_weight": 1000.0,
-      "large_molecule_note": "Cột large_molecule chỉ có ở evidence: A hoặc B có MolWt (RDKit) ≥ large_molecule_weight Da; bản ghi mang cờ không vào hai file training. Nguồn: Doak et al. 2014, Chem. Biol. 21, 1115, DOI 10.1016/j.chembiol.2014.08.013.",
+      "large_molecule_note": "Cột large_molecule chỉ có ở evidence: A hoặc B có MolWt (RDKit) ≥ large_molecule_weight Da; bản ghi mang cờ không vào hai file training. Nguồn: ExCAPE-DB, Sun J et al. 2017, J. Cheminform. 9:17, DOI 10.1186/s13321-017-0203-5, dựng từ ChEMBL và PubChem, chỉ giữ hợp chất có 'molecular weight (MW) <1000 Da'. Chỉ lấy tiêu chí MW của bài. Bản trước trích Doak et al. 2014 (Chem. Biol. 21, 1115) cho mốc này nhưng không xác minh được câu nào của bài nói 1000 Da, nên đã thay.",
+      "excluded_chembl_types": ["Protein", "Oligonucleotide", "Oligosaccharide"],
+      "excluded_chembl_types_note": "Cột chembl_excluded_type chỉ có ở evidence: A hoặc B có molecule_type của ChEMBL 37 (cột molecule_chembl_type của Stage 1) thuộc danh sách này; bản ghi mang cờ không vào hai file training. Nhãn gắn theo InChIKey parent: một phân tử có ít nhất một dòng mang loại bị loại thì bị loại, kể cả dòng BindingDB của cùng chất không ghi mã ChEMBL. Vì sao: ChEMBL FAQ định nghĩa small molecule là 'any bioactive compound (usually an organic molecule that is chemically synthesised) where the chemical structure can be precisely drawn, and it is not a biotherapeutic', và gán peptide vào loại 'Protein' kể cả peptide ngắn có SMILES (vd. protirelin 362 Da, oxytocin; kiểm qua API ChEMBL ngày 28/10/2026), nên nhãn này bắt được peptide mà ngưỡng MW bỏ sót. Ba loại trong danh sách là mọi loại khác 'Small molecule' và 'Unknown' mà phân tử CÓ cấu trúc mang trong ChEMBL 37 (đếm qua API 28/10/2026: Protein 22.169, Oligonucleotide 57, Oligosaccharide 53). 'Unknown' được giữ vì không phải nhãn kích thước: trên dataset v2, MW trung vị của nhóm này là 437 Da.",
+      "assay_type_separator": ";",
+      "assay_type_note": "Cột assay_types (bằng chứng) và cờ mixed_assay_type, có ở cả ba file, KHÔNG lọc dòng nào. assay_types: các loại assay khác nhau (assays.assay_type của ChEMBL: B = binding, F = functional, ...) của những assay đóng góp cho bản ghi, sắp xếp rồi nối bằng assay_type_separator; null khi bản ghi chỉ từ BindingDB (BindingDB không có trường tương đương). mixed_assay_type: có từ hai loại trở lên, tức bước 4 đã gộp Δp đo khả năng gắn với Δp đo đáp ứng chức năng vào cùng một bản ghi (lỗi do người audit ngoài chỉ ra ngày 28/10/2026). Đo trước số bản ghi bị ảnh hưởng rồi mới quyết định tách hay loại.",
       "generator_min_gain": 0.3,
       "plausible_p_range": [2.0, 12.0],
       "min_protein_length": 50,
@@ -661,6 +667,15 @@
       "top_molecules": 30,
       "examples": 5,
       "description_chars": 160,
+      "lipinski": {
+        "max_weight": 500,
+        "max_logp": 5,
+        "max_donors": 5,
+        "max_acceptors": 10,
+        "weight_edges": [500, 1000],
+        "source": "Lipinski CA, Lombardo F, Dominy BW, Feeney PJ. Adv. Drug Deliv. Rev. 2001, 46(1-3), 3-26, DOI 10.1016/S0169-409X(00)00129-0, PMID 11259830. Tóm tắt (kiểm qua Europe PMC 29/10/2026): \"'the rule of 5' predicts that poor absorption or permeation is more likely when there are more than 5 H-bond donors, 10 H-bond acceptors, the molecular weight (MWT) is greater than 500 and the calculated Log P (CLogP) is greater than 5 (or MlogP > 4.15)\".",
+        "note": "Phần lipinski của audit bổ sung (thêm 29/10/2026 theo gợi ý của sếp): CHỈ ĐẾM, không lọc dòng nào. Quy tắc 5 là tiêu chí khả năng hấp thu đường uống, không phải định nghĩa small molecule. logP tính bằng Crippen.MolLogP của RDKit (Wildman & Crippen 1999, J. Chem. Inf. Comput. Sci. 39, 868), không phải CLogP hay MLogP của bài, nên số đếm tiêu chí logP chỉ là xấp xỉ. HBD/HBA đếm NH + OH và N + O như bài (CalcNumLipinskiHBD/HBA). Báo cáo in phân bố số tiêu chí bị vượt (0-4) mà không chọn sẵn mức 'đạt': tóm tắt bài không nói vượt bao nhiêu tiêu chí thì tính là vi phạm. weight_edges chỉ là mốc chia bảng: 500 của Lipinski, 1000 của ExCAPE-DB (stage2b.export.large_molecule_weight)."
+      },
       "note": "Audit bổ sung 27/10/2026 trước dataset_v3, chỉ đọc. Không có ngưỡng lọc nào ở đây: residue_smarts là mẫu một gốc amino acid (N–Cα–C=O) để ĐẾM số gốc của phân tử đã khớp audit.molecules.peptide_smarts, chỉ để xem phân bố; residue_bins và overlap_bins chỉ là cách chia cột của bảng; top_molecules, examples, description_chars là số dòng/ký tự in ra. Mốc chênh nhãn ở mục 1 lấy từ stage2b.qc.collapse_tolerance và audit.literature."
     },
     "stats": {

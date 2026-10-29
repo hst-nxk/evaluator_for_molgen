@@ -11,6 +11,8 @@ Ba câu hỏi, mỗi câu một phần của báo cáo:
     3. in_source : nhóm trùng trong CÙNG một nguồn, cùng tài liệu, khác assay (khóa
                    audit.duplicates.key_levels[0]): có phải cả assay bị nhập hai lần, tức
                    một assay nằm trọn trong assay kia, không.
+    4. lipinski  : (thêm 29/10/2026 theo gợi ý của sếp) bao nhiêu phân tử và cặp nằm trong
+                   quy tắc 5 của Lipinski; chỉ đếm, không lọc.
 Không dòng nào bị sửa hay xóa; chỉ đếm và in ví dụ để tra ngược.
 """
 
@@ -20,6 +22,7 @@ import logging
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -36,6 +39,11 @@ LOGGER = logging.getLogger(__name__)
 RELATIVE_COLUMNS = ("pair_id", "smiles_a", "smiles_b", "protein_hash", "endpoint",
                     "molecule_a_key", "molecule_b_key", "delta_p_mean", "partition")
 PEPTIDE_COLUMNS = ("smiles_a", "smiles_b", "endpoint", "partition")
+# Bốn đại lượng của quy tắc 5 (thứ tự cột của lipinski_properties) và khóa ngưỡng tương
+# ứng trong config audit.followup.lipinski.
+LIPINSKI_METRICS = ("mw", "logp", "donors", "acceptors")
+LIPINSKI_LIMIT_KEYS = {"mw": "max_weight", "logp": "max_logp", "donors": "max_donors",
+                       "acceptors": "max_acceptors"}
 
 
 # --------------------------------------------------------------------------- tiện ích
@@ -440,6 +448,170 @@ def in_source_lines(part: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+# --------------------------------------------------------------------------- 4. Lipinski
+
+
+def lipinski_properties(smiles: Sequence[str]) -> np.ndarray:
+    """Bốn đại lượng của Lipinski cho từng SMILES, cột theo LIPINSKI_METRICS.
+
+    MW: Descriptors.MolWt; logP: Crippen.MolLogP (Wildman & Crippen 1999), KHÔNG phải
+    CLogP hay MLogP mà bài Lipinski dùng; HBD/HBA: CalcNumLipinskiHBD/HBA của RDKit (đếm
+    NH + OH và N + O, đúng cách đếm của bài). SMILES không đọc được -> NaN ở mọi cột.
+    Hàm ở mức module để chạy được trong tiến trình con.
+    """
+    from rdkit import Chem, RDLogger
+    from rdkit.Chem import Crippen, Descriptors, rdMolDescriptors
+
+    RDLogger.DisableLog("rdApp.*")
+    result = np.full((len(smiles), len(LIPINSKI_METRICS)), np.nan, dtype=np.float64)
+    for index, text in enumerate(smiles):
+        molecule = Chem.MolFromSmiles(text) if text else None
+        if molecule is None:
+            continue
+        result[index] = (Descriptors.MolWt(molecule), Crippen.MolLogP(molecule),
+                         rdMolDescriptors.CalcNumLipinskiHBD(molecule),
+                         rdMolDescriptors.CalcNumLipinskiHBA(molecule))
+    return result
+
+
+def lipinski_all(smiles: list[str], settings: Mapping[str, Any]) -> np.ndarray:
+    """lipinski_properties cho cả danh sách, chia khối và chạy song song.
+
+    settings: audit.molecules (dùng chung workers và chunk_size với audit kích thước).
+    """
+    size = int(settings["chunk_size"])
+    chunks = [smiles[start:start + size] for start in range(0, len(smiles), size)]
+    workers = int(settings["workers"])
+    if workers <= 1 or len(chunks) <= 1:
+        parts = [lipinski_properties(chunk) for chunk in chunks]
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            parts = list(pool.map(lipinski_properties, chunks))
+    if not parts:
+        return np.zeros((0, len(LIPINSKI_METRICS)), dtype=np.float64)
+    return np.vstack(parts)
+
+
+def lipinski_exceeded(properties: np.ndarray, limits: Mapping[str, Any]) -> np.ndarray:
+    """Ma trận bool: phân tử vượt từng tiêu chí (cột theo LIPINSKI_METRICS).
+
+    "Vượt" theo đúng chữ của bài: lớn hơn ngưỡng (MW > 500, logP > 5, HBD > 5, HBA > 10).
+    """
+    bounds = np.array([float(limits[LIPINSKI_LIMIT_KEYS[name]]) for name in LIPINSKI_METRICS])
+    with np.errstate(invalid="ignore"):
+        return properties > bounds
+
+
+def violation_counts(properties: np.ndarray, limits: Mapping[str, Any]) -> np.ndarray:
+    """Số tiêu chí Lipinski bị vượt (0-4) của từng phân tử; -1 nếu không đọc được."""
+    counts = lipinski_exceeded(properties, limits).sum(axis=1).astype(np.int64)
+    counts[np.isnan(properties).any(axis=1)] = -1
+    return counts
+
+
+def pair_violations(violations: np.ndarray, index_a: np.ndarray,
+                    index_b: np.ndarray) -> np.ndarray:
+    """Số tiêu chí bị vượt của phía tệ hơn trong mỗi cặp; -1 nếu một phía không đọc được."""
+    left, right = violations[index_a], violations[index_b]
+    worst = np.maximum(left, right)
+    worst[(left < 0) | (right < 0)] = -1
+    return worst
+
+
+def ordered_counts(values: np.ndarray) -> dict[str, int]:
+    """Đếm theo giá trị nguyên, sắp theo giá trị (không theo tần suất)."""
+    keys, counts = np.unique(values, return_counts=True)
+    return {str(int(key)): int(count) for key, count in zip(keys, counts)}
+
+
+def lipinski_check(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
+    """Phần 4: bao nhiêu phân tử và cặp evaluator nằm trong quy tắc 5 của Lipinski.
+
+    Chỉ đếm, không lọc. Báo số tiêu chí bị vượt (0-4) của từng phân tử, của phía tệ hơn
+    trong mỗi cặp, số phân tử vượt từng tiêu chí, và phân bố MW theo các mốc
+    audit.followup.lipinski.weight_edges.
+    """
+    limits = config["audit"]["followup"]["lipinski"]
+    table = pq.read_table(common.dataset_file(config, root, "evaluator"),
+                          columns=list(PEPTIDE_COLUMNS))
+    unique = molecules.unique_strings(table.column("smiles_a"), table.column("smiles_b"))
+    LOGGER.info("phần 4: tính Lipinski cho %s phân tử", f"{len(unique):,}")
+    properties = lipinski_all(unique.to_pylist(), config["audit"]["molecules"])
+    violations = violation_counts(properties, limits)
+    exceeded = lipinski_exceeded(properties, limits)
+
+    index_a = molecules.positions(table.column("smiles_a"), unique)
+    index_b = molecules.positions(table.column("smiles_b"), unique)
+    if (index_a < 0).any() or (index_b < 0).any():
+        raise ValueError("có SMILES rỗng trong evaluator; dữ liệu không đúng như Stage 2b")
+    worst = pair_violations(violations, index_a, index_b)
+    weight = properties[:, LIPINSKI_METRICS.index("mw")]
+    pair_weight = np.fmax(weight[index_a], weight[index_b])
+    edges = [float(edge) for edge in limits["weight_edges"]]
+    partitions = table.column("partition").to_numpy(zero_copy_only=False)
+
+    by_partition = {}
+    for partition in sorted(set(partitions.tolist())):
+        chosen = worst[partitions == partition]
+        by_partition[str(partition)] = {
+            "pairs": int(chosen.size), "zero": int(np.count_nonzero(chosen == 0)),
+            "at_most_one": int(np.count_nonzero((chosen >= 0) & (chosen <= 1)))}
+    return {
+        "molecules": len(unique),
+        "unparsed_molecules": int(np.count_nonzero(violations < 0)),
+        "molecule_violations": ordered_counts(violations),
+        "molecules_exceeding": {name: int(np.count_nonzero(exceeded[:, column]))
+                                for column, name in enumerate(LIPINSKI_METRICS)},
+        "pairs": table.num_rows,
+        "pair_worst_violations": ordered_counts(worst),
+        "by_partition": by_partition,
+        "weight_edges": edges,
+        "molecule_weight": closed_buckets(weight, edges),
+        "pair_weight": closed_buckets(pair_weight, edges),
+        "limits": {name: limits[LIPINSKI_LIMIT_KEYS[name]] for name in LIPINSKI_METRICS},
+    }
+
+
+def lipinski_lines(part: Mapping[str, Any]) -> list[str]:
+    """Phần báo cáo đọc được của mục 4."""
+    molecules_total, pairs = part["molecules"], part["pairs"]
+    limits = part["limits"]
+
+    def violation_table(counts: Mapping[str, int], total: int) -> list[str]:
+        return common.table_lines(
+            ["số tiêu chí vượt", "số", "%"],
+            [["không đọc được" if key == "-1" else key, common.number(value),
+              common.percent(common.share(value, total))] for key, value in counts.items()])
+
+    lines = ["## 4. Quy tắc 5 của Lipinski (chỉ đếm, không lọc)", "",
+             f"Ngưỡng: MW > {limits['mw']:g}, logP > {limits['logp']:g}, "
+             f"HBD > {limits['donors']:g}, HBA > {limits['acceptors']:g} "
+             "(Lipinski et al. 2001). logP là Crippen của RDKit, không phải CLogP/MLogP.",
+             f"Phân tử: {common.number(molecules_total)}; cặp evaluator: {common.number(pairs)}",
+             "", "Phân tử theo số tiêu chí bị vượt:"]
+    lines += violation_table(part["molecule_violations"], molecules_total)
+    lines += ["", "Phân tử vượt từng tiêu chí:"]
+    lines += common.table_lines(
+        ["tiêu chí", "số", "%"],
+        [[name, common.number(value), common.percent(common.share(value, molecules_total))]
+         for name, value in part["molecules_exceeding"].items()])
+    lines += ["", "Cặp theo số tiêu chí bị vượt của phía tệ hơn:"]
+    lines += violation_table(part["pair_worst_violations"], pairs)
+    lines += ["", "Theo partition (cặp có cả hai phía vượt 0 tiêu chí / tối đa 1 tiêu chí):"]
+    lines += common.table_lines(
+        ["partition", "cặp", "0 tiêu chí", "%", "≤ 1 tiêu chí", "%"],
+        [[name, common.number(row["pairs"]), common.number(row["zero"]),
+          common.percent(common.share(row["zero"], row["pairs"])),
+          common.number(row["at_most_one"]),
+          common.percent(common.share(row["at_most_one"], row["pairs"]))]
+         for name, row in part["by_partition"].items()])
+    lines += ["", "MW của phân tử:"]
+    lines += bucket_table(part["molecule_weight"], molecules_total)
+    lines += ["", "MW lớn hơn trong hai phía của cặp:"]
+    lines += bucket_table(part["pair_weight"], pairs)
+    return lines
+
+
 # --------------------------------------------------------------------------- chạy
 
 
@@ -447,15 +619,16 @@ PARTS = {
     "relative": (relative_duplicates, relative_lines),
     "peptide": (peptide_check, peptide_lines),
     "in_source": (in_source_copies, in_source_lines),
+    "lipinski": (lipinski_check, lipinski_lines),
 }
 
 
 def run(config: Mapping[str, Any], root: Path,
         parts: Sequence[str] = tuple(PARTS)) -> tuple[dict[str, Any], list[str]]:
-    """Chạy các phần được chọn (mặc định cả ba). Trả về (số liệu, các dòng báo cáo).
+    """Chạy các phần được chọn (mặc định mọi phần). Trả về (số liệu, các dòng báo cáo).
 
     Chạy riêng từng phần khi máy ít RAM: in_source đọc mọi observation (nặng nhất),
-    relative đọc evidence_records, peptide chỉ đọc 4 cột của evaluator.
+    relative đọc evidence_records, peptide và lipinski chỉ đọc 4 cột của evaluator.
     """
     unknown = [part for part in parts if part not in PARTS]
     if unknown:

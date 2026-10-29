@@ -348,6 +348,9 @@ def record_table(rows: list[dict[str, Any]]) -> pa.Table:
         "short_protein": pa.array([row.get("short_protein", False) for row in rows], pa.bool_()),
         "source_quality_warning": pa.array(
             [row.get("source_quality_warning") for row in rows], pa.string()),
+        "assay_types": pa.array([row.get("assay_types", "B") for row in rows], pa.string()),
+        "mixed_assay_type": pa.array([row.get("mixed_assay_type", False) for row in rows],
+                                     pa.bool_()),
     })
 
 
@@ -643,6 +646,86 @@ def test_observation_flag_columns_by_source(tmp_path: Path) -> None:
     # p3: chỉ BindingDB -> null.
     assert minimum.to_pylist() == [0, 9, None]
     assert inactive.to_pylist() == [False, True, False]
+
+
+def test_excluded_type_keys_flags_any_excluded_label_and_counts_conflicts() -> None:
+    pairs = pa.table({"inchikey": ["K1", "K2", "K2", "K3", "K4"],
+                      "molecule_chembl_type": ["Protein", "Protein", "Small molecule",
+                                               "Small molecule", "Unknown"]})
+    flagged, stats = pipeline.excluded_type_keys(pairs, ["Protein", "Oligonucleotide"])
+    # K2 mang hai nhãn mâu thuẫn: bị loại (thận trọng) và được đếm riêng.
+    assert flagged == {"K1", "K2"}
+    assert stats["excluded_molecules"] == 2 and stats["conflicting_molecules"] == 1
+    assert stats["molecules_by_type"] == {"Protein": 2, "Small molecule": 2, "Unknown": 1}
+
+
+def test_excluded_type_column_ignores_the_relative_stereo_suffix() -> None:
+    records = record_table([
+        {"delta_p_mean": 1.0, "molecule_a_key": "K1" + SUFFIX, "molecule_b_key": "K9"},
+        {"delta_p_mean": 1.0, "molecule_a_key": "K8", "molecule_b_key": "K1"},
+        {"delta_p_mean": 1.0, "molecule_a_key": "K8", "molecule_b_key": "K9"}])
+    flags = pipeline.excluded_type_column(records, {"K1"}, SUFFIX)
+    assert flags.to_pylist() == [True, True, False]
+
+
+def test_strip_suffix_only_removes_a_trailing_suffix() -> None:
+    assert pipeline.strip_suffix("AAA-BBB-N" + SUFFIX, SUFFIX) == "AAA-BBB-N"
+    assert pipeline.strip_suffix("AAA-BBB-N", SUFFIX) == "AAA-BBB-N"
+
+
+def test_chembl_type_pairs_reads_distinct_labelled_rows(tmp_path: Path,
+                                                        config: dict[str, Any]) -> None:
+    names = config["stage2b"]["columns"]
+    table = pa.table({names["inchikey"]: ["K1", "K1", "K2", "K3", None],
+                      names["molecule_chembl_type"]: ["Protein", "Protein", None,
+                                                      "Small molecule", "Protein"]})
+    pq.write_table(table, tmp_path / "src.parquet")
+    local = {"stage2b": dict(config["stage2b"], inputs={"chembl": "src.parquet",
+                                                        "bindingdb": "src.parquet"})}
+    pairs = pipeline.chembl_type_pairs(local, tmp_path)
+    assert sorted(zip(pairs.column("inchikey").to_pylist(),
+                      pairs.column("molecule_chembl_type").to_pylist())) == [
+        ("K1", "Protein"), ("K3", "Small molecule")]
+
+
+def assay_type_source(path: Path, config: dict[str, Any], types: list[str | None]) -> None:
+    names = config["stage2b"]["columns"]
+    rows = len(types)
+    pq.write_table(pa.table({
+        names["source"]: ["chembl"] * (rows - 1) + ["bindingdb"],
+        names["assay_id"]: ["A1"] * (rows - 1) + ["7"],
+        names["assay_entry_id"]: [None] * (rows - 1) + ["50"],
+        names["assay_type"]: pa.array(types, pa.string())}), path)
+
+
+def test_assay_type_map_keeps_typed_assays_only(tmp_path: Path,
+                                                config: dict[str, Any]) -> None:
+    assay_type_source(tmp_path / "src.parquet", config, ["B", "B", None])
+    local = dict(config, stage2b=dict(config["stage2b"], inputs={"chembl": "src.parquet"}))
+    assert pipeline.assay_type_map(local, tmp_path) == {"chembl::A1": "B"}
+
+
+def test_assay_type_map_refuses_an_assay_with_two_types(tmp_path: Path,
+                                                        config: dict[str, Any]) -> None:
+    assay_type_source(tmp_path / "src.parquet", config, ["B", "F", None])
+    local = dict(config, stage2b=dict(config["stage2b"], inputs={"chembl": "src.parquet"}))
+    with pytest.raises(ValueError, match="hai loại"):
+        pipeline.assay_type_map(local, tmp_path)
+
+
+def test_assay_type_columns_marks_mixed_binding_and_functional() -> None:
+    records = pa.table({"assay_keys": pa.array(
+        [["chembl::A1", "chembl::A2"], ["chembl::A1", "chembl::A3"],
+         ["bindingdb:5:1"], ["chembl::A2", "bindingdb:5:1"]], pa.list_(pa.string()))})
+    types = {"chembl::A1": "F", "chembl::A2": "B", "chembl::A3": "F"}
+    joined, mixed = pipeline.assay_type_columns(records, types, ";")
+    assert joined.to_pylist() == ["B;F", "F", None, "B"]
+    assert mixed.to_pylist() == [True, False, False, False]
+
+
+def test_scope_and_flag_columns_do_not_overlap() -> None:
+    assert not set(pipeline.SCOPE_COLUMNS) & set(pipeline.FLAG_COLUMNS)
+    assert not set(pipeline.SCOPE_COLUMNS) & set(pipeline.EVALUATOR_COLUMNS)
 
 
 def test_nonstandard_proteins_ignores_case_and_whitespace() -> None:

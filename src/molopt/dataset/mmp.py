@@ -132,9 +132,12 @@ def fragment_pieces(chains: Chem.Mol, settings: FragmentSettings
                     ) -> tuple[list[tuple[str, int]], bool]:
     """Hai mảnh của một lần cắt: [(SMILES chính tắc, số nguyên tử nặng)], mảnh có hợp lệ.
 
-    Hợp lệ khi mỗi mảnh có đúng `attachment_points` nguyên tử dummy và mọi dummy có bậc
-    `attachment_degree`. Với single cut trên liên kết đơn điều này luôn đúng; kiểm tra để
-    lỗi đầu vào bất thường hiện ra thành số đếm thay vì lặng lẽ sinh cặp sai.
+    Hợp lệ khi có đúng hai mảnh, mỗi mảnh có đúng `attachment_points` nguyên tử dummy và
+    mọi dummy có bậc `attachment_degree`. Với single cut trên liên kết đơn của phân tử MỘT
+    mảnh thì điều này luôn đúng. Phân tử nhiều mảnh (vd. còn ion đối) cho ba mảnh trở lên
+    nên bị loại ở đây: từ Stage 1 v2, SMILES đầu vào là parent đã bỏ muối (ChEMBL Structure
+    Pipeline), nên chỉ phân tử có molecule_parent_fragments > 1 rơi vào trường hợp này và
+    được đếm thành số cách cắt không hợp lệ, không lặng lẽ sinh cặp sai.
     """
     pieces, valid = [], True
     for fragment in Chem.GetMolFrags(chains, asMols=True, sanitizeFrags=False):

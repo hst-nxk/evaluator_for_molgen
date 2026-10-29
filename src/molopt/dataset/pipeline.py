@@ -1077,14 +1077,20 @@ def split_lines(manifest: Mapping[str, Any]) -> list[str]:
 
 
 FLAG_COLUMNS = ["unseen_pair", "plausible_range", "short_protein", "inactive_comment",
-                "nonstandard_sequence"]
+                "nonstandard_sequence", "mixed_assay_type"]
 # Cột cảnh báo của nguồn: chuỗi nguyên văn, không phải cờ bool, nên đếm riêng FLAG_COLUMNS.
 WARNING_COLUMN = "source_quality_warning"
-# Cờ phân tử lớn: chỉ có trong evidence; bản ghi mang cờ bị loại khỏi hai file training.
+# Hai cờ phạm vi "phân tử nhỏ" (yêu cầu 4 của buổi họp 26/10/2026): chỉ có trong evidence;
+# bản ghi mang MỘT trong hai cờ bị loại khỏi hai file training.
 LARGE_MOLECULE_COLUMN = "large_molecule"
-# Cột mô tả bằng chứng (số, không phải cờ bool), có ở cả hai file training. Không lọc gì.
+EXCLUDED_TYPE_COLUMN = "chembl_excluded_type"
+SCOPE_COLUMNS = [LARGE_MOLECULE_COLUMN, EXCLUDED_TYPE_COLUMN]
+# Cột mô tả bằng chứng (không phải cờ bool), có ở cả hai file training. Không lọc gì.
 EVIDENCE_COLUMNS = ["n_assays", "n_distinct_values", "n_documents", "qc_status",
-                    "min_target_confidence", "p_a_range", "max_replicate_std"]
+                    "min_target_confidence", "p_a_range", "max_replicate_std", "assay_types"]
+# Vai trò cột đọc lại từ đầu vào ở bước 5 (ánh xạ sang tên cột ở config stage2b.columns).
+SCOPE_ROLES = ("inchikey", "molecule_chembl_type")
+ASSAY_TYPE_ROLES = ("source", "assay_id", "assay_entry_id", "assay_type")
 EVALUATOR_COLUMNS = ["pair_id", "endpoint", "protein_hash", "partition", "smiles_a", "smiles_b",
                      "constant_smiles", "variable_a", "variable_b", "delta_p_mean",
                      *EVIDENCE_COLUMNS, *FLAG_COLUMNS, WARNING_COLUMN]
@@ -1178,13 +1184,127 @@ def large_molecule_column(records: pa.Table, cache: MutableMapping[str, float],
                           limit: float) -> pa.Array:
     """Cờ large_molecule: A hoặc B có khối lượng phân tử ≥ limit (Da).
 
-    Căn cứ ngưỡng 1000 Da: không gian thuốc uống "beyond rule of 5" có MW < 1000 Da
-    (Doak et al. 2014, Chem. Biol. 21, 1115, DOI 10.1016/j.chembiol.2014.08.013), nên
-    phân tử từ 1000 Da trở lên nằm ngoài phạm vi "small molecule" của dự án.
+    Căn cứ ngưỡng 1000 Da: ExCAPE-DB (Sun et al. 2017, J. Cheminform. 9:17, DOI
+    10.1186/s13321-017-0203-5), dựng từ ChEMBL và PubChem như dự án này, chỉ giữ hợp chất
+    có "molecular weight (MW) <1000 Da". Dự án chỉ lấy tiêu chí MW của bài, không lấy các
+    tiêu chí khác (số nguyên tử nặng, kim loại).
     """
     weight_a = molecular_weights(records.column("smiles_a").to_pylist(), cache)
     weight_b = molecular_weights(records.column("smiles_b").to_pylist(), cache)
     return pa.array((weight_a >= limit) | (weight_b >= limit), pa.bool_())
+
+
+def chembl_type_pairs(config: Mapping[str, Any], root: Path) -> pa.Table:
+    """Các cặp (InChIKey, loại phân tử ChEMBL) khác nhau trong đầu vào Stage 2b.
+
+    Nhận: config; thư mục gốc. Đọc lại các file đầu vào (chỉ hai cột).
+    Trả về: bảng hai cột inchikey, molecule_chembl_type, không trùng dòng; bỏ dòng thiếu
+    một trong hai. InChIKey ở đây là của parent (Stage 1 v2), cùng InChIKey dựng khóa
+    phân tử, nên nhãn của một dòng ChEMBL áp được cho mọi dòng cùng phân tử, kể cả dòng
+    BindingDB không ghi mã ChEMBL.
+    """
+    stage = config["stage2b"]
+    columns, run = stage["columns"], stage["run"]
+    names = [columns[role] for role in SCOPE_ROLES]
+    keys = list(SCOPE_ROLES)
+    parts: list[pa.Table] = []
+    for relative_path in stage["inputs"].values():
+        parquet = pq.ParquetFile(root / relative_path)
+        for batch in parquet.iter_batches(batch_size=run["batch_rows"], columns=names):
+            table = rename_roles(batch, columns, SCOPE_ROLES)
+            table = table.filter(pc.and_(non_empty(table.column("inchikey")),
+                                         non_empty(table.column("molecule_chembl_type"))))
+            parts.append(table.group_by(keys).aggregate([]))
+            if len(parts) >= run["molecule_merge_batches"]:
+                parts = [pa.concat_tables(parts).group_by(keys).aggregate([])]
+    if not parts:
+        return pa.table({key: pa.array([], pa.string()) for key in keys})
+    return pa.concat_tables(parts).group_by(keys).aggregate([]).select(keys)
+
+
+def excluded_type_keys(pairs: pa.Table,
+                       excluded: Sequence[str]) -> tuple[set[str], dict[str, Any]]:
+    """InChIKey mang loại phân tử ChEMBL nằm ngoài phạm vi, và số liệu để báo cáo.
+
+    Nhận: bảng của chembl_type_pairs; danh sách loại bị loại (config).
+    Trả về: (tập InChIKey có ÍT NHẤT MỘT dòng mang loại bị loại; số liệu gồm số phân tử
+    theo từng loại, số phân tử bị loại, và số phân tử mang cả loại bị loại lẫn loại khác).
+    Phân tử mang hai nhãn mâu thuẫn bị loại (cách thận trọng) và được đếm riêng để báo cáo.
+    """
+    wanted = set(excluded)
+    inchikeys = pairs.column("inchikey").to_pylist()
+    labels = pairs.column("molecule_chembl_type").to_pylist()
+    flagged = {key for key, label in zip(inchikeys, labels) if label in wanted}
+    others = {key for key, label in zip(inchikeys, labels) if label not in wanted}
+    return flagged, {"molecules_by_type": dict(sorted(Counter(labels).items())),
+                     "excluded_molecules": len(flagged),
+                     "conflicting_molecules": len(flagged & others)}
+
+
+def strip_suffix(key: str, suffix: str) -> str:
+    """Khóa phân tử -> InChIKey: bỏ hậu tố lập thể tương đối nếu có."""
+    return key[:-len(suffix)] if suffix and key.endswith(suffix) else key
+
+
+def excluded_type_column(records: pa.Table, flagged: set[str], suffix: str) -> pa.Array:
+    """Cờ chembl_excluded_type: A hoặc B mang loại phân tử ChEMBL nằm ngoài phạm vi.
+
+    Khóa phân tử có thể mang hậu tố lập thể tương đối; nhãn là của chất (InChIKey), nên
+    bỏ hậu tố trước khi tra.
+    """
+    flags = [strip_suffix(a, suffix) in flagged or strip_suffix(b, suffix) in flagged
+             for a, b in zip(records.column("molecule_a_key").to_pylist(),
+                             records.column("molecule_b_key").to_pylist())]
+    return pa.array(flags, pa.bool_())
+
+
+def assay_type_map(config: Mapping[str, Any], root: Path) -> dict[str, str]:
+    """assay_key -> loại assay của nguồn (ChEMBL: B, F, A, ...); assay không có loại thì vắng.
+
+    Nhận: config; thư mục gốc. Đọc lại các file đầu vào (chỉ các cột assay).
+    Trả về: từ điển chỉ gồm assay có loại; BindingDB không có trường tương đương nên mọi
+    assay BindingDB vắng mặt. Khóa tính bằng chính assay_keys nên khớp khóa ở bước 1-4.
+    Một assay mang hai loại khác nhau là lỗi dữ liệu: dừng, không chọn bừa một loại.
+    """
+    stage = config["stage2b"]
+    columns, run = stage["columns"], stage["run"]
+    names = [columns[role] for role in ASSAY_TYPE_ROLES]
+    found: dict[str, str] = {}
+    for relative_path in stage["inputs"].values():
+        parquet = pq.ParquetFile(root / relative_path)
+        for batch in parquet.iter_batches(batch_size=run["batch_rows"], columns=names):
+            table = rename_roles(batch, columns, ASSAY_TYPE_ROLES)
+            table = table.filter(non_empty(table.column("assay_type")))
+            if not table.num_rows:
+                continue
+            distinct = pa.table({"assay_key": assay_keys(table),
+                                 "assay_type": table.column("assay_type")}
+                                ).group_by(["assay_key", "assay_type"]).aggregate([])
+            for key, kind in zip(distinct.column("assay_key").to_pylist(),
+                                 distinct.column("assay_type").to_pylist()):
+                if found.setdefault(key, kind) != kind:
+                    raise ValueError(f"assay {key!r} mang hai loại assay: "
+                                     f"{found[key]!r} và {kind!r}")
+    LOGGER.info("assay có loại assay của nguồn: %s", fmt_int(len(found)))
+    return found
+
+
+def assay_type_columns(records: pa.Table, types: Mapping[str, str],
+                       separator: str) -> tuple[pa.Array, pa.Array]:
+    """(assay_types, mixed_assay_type) cho từng bản ghi.
+
+    assay_types: các loại assay KHÁC NHAU của những assay đóng góp đã biết loại, sắp xếp
+    rồi nối bằng separator (vd. 'B', 'B;F'); null khi không assay nào có loại (bản ghi
+    chỉ từ BindingDB). mixed_assay_type: có từ hai loại trở lên, tức Δp đo khả năng gắn
+    (B) và Δp đo đáp ứng chức năng (F) bị gộp chung vào một bản ghi. Chỉ mô tả, không lọc.
+    """
+    joined: list[str | None] = []
+    mixed: list[bool] = []
+    for assays in records.column("assay_keys").to_pylist():
+        kinds = sorted({types[key] for key in assays if key in types})
+        joined.append(separator.join(kinds) if kinds else None)
+        mixed.append(len(kinds) > 1)
+    return pa.array(joined, pa.string()), pa.array(mixed, pa.bool_())
 
 
 def value_bounds(path: Path, pair_ids: pa.Array) -> tuple[np.ndarray, np.ndarray]:
@@ -1467,9 +1587,9 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     """Bước 5: hai file training (evaluator, generator) và một file evidence.
 
     Phần training chỉ gồm bản ghi đủ điều kiện (qc_status thuộc export.eligible_qc và
-    không mang cờ large_molecule); phần evidence giữ MỌI bản ghi, kể cả quarantine và phân
-    tử lớn, nối với training bằng pair_id. Bộ lọc chỉ quyết định tính đủ điều kiện, không
-    xóa evidence.
+    không mang cờ nào trong SCOPE_COLUMNS: large_molecule, chembl_excluded_type); phần
+    evidence giữ MỌI bản ghi, kể cả quarantine và phân tử ngoài phạm vi, nối với training
+    bằng pair_id. Bộ lọc chỉ quyết định tính đủ điều kiện, không xóa evidence.
     Split được đọc từ protein_split.parquet; hàm này không tự dựng split.
     """
     settings = config["stage2b"]
@@ -1494,6 +1614,16 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     separator = settings["export"]["source_quality_separator"]
     endpoints = list(config["endpoints"])
     comments = source_quality_comments(config, root, settings["export"])
+    suffix = settings["identity"]["relative_stereo_suffix"]
+    excluded_types = list(export["excluded_chembl_types"])
+    flagged_keys, type_stats = excluded_type_keys(chembl_type_pairs(config, root),
+                                                  excluded_types)
+    LOGGER.info("phân tử mang loại ChEMBL %s: %s (mâu thuẫn nhãn: %s)", excluded_types,
+                fmt_int(type_stats["excluded_molecules"]),
+                fmt_int(type_stats["conflicting_molecules"]))
+    types = assay_type_map(config, root)
+    type_separator = export["assay_type_separator"]
+    assay_type_counts: Counter = Counter()
     codes, train_codes = train_pair_codes(full, endpoints, assignment)
     started = time.perf_counter()
 
@@ -1528,20 +1658,27 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
                 records = records.append_column("nonstandard_sequence", pa.array(
                     [key in unusual for key in records.column("protein_hash").to_pylist()],
                     pa.bool_()))
+                joined, mixed = assay_type_columns(records, types, type_separator)
+                records = records.append_column("assay_types", joined)
+                records = records.append_column("mixed_assay_type", mixed)
+                assay_type_counts.update(joined.to_pylist())
                 large = large_molecule_column(records, weights, weight_limit)
                 records = records.append_column(LARGE_MOLECULE_COLUMN, large)
-                counts[f"{LARGE_MOLECULE_COLUMN}_true"] += int(pc.sum(large).as_py() or 0)
-                for flag in FLAG_COLUMNS:
+                records = records.append_column(EXCLUDED_TYPE_COLUMN, excluded_type_column(
+                    records, flagged_keys, suffix))
+                out_of_scope = pc.or_(large, records.column(EXCLUDED_TYPE_COLUMN))
+                for flag in [*SCOPE_COLUMNS, *FLAG_COLUMNS]:
                     counts[f"{flag}_true"] += int(pc.sum(records.column(flag)).as_py() or 0)
+                counts["out_of_scope_true"] += int(pc.sum(out_of_scope).as_py() or 0)
                 warning_counts.update(
                     value for value in records.column(WARNING_COLUMN).to_pylist()
                     if value is not None)
                 evidence = records
                 qc_eligible = pc.is_in(records.column("qc_status"),
                                        value_set=pa.array(eligible, pa.string()))
-                counts["eligible_qc_large_molecule"] += int(
-                    pc.sum(pc.and_(qc_eligible, large)).as_py() or 0)
-                training = records.filter(pc.and_(qc_eligible, pc.invert(large)))
+                counts["eligible_qc_out_of_scope"] += int(
+                    pc.sum(pc.and_(qc_eligible, out_of_scope)).as_py() or 0)
+                training = records.filter(pc.and_(qc_eligible, pc.invert(out_of_scope)))
                 evaluator = training.select(EVALUATOR_COLUMNS)
                 generator = oriented_generator_rows(training, min_gain)
                 for key, table in (("evidence_records", evidence), ("evaluator", evaluator),
@@ -1568,13 +1705,23 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
         "parameters": settings["export"],
         "rows": dict(counts),
         "flags": {flag: counts[f"{flag}_true"] for flag in FLAG_COLUMNS},
-        "large_molecule": {
+        "molecule_scope": {
             "limit_dalton": weight_limit,
-            "evidence_records": counts[f"{LARGE_MOLECULE_COLUMN}_true"],
-            "excluded_from_training": counts["eligible_qc_large_molecule"],
+            "excluded_chembl_types": excluded_types,
+            "evidence_records_large_molecule": counts[f"{LARGE_MOLECULE_COLUMN}_true"],
+            "evidence_records_excluded_type": counts[f"{EXCLUDED_TYPE_COLUMN}_true"],
+            "evidence_records_either": counts["out_of_scope_true"],
+            "excluded_from_training": counts["eligible_qc_out_of_scope"],
             "distinct_molecules_weighed": len(weights),
             "distinct_large_molecules": sum(value >= weight_limit
                                             for value in weights.values()),
+            "chembl_types": type_stats,
+        },
+        "assay_type": {
+            "assays_with_type": len(types),
+            "records_by_types": {str(key): value for key, value in sorted(
+                assay_type_counts.items(), key=lambda item: -item[1])},
+            "mixed_records": counts["mixed_assay_type_true"],
         },
         "source_quality_warning": {
             "observations_with_warning": len(comments),
@@ -1589,8 +1736,11 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
                       "không có cảnh báo hoặc nguồn không có cột tương đương. "
                       "inactive_comment: ít nhất một phép đo đóng góp có activity_comment "
                       "thuộc export.inactive_comments. nonstandard_sequence: chuỗi protein "
-                      "có ký tự ngoài export.protein_alphabet. min_target_confidence (cột "
-                      "bằng chứng, không phải cờ): confidence_score nhỏ nhất của ChEMBL, "
+                      "có ký tự ngoài export.protein_alphabet. mixed_assay_type: các assay "
+                      "đóng góp có từ hai loại assay khác nhau (vd. B và F). "
+                      "min_target_confidence (cột bằng chứng, không phải cờ): "
+                      "confidence_score nhỏ nhất của ChEMBL, null khi bản ghi chỉ có "
+                      "BindingDB. assay_types (cột bằng chứng): các loại assay đã biết, "
                       "null khi bản ghi chỉ có BindingDB."),
         "min_target_confidence": dict(sorted(confidence_counts.items(),
                                              key=lambda item: (item[0] is None, item[0]))),
@@ -1608,11 +1758,20 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     by_count = sorted(warning_counts.items(), key=lambda item: -item[1])
     warning_table = [[value, fmt_int(number), fmt_pct(number, counts["evidence_records"])]
                      for value, number in by_count]
+    type_rows = [[str(value), fmt_int(number), fmt_pct(number, counts["evidence_records"])]
+                 for value, number in sorted(assay_type_counts.items(),
+                                             key=lambda item: -item[1])]
     log_lines(["Bước 5 — xuất dataset:", *format_table(["file", "dòng"], rows), "",
-               f"Phân tử lớn (MW ≥ {weight_limit:g} Da, A hoặc B): "
-               f"{fmt_int(counts[f'{LARGE_MOLECULE_COLUMN}_true'])} bản ghi evidence; "
-               f"{fmt_int(counts['eligible_qc_large_molecule'])} bản ghi đủ điều kiện QC "
+               "Phạm vi phân tử nhỏ (A hoặc B), bản ghi evidence:",
+               f"  MW ≥ {weight_limit:g} Da: "
+               f"{fmt_int(counts[f'{LARGE_MOLECULE_COLUMN}_true'])}",
+               f"  loại ChEMBL {excluded_types}: "
+               f"{fmt_int(counts[f'{EXCLUDED_TYPE_COLUMN}_true'])}",
+               f"  một trong hai: {fmt_int(counts['out_of_scope_true'])}; "
+               f"{fmt_int(counts['eligible_qc_out_of_scope'])} bản ghi đủ điều kiện QC "
                "bị loại khỏi training.", "",
+               "Loại assay của các assay đóng góp (None = chỉ BindingDB, không có loại):",
+               *format_table(["assay_types", "số bản ghi", "tỷ lệ"], type_rows), "",
                "Cờ mô tả trên evidence (không lọc gì):",
                *format_table(["cờ", "số dòng True", "tỷ lệ"], flags), "",
                f"{WARNING_COLUMN} — cảnh báo của chính nguồn, nguyên văn, không lọc gì "
@@ -2000,8 +2159,8 @@ def check_export(config: Mapping[str, Any], root: Path, layout: Layout,
                  endpoints: Sequence[str]) -> dict[str, Any]:
     """Phần xuất khớp phần bản ghi: evidence đủ mọi bản ghi, training chỉ bản ghi đủ điều kiện.
 
-    Đủ điều kiện = qc_status thuộc eligible_qc và không mang cờ large_molecule; số này đếm
-    trên chính file evidence, vì cờ phân tử lớn chỉ có ở đó.
+    Đủ điều kiện = qc_status thuộc eligible_qc và không mang cờ nào trong SCOPE_COLUMNS;
+    số này đếm trên chính file evidence, vì các cờ phạm vi chỉ có ở đó.
     """
     settings = config["stage2b"]
     _, dataset = layouts(config, root)
@@ -2014,11 +2173,15 @@ def check_export(config: Mapping[str, Any], root: Path, layout: Layout,
     records = sum(pq.ParquetFile(path).metadata.num_rows for endpoint in endpoints
                   for path in layout.bucket_files("records_dir", endpoint))
     evidence_table = pq.read_table(files["evidence_records"],
-                                   columns=["qc_status", LARGE_MOLECULE_COLUMN])
+                                   columns=["qc_status", *SCOPE_COLUMNS])
+    out_of_scope = evidence_table.column(SCOPE_COLUMNS[0])
+    for name in SCOPE_COLUMNS[1:]:
+        out_of_scope = pc.or_(out_of_scope, evidence_table.column(name))
+    in_scope = pc.invert(out_of_scope)
     eligible_rows = int(pc.sum(pc.and_(
         pc.is_in(evidence_table.column("qc_status"),
                  value_set=pa.array(sorted(eligible), pa.string())),
-        pc.invert(evidence_table.column(LARGE_MOLECULE_COLUMN)))).as_py() or 0)
+        in_scope)).as_py() or 0)
     evidence = evidence_table.num_rows
     evaluator = pq.ParquetFile(files["evaluator"]).metadata.num_rows
     generator_table = pq.read_table(files["generator"], columns=["gain", "partition"])
