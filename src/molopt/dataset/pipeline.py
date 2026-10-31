@@ -1,6 +1,8 @@
 """Stage 2b: điều phối Observations -> dataset cặp MMP có Δp.
 
 Luồng (mỗi bước ở một module riêng, file này chỉ nối chúng lại và lo I/O):
+    làm sạch  curation.py                 : quy tắc loại dòng (có nguồn), ghi bảng loại
+        excluded_observations kèm lý do của từng dòng.
     lượt gom (pass 1): đọc hai bản sao dedup, lọc dòng đủ điều kiện, dựng assay_key và
         khóa phân tử, ghi ra shard theo (endpoint, bucket protein); đồng thời dựng bảng
         phân tử (SMILES đại diện) và bảng protein.
@@ -28,7 +30,7 @@ import shutil
 import time
 import zlib
 from collections import Counter
-from collections.abc import Iterator, Mapping, MutableMapping, Sequence
+from collections.abc import Iterator, Mapping, MutableMapping, Sequence, Set
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,13 +38,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
-from molopt.dataset import aggregate, delta, mmp, split
+from molopt.dataset import aggregate, curation, delta, mmp, split
 
 LOGGER = logging.getLogger(__name__)
 
@@ -76,8 +79,21 @@ HEX_PAIRS = [f"{value:02x}" for value in range(256)]
 # lại sau mỗi bước nên nhãn phải cố định ở một chỗ.
 FILTER_LABELS = ("dedup_keep", "qualifier '='", "protein resolved", "assay resolved",
                  "có pActivity", "có InChIKey", "có SMILES")
+# Bước sau cùng của phễu: dòng không bị bước làm sạch (curation) loại.
+CURATION_LABEL = "không bị loại khi làm sạch"
 FUNNEL_ALL = "tất cả"
 FUNNEL_SMOKE = "mẫu smoke"
+# Vai trò cột bước làm sạch cần thêm ngoài LOAD_ROLES (JSON assay, mô tả, biến thể, lý do
+# dedup của Stage 2a).
+CURATION_ROLES = LOAD_ROLES + ("assay_context", "assay_description", "protein_variant_id",
+                               "dedup_reason")
+EXCLUDED_SCHEMA = pa.schema([
+    ("observation_id", pa.string()),
+    ("source", pa.string()),
+    ("assay_key", pa.string()),
+    ("endpoint", pa.string()),
+    ("reasons", pa.list_(pa.string())),
+])
 
 
 # --------------------------------------------------------------------------- định dạng
@@ -201,6 +217,12 @@ def filter_steps(table: pa.Table, exact_qualifiers: Sequence[str],
         non_empty(table.column("smiles")),
     ]
     return list(zip(FILTER_LABELS, masks))
+
+
+def curation_step(table: pa.Table, excluded: pa.Array) -> tuple[str, Any]:
+    """Bước lọc cuối: dòng có observation_id nằm trong bảng loại của bước làm sạch bị bỏ."""
+    return CURATION_LABEL, pc.invert(pc.is_in(table.column("observation_id"),
+                                              value_set=excluded))
 
 
 def combined_mask(steps: Sequence[tuple[str, Any]]) -> list[tuple[str, Any]]:
@@ -383,10 +405,11 @@ class ShardWriter:
 
 
 def collect_rows(config: Mapping[str, Any], root: Path, layout: Layout,
-                 modulus: int | None) -> dict[str, Any]:
+                 modulus: int | None, excluded: pa.Array) -> dict[str, Any]:
     """Lượt gom: đọc hai bản sao dedup, lọc, ghi shard, dựng bảng phân tử và protein.
 
-    Nhận: config; thư mục gốc dự án; layout output; modulus lấy mẫu smoke (None = lấy hết).
+    Nhận: config; thư mục gốc dự án; layout output; modulus lấy mẫu smoke (None = lấy hết);
+    observation_id bị bước làm sạch loại (build_exclusions).
     Trả về: thống kê (phễu lọc theo endpoint, số dòng mỗi nguồn, số shard, số phân tử,
     số protein).
     Đọc theo batch, mỗi batch ghi ngay ra shard, nên bộ nhớ không phụ thuộc kích thước
@@ -406,7 +429,7 @@ def collect_rows(config: Mapping[str, Any], root: Path, layout: Layout,
                                 run["molecule_merge_batches"])
     writer = ShardWriter(layout, "shards_dir")
     funnel = {label: np.zeros(len(endpoints), dtype=np.int64)
-              for label in [FUNNEL_ALL, *FILTER_LABELS]
+              for label in [FUNNEL_ALL, *FILTER_LABELS, CURATION_LABEL]
               + ([FUNNEL_SMOKE] if modulus else [])}
     source_rows: dict[str, int] = {}
 
@@ -423,7 +446,8 @@ def collect_rows(config: Mapping[str, Any], root: Path, layout: Layout,
                 table = table.append_column("assay_key", assay_keys(table))
                 codes = endpoint_codes(table.column("endpoint"), endpoints)
                 steps = combined_mask(filter_steps(table, config["qualifiers"]["exact"],
-                                                   settings["filter"]["resolved_status"]))
+                                                   settings["filter"]["resolved_status"])
+                                      + [curation_step(table, excluded)])
                 funnel[FUNNEL_ALL] += np.bincount(codes[codes >= 0],
                                                   minlength=len(endpoints))
                 for label, mask in steps:
@@ -497,10 +521,152 @@ def write_shards(writer: ShardWriter, rows: pa.Table, codes: np.ndarray,
                          ordered.slice(first, last - first))
 
 
+# --------------------------------------------------------------------------- làm sạch
+
+
+def build_exclusions(config: Mapping[str, Any], root: Path,
+                     layout: Layout) -> tuple[pa.Array, dict[str, Any]]:
+    """Bước làm sạch: áp stage2b.curation lên mọi dòng đã qua bộ lọc cơ bản, ghi bảng loại.
+
+    Nhận: config; thư mục gốc dự án; layout output (bảng loại ghi vào file
+    excluded_observations của layout).
+    Trả về: (observation_id bị loại, thống kê theo nguồn và theo quy tắc).
+    Luôn đọc toàn bộ hai bản sao dedup, kể cả khi chạy smoke, vì quy tắc theo nhóm cần mọi
+    dòng của một assay và của một phân tử. Dữ liệu đầu vào chỉ được đọc.
+    """
+    settings = config["stage2b"]
+    rules = settings["curation"]
+    curation.check_rule_names(rules["rules"])
+    columns, run = settings["columns"], settings["run"]
+    pattern = config["stage2a"]["dedup"]["relative_stereo_pattern"]
+    suffix = settings["identity"]["relative_stereo_suffix"]
+    names = [columns[role] for role in CURATION_ROLES]
+    cache: dict[str, bool] = {}
+    flag_parts: dict[str, list[np.ndarray]] = {reason: [] for reason in curation.ROW_REASONS}
+    group_parts: list[pa.Table] = []
+    sources: list[str] = []
+    json_checked = 0
+    for source, relative_path in settings["inputs"].items():
+        is_chembl = source == rules["chembl_input"]
+        parquet = pq.ParquetFile(root / relative_path)
+        for batch in parquet.iter_batches(batch_size=run["batch_rows"], columns=names):
+            table = rename_roles(batch, columns, CURATION_ROLES)
+            table = table.append_column("assay_key", assay_keys(table))
+            base = combined_mask(filter_steps(table, config["qualifiers"]["exact"],
+                                              settings["filter"]["resolved_status"]))[-1][1]
+            kept = table.filter(base)
+            if not kept.num_rows:
+                continue
+            check_rows = rules["json_check_rows"] if is_chembl and not json_checked else 0
+            flags = curation.row_reasons(kept, is_chembl, rules, cache, check_rows)
+            json_checked += min(check_rows, kept.num_rows)
+            for reason in curation.ROW_REASONS:
+                flag_parts[reason].append(flags[reason])
+            relative = mmp.relative_stereo_mask(kept.column("cx_extension"), pattern)
+            group_parts.append(pa.table({
+                "observation_id": kept.column("observation_id"),
+                "assay_key": kept.column("assay_key"),
+                "protein_hash": kept.column("protein_hash"),
+                "endpoint": kept.column("endpoint"),
+                "molecule_key": mmp.identity_keys(kept.column("inchikey"), relative, suffix),
+                "p_activity": pc.cast(kept.column("p_activity"), pa.float64())}))
+            sources.extend([source] * kept.num_rows)
+        LOGGER.info("làm sạch: đã đọc %s (%s dòng qua bộ lọc cơ bản)", source,
+                    fmt_int(sum(part.num_rows for part in group_parts)))
+    if not json_checked:
+        raise ValueError("bước làm sạch không so được regex với json.loads trên dòng ChEMBL nào")
+    rows = pa.concat_tables(group_parts)
+    frame = pa.table({name: (rows.column(name).dictionary_encode()
+                             if name in ("assay_key", "protein_hash", "endpoint",
+                                         "molecule_key") else rows.column(name))
+                      for name in curation.GROUP_COLUMNS if name != "observation_id"}
+                     ).to_pandas()
+    flags = {reason: np.concatenate(parts) for reason, parts in flag_parts.items()}
+    row_excluded = np.logical_or.reduce([flags[reason] for reason in curation.ROW_REASONS])
+    flags.update(curation.group_reasons(frame, rules, row_excluded))
+    del frame
+    excluded = np.zeros(rows.num_rows, dtype=bool)
+    for values in flags.values():
+        excluded |= values
+    positions = pa.array(np.flatnonzero(excluded), pa.int64())
+    source_array = np.asarray(sources, dtype=object)
+    table = pa.table({
+        "observation_id": pc.take(rows.column("observation_id"), positions),
+        "source": pa.array(source_array[excluded].tolist(), pa.string()),
+        "assay_key": pc.take(rows.column("assay_key"), positions),
+        "endpoint": pc.take(rows.column("endpoint"), positions),
+        "reasons": pa.array(curation.reason_lists(
+            {reason: values[excluded] for reason, values in flags.items()}),
+            pa.list_(pa.string())),
+    }, schema=EXCLUDED_SCHEMA)
+    write_parquet(table, layout.file("excluded_observations"))
+    stats = exclusion_stats(flags, excluded, source_array, rows.column("endpoint"),
+                            list(settings["inputs"]), list(config["endpoints"]))
+    stats["json_rows_checked"] = json_checked
+    stats["file"] = str(layout.file("excluded_observations"))
+    return table.column("observation_id").combine_chunks(), stats
+
+
+def exclusion_stats(flags: Mapping[str, np.ndarray], excluded: np.ndarray, sources: np.ndarray,
+                    endpoints: pa.ChunkedArray, source_names: Sequence[str],
+                    endpoint_names: Sequence[str]) -> dict[str, Any]:
+    """Số dòng của bước làm sạch theo nguồn và theo endpoint.
+
+    Theo nguồn: qua bộ lọc cơ bản, bị loại (hợp mọi quy tắc), còn lại, và với mỗi quy tắc số
+    dòng nó bắt cùng số dòng chỉ bị nó bắt. Theo endpoint: qua bộ lọc cơ bản và bị loại.
+    """
+    by_source: dict[str, Any] = {}
+    for name in source_names:
+        mask = sources == name
+        by_source[name] = {
+            "base_rows": int(mask.sum()),
+            "excluded_rows": int((excluded & mask).sum()),
+            "kept_rows": int((~excluded & mask).sum()),
+            "rules": curation.reason_counts({reason: values[mask]
+                                             for reason, values in flags.items()}),
+        }
+    endpoint_values = np.asarray(endpoints.to_pylist(), dtype=object)
+    by_endpoint = {name: {"base_rows": int((endpoint_values == name).sum()),
+                          "excluded_rows": int((excluded & (endpoint_values == name)).sum())}
+                   for name in endpoint_names}
+    return {"by_source": by_source, "by_endpoint": by_endpoint,
+            "excluded_rows": int(excluded.sum()), "base_rows": int(excluded.size)}
+
+
+def exclusion_lines(stats: Mapping[str, Any]) -> list[str]:
+    """Bảng của bước làm sạch: mỗi quy tắc bắt bao nhiêu dòng ở mỗi nguồn."""
+    sources = list(stats["by_source"])
+    rows = []
+    for reason in curation.REASONS:
+        cells = [reason]
+        for source in sources:
+            counts = stats["by_source"][source]["rules"][reason]
+            cells += [fmt_int(counts["rows"]), fmt_int(counts["only_this_rule"])]
+        rows.append(cells)
+    rows.append(["HỢP (bị loại)", *[cell for source in sources for cell in
+                                     (fmt_int(stats["by_source"][source]["excluded_rows"]),
+                                      "")]])
+    rows.append(["qua bộ lọc cơ bản", *[cell for source in sources for cell in
+                                        (fmt_int(stats["by_source"][source]["base_rows"]), "")]])
+    headers = ["quy tắc", *[label for source in sources
+                           for label in (f"{source}: dòng", f"{source}: chỉ quy tắc này")]]
+    return ["Bước làm sạch (stage2b.curation), số dòng bị từng quy tắc bắt:",
+            *format_table(headers, rows)]
+
+
+def load_exclusions(layout: Layout) -> pa.Array:
+    """observation_id đã bị bước làm sạch loại, đọc lại từ bảng loại của layout."""
+    path = layout.file("excluded_observations")
+    if not path.is_file():
+        raise FileNotFoundError(f"chưa có bảng loại {path}; chạy lại --mode full")
+    return pq.read_table(path, columns=["observation_id"]).column(
+        "observation_id").combine_chunks()
+
+
 # --------------------------------------------------------------------------- bước 1 → 4
 
 
-DOCUMENT_ROLES = ("source", "assay_id", "assay_entry_id", "document_pmid", "document_doi",
+DOCUMENT_ROLES =("source", "assay_id", "assay_entry_id", "document_pmid", "document_doi",
                   "document_patent", "document_id")
 
 
@@ -822,8 +988,11 @@ def run_pipeline(config: Mapping[str, Any], root: Path, out_root: Path,
     out_root.mkdir(parents=True, exist_ok=True)
 
     started = time.perf_counter()
-    collected = collect_rows(config, root, layout, modulus)
-    collect_seconds = time.perf_counter() - started
+    excluded, curated = build_exclusions(config, root, layout)
+    curation_seconds = time.perf_counter() - started
+    log_lines(exclusion_lines(curated))
+    collected = collect_rows(config, root, layout, modulus, excluded)
+    collect_seconds = time.perf_counter() - started - curation_seconds
     log_lines(funnel_lines(collected))
 
     molecules = pq.read_table(layout.file("molecules"), columns=["molecule_key", "smiles"])
@@ -862,11 +1031,13 @@ def run_pipeline(config: Mapping[str, Any], root: Path, out_root: Path,
                             "rows": collected["source_rows"].get(source)}
                    for source, path in settings["inputs"].items()},
         "parameters": {key: settings[key] for key in
-                       ("filter", "replicate", "identity", "mmp", "delta", "qc")},
+                       ("filter", "curation", "replicate", "identity", "mmp", "delta", "qc")},
+        "curation": curated,
         "collected": collected,
         "per_endpoint": per_endpoint,
         "totals": merge_stats(list(per_endpoint.values())),
-        "seconds": {"gom_dong": round(collect_seconds, 1),
+        "seconds": {"lam_sach": round(curation_seconds, 1),
+                    "gom_dong": round(collect_seconds, 1),
                     "buoc_1_den_4": round(pairs_seconds, 1),
                     "tong": round(time.perf_counter() - started, 1)},
     }
@@ -1077,7 +1248,11 @@ def split_lines(manifest: Mapping[str, Any]) -> list[str]:
 
 
 FLAG_COLUMNS = ["unseen_pair", "plausible_range", "short_protein", "inactive_comment",
-                "nonstandard_sequence", "mixed_assay_type"]
+                "nonstandard_sequence", "mixed_assay_type",
+                "residual_top_concentration", "residual_top_concentration_both"]
+# Hai cờ phần dư của quy tắc trần nồng độ, xem residual_tie_keys.
+RESIDUAL_TIE_COLUMN = "residual_top_concentration"
+RESIDUAL_BOTH_COLUMN = "residual_top_concentration_both"
 # Cột cảnh báo của nguồn: chuỗi nguyên văn, không phải cờ bool, nên đếm riêng FLAG_COLUMNS.
 WARNING_COLUMN = "source_quality_warning"
 # Hai cờ phạm vi "phân tử nhỏ" (yêu cầu 4 của buổi họp 26/10/2026): chỉ có trong evidence;
@@ -1098,6 +1273,69 @@ GENERATOR_COLUMNS = ["pair_id", "endpoint", "protein_hash", "partition", "smiles
                      "smiles_strong", "constant_smiles", "variable_weak", "variable_strong",
                      "gain", *EVIDENCE_COLUMNS, *FLAG_COLUMNS, WARNING_COLUMN]
 PAIR_CODE_SHIFT = 31
+
+
+def residual_tie_keys(config: Mapping[str, Any], root: Path,
+                      layout: Layout) -> set[tuple[str, str, str, str]]:
+    """Khóa phân tử CÒN nằm ở giá trị yếu nhất của assay sau khi mọi bộ lọc đã chạy.
+
+    Nhận: config; thư mục gốc (chỉ để giữ chữ ký giống các hàm bước 5); layout của full.
+    Trả về: tập (assay_key, protein_hash, endpoint, molecule_key).
+
+    Vì sao cần: bước làm sạch (stage2b.curation) chạy MỘT lượt trên các dòng vừa qua bộ lọc
+    cơ bản. Sau khi nó bỏ các phân tử ở mức yếu nhất, một mức yếu nhất mới có thể lộ ra
+    trong phần còn lại — giống bóc lớp hành. Hàm này đo lại ĐÚNG quy tắc đó
+    (``curation.tie_keys``, cùng ngưỡng trong config) trên các dòng đã vào shard, để **gắn
+    cờ** phần dư chứ KHÔNG xóa.
+
+    Vì sao không xóa tiếp: mô phỏng lặp quy tắc đến khi hết (31/10/2026,
+    runs/audit/simulate_tie_iteration_20261031.txt) phải chạy 44 lượt, bỏ thêm 4.254
+    phân tử-assay, trong đó 1.815 (43 %) đến từ các nhóm lớn (>= 50 phân tử) mà phần bị bỏ
+    chiếm dưới 10 % nhóm — tức là trùng hợp ở độ phân giải 0,01 chứ không phải trần nồng
+    độ. Xóa tiếp thì mất dữ liệu đo thật nhiều hơn phần bẩn dọn được.
+    """
+    settings = config["stage2b"]["curation"]
+    min_ties = int(settings["rules"][curation.TOP_CONCENTRATION]["min_molecules_at_minimum"])
+    decimals = int(settings["value_decimals"])
+    columns = ["assay_key", "protein_hash", "molecule_key", "p_activity"]
+    frames: list[pd.DataFrame] = []
+    for endpoint in config["endpoints"]:
+        for shard in layout.bucket_files("shards_dir", endpoint):
+            frame = pq.read_table(shard, columns=columns).to_pandas()
+            if not len(frame):
+                continue
+            frame["endpoint"] = endpoint
+            frames.append(frame)
+    if not frames:
+        return set()
+    rows = pd.concat(frames, ignore_index=True)
+    for name in curation.MOLECULE_COLUMNS:
+        rows[name] = rows[name].astype(str)
+    keys = curation.tie_keys(curation.molecule_means(rows), min_ties, decimals)
+    return set(map(tuple, keys[curation.MOLECULE_COLUMNS].to_numpy()))
+
+
+def residual_tie_columns(records: pa.Table,
+                         keys: Set[tuple[str, str, str, str]]) -> tuple[pa.Array, pa.Array]:
+    """(cờ một phía, cờ cả hai phía) của phần dư trần nồng độ, cho từng bản ghi.
+
+    Một bản ghi bị gắn cờ khi một phía của cặp là phân tử nằm trong ``keys`` ở một trong
+    các assay đã đóng góp vào Δp của nó. Cờ "cả hai phía" tách riêng trường hợp nặng hơn:
+    cả A lẫn B đều ở mức yếu nhất, nên Δp ~ 0 có thể là giả.
+    """
+    proteins = records.column("protein_hash").to_pylist()
+    endpoints = records.column("endpoint").to_pylist()
+    first = records.column("molecule_a_key").to_pylist()
+    second = records.column("molecule_b_key").to_pylist()
+    either: list[bool] = []
+    both: list[bool] = []
+    for index, assays in enumerate(records.column("assay_keys").to_pylist()):
+        stem = (proteins[index], endpoints[index])
+        hit_a = any((str(assay), *stem, first[index]) in keys for assay in assays)
+        hit_b = any((str(assay), *stem, second[index]) in keys for assay in assays)
+        either.append(hit_a or hit_b)
+        both.append(hit_a and hit_b)
+    return pa.array(either, pa.bool_()), pa.array(both, pa.bool_())
 
 
 def pair_codes(table: pa.Table, codes: MutableMapping[str, int] | Mapping[str, int],
@@ -1625,6 +1863,9 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     type_separator = export["assay_type_separator"]
     assay_type_counts: Counter = Counter()
     codes, train_codes = train_pair_codes(full, endpoints, assignment)
+    residual_ties = residual_tie_keys(config, root, full)
+    LOGGER.info("phần dư trần nồng độ: %s phân tử-assay vẫn ở mức yếu nhất sau mọi bộ lọc "
+                "(chỉ gắn cờ, không xóa)", fmt_int(len(residual_ties)))
     started = time.perf_counter()
 
     writers: dict[str, pq.ParquetWriter] = {}
@@ -1661,6 +1902,9 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
                 joined, mixed = assay_type_columns(records, types, type_separator)
                 records = records.append_column("assay_types", joined)
                 records = records.append_column("mixed_assay_type", mixed)
+                either, both = residual_tie_columns(records, residual_ties)
+                records = records.append_column(RESIDUAL_TIE_COLUMN, either)
+                records = records.append_column(RESIDUAL_BOTH_COLUMN, both)
                 assay_type_counts.update(joined.to_pylist())
                 large = large_molecule_column(records, weights, weight_limit)
                 records = records.append_column(LARGE_MOLECULE_COLUMN, large)
@@ -1738,6 +1982,13 @@ def run_export(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
                       "thuộc export.inactive_comments. nonstandard_sequence: chuỗi protein "
                       "có ký tự ngoài export.protein_alphabet. mixed_assay_type: các assay "
                       "đóng góp có từ hai loại assay khác nhau (vd. B và F). "
+                      f"{RESIDUAL_TIE_COLUMN}: một phía của cặp là phân tử VẪN nằm ở giá "
+                      "trị yếu nhất của assay sau khi mọi bộ lọc đã chạy — phần dư của "
+                      "quy tắc top_concentration_ties vì quy tắc đó chỉ chạy một lượt "
+                      f"(xem residual_tie_keys). {RESIDUAL_BOTH_COLUMN}: cả hai phía đều "
+                      "như vậy, nên Δp ~ 0 của bản ghi đó có thể là giả. Hai cờ này CHỈ "
+                      "gắn cờ, không xóa: xóa tiếp sẽ mất dữ liệu đo thật nhiều hơn phần "
+                      "bẩn dọn được (đã đo). "
                       "min_target_confidence (cột bằng chứng, không phải cờ): "
                       "confidence_score nhỏ nhất của ChEMBL, null khi bản ghi chỉ có "
                       "BindingDB. assay_types (cột bằng chứng): các loại assay đã biết, "
@@ -1986,6 +2237,35 @@ def check_one_delta_per_assay(layout: Layout, endpoints: Sequence[str]) -> dict[
     return {"passed": not problems, "records_checked": pairs_checked, "problems": problems[:20]}
 
 
+def check_exclusions(layout: Layout, endpoints: Sequence[str]) -> dict[str, Any]:
+    """Bảng loại của bước làm sạch dùng được và đã được áp đúng.
+
+    Ba điều: mỗi dòng có ít nhất một lý do và mọi lý do thuộc curation.REASONS; không
+    observation_id nào lặp; không dòng bị loại nào có mặt trong shard (đầu vào bước 1).
+    """
+    path = layout.file("excluded_observations")
+    if not path.is_file():
+        return {"passed": False, "note": f"thiếu {path}"}
+    table = pq.read_table(path, columns=["observation_id", "reasons"])
+    ids = table.column("observation_id").combine_chunks()
+    lengths = np.asarray(pc.list_value_length(table.column("reasons")).to_numpy(
+        zero_copy_only=False), dtype=np.int64)
+    reasons = set(pc.unique(pc.list_flatten(table.column("reasons"))).to_pylist())
+    unknown = sorted(reasons - set(curation.REASONS))
+    repeated = table.num_rows - int(pc.count_distinct(ids).as_py() or 0)
+    leaked = 0
+    for endpoint in endpoints:
+        for shard in layout.bucket_files("shards_dir", endpoint):
+            column = pq.read_table(shard, columns=["observation_id"]).column("observation_id")
+            leaked += int(pc.sum(pc.is_in(column, value_set=ids)).as_py() or 0)
+    by_reason = Counter(pc.list_flatten(table.column("reasons")).to_pylist())
+    return {"passed": bool((lengths >= 1).all()) and not unknown and not repeated
+            and not leaked,
+            "excluded_rows": table.num_rows, "rows_without_reason": int((lengths < 1).sum()),
+            "unknown_reasons": unknown, "repeated_ids": repeated,
+            "excluded_rows_in_shards": leaked, "rows_by_reason": dict(by_reason)}
+
+
 def sample_assay_deltas(layout: Layout, endpoints: Sequence[str], sample_rows: int,
                         seed: int) -> pa.Table:
     """Lấy mẫu ngẫu nhiên (seed cố định) các dòng Δp assay trên mọi endpoint và bucket."""
@@ -2023,12 +2303,15 @@ def check_against_observations(config: Mapping[str, Any], root: Path, layout: La
     """Tính lại Δp của một mẫu dòng, đi ngược về observations gốc.
 
     Cách làm: lấy mẫu dòng Δp assay; lấy khóa nhóm của hai phía; quét lại hai bản sao
-    dedup với ĐÚNG bộ lọc của pipeline; gộp replicate lại từ đầu; so p(A), p(B), Δp,
-    số dòng gốc và danh sách observation_id với giá trị đã lưu.
-    Phép kiểm tra này độc lập với file trung gian: nó chỉ dùng dữ liệu đầu vào.
+    dedup với ĐÚNG bộ lọc của pipeline (bộ lọc cơ bản và bảng loại của bước làm sạch);
+    gộp replicate lại từ đầu; so p(A), p(B), Δp, số dòng gốc và danh sách observation_id
+    với giá trị đã lưu.
+    Phép kiểm tra này độc lập với file trung gian của bước 1-4: nó chỉ dùng dữ liệu đầu vào
+    và bảng loại (bảng loại được kiểm riêng ở check_exclusions).
     """
     settings = config["stage2b"]
     run = settings["run"]
+    excluded = load_exclusions(layout)
     sample = sample_assay_deltas(layout, endpoints, run["verify_sample_rows"],
                                  run["verify_seed"])
     if not sample.num_rows:
@@ -2048,7 +2331,8 @@ def check_against_observations(config: Mapping[str, Any], root: Path, layout: La
             table = rename_roles(batch, columns, LOAD_ROLES)
             table = table.append_column("assay_key", assay_keys(table))
             steps = combined_mask(filter_steps(table, config["qualifiers"]["exact"],
-                                               settings["filter"]["resolved_status"]))
+                                               settings["filter"]["resolved_status"])
+                                  + [curation_step(table, excluded)])
             kept = table.filter(steps[-1][1])
             if kept.num_rows:
                 rows = shard_rows(kept, settings["filter"], pattern, suffix)
@@ -2225,6 +2509,7 @@ def run_verify(config: Mapping[str, Any], root: Path) -> dict[str, Any]:
     if not full.root.is_dir():
         raise FileNotFoundError(f"chưa có {full.root}; chạy --mode full trước")
     checks = {
+        "bang_loai_lam_sach": check_exclusions(full, endpoints),
         "bao_toan_cap": check_conservation(full, endpoints),
         "thong_ke_tu_evidence": check_record_stats(full, config, endpoints,
                                                    assay_documents(config, root)),

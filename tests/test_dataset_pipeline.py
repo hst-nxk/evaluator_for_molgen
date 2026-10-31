@@ -351,6 +351,10 @@ def record_table(rows: list[dict[str, Any]]) -> pa.Table:
         "assay_types": pa.array([row.get("assay_types", "B") for row in rows], pa.string()),
         "mixed_assay_type": pa.array([row.get("mixed_assay_type", False) for row in rows],
                                      pa.bool_()),
+        pipeline.RESIDUAL_TIE_COLUMN: pa.array(
+            [row.get(pipeline.RESIDUAL_TIE_COLUMN, False) for row in rows], pa.bool_()),
+        pipeline.RESIDUAL_BOTH_COLUMN: pa.array(
+            [row.get(pipeline.RESIDUAL_BOTH_COLUMN, False) for row in rows], pa.bool_()),
     })
 
 
@@ -875,3 +879,71 @@ def test_layout_lists_only_existing_bucket_files(tmp_path: Path,
     path.parent.mkdir(parents=True)
     pq.write_table(pa.table({"x": [1]}), path)
     assert layout.bucket_files("records_dir", "Ki") == [path]
+
+
+# --- phần dư trần nồng độ (residual_top_concentration) ---------------------------------
+
+RESIDUAL_ASSAY = "chembl::CHEMBL1"
+RESIDUAL_KEY = (RESIDUAL_ASSAY, HASH_A, "Ki", "KEY-A")
+
+
+def residual_record_table(rows: list[dict[str, Any]]) -> pa.Table:
+    """Bảng tối thiểu mà residual_tie_columns cần đọc."""
+    return pa.table({
+        "protein_hash": pa.array([row.get("protein_hash", HASH_A) for row in rows],
+                                 pa.string()),
+        "endpoint": pa.array([row.get("endpoint", "Ki") for row in rows], pa.string()),
+        "molecule_a_key": pa.array([row.get("molecule_a_key", "KEY-A") for row in rows],
+                                   pa.string()),
+        "molecule_b_key": pa.array([row.get("molecule_b_key", "KEY-B") for row in rows],
+                                   pa.string()),
+        "assay_keys": pa.array([row.get("assay_keys", [RESIDUAL_ASSAY]) for row in rows],
+                               pa.list_(pa.string())),
+    })
+
+
+def residual_flags(rows: list[dict[str, Any]], keys: set) -> tuple[list[bool], list[bool]]:
+    either, both = pipeline.residual_tie_columns(residual_record_table(rows), keys)
+    return either.to_pylist(), both.to_pylist()
+
+
+def test_residual_tie_flag_is_false_when_no_molecule_matches() -> None:
+    assert residual_flags([{}], set()) == ([False], [False])
+
+
+def test_residual_tie_flag_catches_one_side() -> None:
+    assert residual_flags([{}], {RESIDUAL_KEY}) == ([True], [False])
+
+
+def test_residual_tie_flag_marks_both_sides_separately() -> None:
+    # Cả hai phía ở mức yếu nhất thì Δp ~ 0 có thể là giả: cờ riêng cho trường hợp này.
+    keys = {RESIDUAL_KEY, (RESIDUAL_ASSAY, HASH_A, "Ki", "KEY-B")}
+    assert residual_flags([{}], keys) == ([True], [True])
+
+
+def test_residual_tie_flag_needs_the_same_assay() -> None:
+    # Phân tử chỉ "ở mức yếu nhất" TRONG MỘT assay cụ thể; assay khác thì không tính.
+    rows = [{"assay_keys": ["chembl::CHEMBL999"]}]
+    assert residual_flags(rows, {RESIDUAL_KEY}) == ([False], [False])
+
+
+def test_residual_tie_flag_needs_the_same_protein_and_endpoint() -> None:
+    assert residual_flags([{"protein_hash": HASH_B}], {RESIDUAL_KEY}) == ([False], [False])
+    assert residual_flags([{"endpoint": "Kd"}], {RESIDUAL_KEY}) == ([False], [False])
+
+
+def test_residual_tie_flag_checks_every_assay_of_the_record() -> None:
+    # Một bản ghi gộp nhiều assay: chỉ cần MỘT assay có phân tử ở mức yếu nhất là bị cờ.
+    rows = [{"assay_keys": ["chembl::CHEMBL999", RESIDUAL_ASSAY]}]
+    assert residual_flags(rows, {RESIDUAL_KEY}) == ([True], [False])
+
+
+def test_residual_tie_flag_handles_a_record_with_no_assays() -> None:
+    assert residual_flags([{"assay_keys": []}], {RESIDUAL_KEY}) == ([False], [False])
+
+
+def test_residual_tie_flags_are_declared_in_the_training_tables() -> None:
+    # Hai cờ phải chảy vào cả hai file training, nếu không thì không lọc lại được.
+    for columns in (pipeline.EVALUATOR_COLUMNS, pipeline.GENERATOR_COLUMNS):
+        assert pipeline.RESIDUAL_TIE_COLUMN in columns
+        assert pipeline.RESIDUAL_BOTH_COLUMN in columns

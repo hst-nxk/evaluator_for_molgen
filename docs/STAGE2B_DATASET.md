@@ -12,6 +12,198 @@ export`; 278 unit test pass, số dòng ba file không đổi, cột mới đã 
 
 > **Mọi số đo ở mục 11 là của v1** (`data/dataset/`, dựng 21–22/10/2026). Mục 0 dưới đây
 > mô tả **v2**, ghi vào `data/dataset_v2/`; v1 giữ nguyên, chỉ đọc, để đối chiếu.
+>
+> **Bản hiện hành là v4** (`data/dataset_v4/`, mục V4 ngay dưới). Ngưỡng và tham số hiện hành
+> luôn là các giá trị trong `config.json`; các mục cũ của file này giữ số của phiên bản lúc
+> viết (vd. ngưỡng phân tán 1,4 và `max_variable_heavy_atoms` 10 là của v1/v2; từ v3 là 1,0
+> cho mọi endpoint và 13).
+
+## V4. Dataset v4 (31/10/2026): bước làm sạch trước khi ghép cặp
+
+### V4.1 Vì sao
+
+Audit trên v3 (`runs/audit/scan_assay_conflicts_20261031.txt`,
+`check_bad_assays_20261031.txt`, `verify_residual_20261031.txt`) tìm thấy những assay mà cả
+assay ghi sai giá trị và làm Δp đổi dấu khi so với assay khác cùng protein: patent ghi dữ liệu
+theo khoảng (p dạng 8,26 / 7,26 / 6,26) nhưng lưu như số đo `=`; giá trị lưu nghịch đảo
+(BindingDB 50038479: 3.311.311 nM so với 302 nM của ChEMBL, tổng hai p luôn ≈ 9,00); hai patent
+cùng nội dung lệch đúng 1000 lần (µM ghi thành nM). v3 chỉ gắn cờ các dòng này, nên chúng vẫn
+vào dữ liệu train. v4 loại chúng trước khi ghép cặp.
+
+Nguyên tắc truy vết vẫn giữ (họp 26/10/2026: "đánh flag ... sau này cần truy vết về thì vẫn
+truy vết được"): mỗi dòng bị loại được ghi vào `data/dataset_v4/full/excluded_observations.parquet`
+cùng danh sách lý do (`observation_id`, `source`, `assay_key`, `endpoint`, `reasons`). `verify`
+kiểm: mọi dòng bị loại có lý do, lý do thuộc danh sách đã biết, không dòng nào bị loại mà vẫn
+nằm trong shard.
+
+### V4.2 Quy tắc (config `stage2b.curation`, code `src/molopt/dataset/curation.py`)
+
+Mọi quy tắc chạy trên các dòng đã qua `stage2b.filter`. Quy tắc theo dòng tính độc lập với
+nhau. Ba quy tắc theo nhóm chạy theo thứ tự, mỗi quy tắc một lượt:
+
+1. `unit_error_between_assays` trên **mọi** dòng: hai phía của cặp lệch đúng 3/6/9 bậc đều bị
+   loại, kể cả khi một phía đã bị quy tắc khác bắt.
+2. `top_concentration_ties` trên các dòng **không** bị quy tắc theo dòng bắt. Bản đầu của v4
+   tính trên mọi dòng và để sót: bindingdb:11549:3 còn 607 phân tử đúng p = 4,00 (100 µM) trong
+   dataset, vì một dòng p < 4 (bị loại do ngoài [4, 11]) là giá trị thấp nhất lúc tính.
+3. `binned_assay` trên các dòng còn lại sau bước 2, bỏ cả phân tử ở giá trị trần: giá trị
+   trần không phải số đo.
+
+Quy tắc trần không lặp lại: bỏ mức thấp nhất rồi tìm tiếp sẽ ăn dần vào assay đo thật ở độ
+phân giải 0,01 (vd. 4,01 / 4,02 / 4,03, mỗi mức ba phân tử). Câu trích đầy đủ nằm ở khóa
+`source` của từng quy tắc trong config.
+
+| quy tắc | nguồn | loại gì |
+|---|---|---|
+| `chembl_data_validity` | Landrum & Riniker 2024 (DOI 10.1021/acs.jcim.4c00049); Lenselink 2017 | ChEMBL có `data_validity_comment` |
+| `chembl_no_pchembl` | Landrum & Riniker 2024; Papadatos 2015 | ChEMBL không có pChEMBL |
+| `chembl_inactive_comment` | Lenselink 2017; Hu & Bajorath 2014 | `activity_comment` là inactive / not active / inconclusive / undetermined |
+| `chembl_potential_duplicate` | Lenselink 2017; schema ChEMBL 37 | trích lại giá trị của bài khác |
+| `chembl_confidence_not_direct` | Landrum & Riniker 2024; Lenselink 2017; Hu & Bajorath 2014 | `confidence_score` khác 9 (8 = protein đồng đẳng, không phải protein đã gán) |
+| `chembl_relationship_not_direct` | Hu & Bajorath 2014 | `relationship_type` khác D |
+| `chembl_mutant_without_variant` | Landrum & Riniker 2024 | mô tả có mutant/mutation/variant mà không có `variant_id` |
+| `p_outside_plausible` | Kalliokoski 2013 (DOI 10.1371/journal.pone.0061007) | p ngoài [2, 15], cả hai nguồn |
+| `bindingdb_outside_typical_range` | Papadatos 2015 (DOI 10.1007/s10822-015-9860-5) | BindingDB có p ngoài [4, 11], tức 0,01 nM–100 µM. BindingDB không có cờ kiểu `data_validity_comment`; đo trên ChEMBL 37: không dòng nào p > 11 thiếu cờ, 98,4 % dòng p < 4 đã bị gắn cờ |
+| `bindingdb_conflicts_chembl` | quyết định của dự án (Stage 2a chọn ChEMBL là nguồn giữ lại) | dòng BindingDB mà Stage 2a ghi `value_differs` / `value_qualifier_differs` với bản ChEMBL cùng tài liệu |
+| `nonstandard_sequence` | không cần ngưỡng | chuỗi protein có ký tự ngoài 20 acid amin và B, X, Z, U, O |
+| `unit_error_between_assays` | Kalliokoski 2013; Papadatos 2015 | cùng phân tử, protein, endpoint ở hai assay lệch đúng 3, 6 hoặc 9 log (± 0,01): loại cả hai phía |
+| `top_concentration_ties` | **ngưỡng của dự án, chưa có nguồn** (con số 3) | ≥ 3 phân tử cùng đúng giá trị yếu nhất của assay: nồng độ cao nhất đã thử bị ghi thành `=` |
+| `binned_assay` | **ngưỡng của dự án, chưa có nguồn** (10, 4, 0,95); BindingDB (NAR 2025) tự bỏ dữ liệu chia khoảng | assay ≥ 10 phân tử mà 4 giá trị phổ biến nhất chiếm ≥ 95 % số phân tử: loại cả assay |
+
+Cách chọn hai ngưỡng chưa có nguồn, đo trên dữ liệu (ghi trong khóa `note` của config):
+- `binned_assay`, con số 4: số assay (≥ 10 phân tử) theo số giá trị khác nhau là 1: 511,
+  2: 807, 3: 564, 4: 210, 5: 149, 6–9: 2.716; 5 là đáy.
+- `binned_assay`, con số 0,95 (`runs/audit/binned_share_20261031.txt`): với nhóm ≥ 50 phân tử,
+  số nhóm theo tỉ phần của 4 giá trị phổ biến nhất là 10–28 ở mỗi khoảng từ 0,60 đến 0,95, rồi
+  105 ở ≥ 0,975. Bản đầu tiên dùng "≤ 4 giá trị khác nhau" và bỏ sót 150 nhóm (29.652 phân tử)
+  có vài giá trị lẻ, vd. CHEMBL5735558: 7,26 × 133, 6,26 × 41, 5,26 × 8 trên 188 phân tử.
+
+**Không loại** (đã cân nhắc): loại assay B và F (đo 31/10/2026: hai assay khác tài liệu lệch
+> 0,3 log ở 44 % cặp B-B, 50 % B-F, 50 % F-F, tức trộn B với F không tệ hơn B với B; giữ cờ
+`mixed_assay_type`, sếp đồng ý 31/10/2026); "assay lớn nhất mỗi tài liệu" và "assay > 100 hợp
+chất" của Landrum & Riniker (bài đó so hai assay với nhau, không dựng dữ liệu train); ghi chú
+`uncertain`.
+
+### V4.3 Thứ tự chạy
+
+Giống v2 (mục 0.3), thay `v2` bằng `v4` trong đường dẫn: `smoke` → `full` → `split` (ghi FASTA,
+thoát mã 2) → MMseqs2 trong WSL vào `runs/dataset/mmseqs_v4b/` với đúng tham số
+`stage2b.split.clustering` → `split --clusters runs\dataset\mmseqs_v4b\p50_cluster.tsv` →
+`export` → `verify`.
+
+### V4.4 Số đo của v4 (31/10/2026)
+
+Chạy xong `full` → `split` → `export` → `verify` ngày 31/10/2026. **verify 8/8 PASS**
+(thêm phép `bang_loai_lam_sach` so với v3), log ở `runs/dataset/full_20261031_153659.log`.
+
+**Bước làm sạch** (dòng observation bị loại, cột "chỉ quy tắc này" = không quy tắc nào khác bắt):
+
+| Quy tắc nhóm | ChEMBL bắt | ChEMBL chỉ quy tắc này | BindingDB bắt | BindingDB chỉ quy tắc này |
+|---|---|---|---|---|
+| `unit_error_between_assays` | 18.102 | 3.764 | 3.234 | 1.728 |
+| `top_concentration_ties` | 29.810 | 17.909 | 29.420 | 18.381 |
+| `binned_assay` | 51.171 | 34.790 | 44.357 | 33.060 |
+| **hợp (gồm cả quy tắc dòng)** | **942.837** | | **100.596** | |
+
+Còn lại 1.745.644 dòng đo được: Ki 348.829, Kd 60.718, IC50 1.153.415, EC50 182.682.
+
+**Bản ghi Δp**: tổng **8.011.271** — Ki 1.181.365, Kd 137.088, IC50 5.937.079, EC50 755.739.
+Cách ly QC 43.691 bản ghi (Ki 1.669, Kd 274, IC50 39.803, EC50 1.945).
+
+**Split**: 5.428 protein → 2.415 nhóm MMseqs2 (50 % identity). train 6.709.440 (83,8 %),
+validation 500.704 (6,2 %), test 801.127 (10,0 %). Validation đạt mốc ~500.000 cặp của
+cuộc họp 26/10 nhờ đổi `target_ratios` (xem ghi chú trong config).
+
+**Export**: evidence 8.011.271, evaluator 7.899.045, generator 4.972.413.
+
+**Cờ trên bảng evidence** (gắn cờ, không lọc): `plausible_range` 100 %, `unseen_pair`
+1.103.778 (13,8 %), `mixed_assay_type` 20.829 (0,3 %), `short_protein` 563,
+`inactive_comment` 20, `nonstandard_sequence` 0, `source_quality_warning` 0 bản ghi.
+
+**Kiểm độc lập trên các dòng được giữ** (vòng chỉ đọc, không dùng code pipeline):
+
+| Phép kiểm | v3 | v4 |
+|---|---|---|
+| Nhóm ≥ 10 phân tử có 4 giá trị đầu chiếm ≥ 0,95 | 150 nhóm / 29.652 phân tử | **0** |
+| Nhóm có ≥ 3 phân tử bằng nhau ở giá trị nhỏ nhất | 287 nhóm (lớn nhất 607 phân tử) | 268 nhóm / 1.881 phân tử (lớn nhất 54) |
+| Dòng BindingDB ngoài khoảng [4, 11] | — | 0 |
+| Cặp tài liệu nghịch dấu, r < −0,8, ≥ 10 bản ghi | 22 cặp / 6.475 bản ghi | 3 cặp / 127 bản ghi |
+
+Phần dư 268 nhóm (0,11 % dòng được giữ) là hệ quả đã biết của việc **chỉ chạy một lượt**:
+sau khi bỏ các phân tử bằng nhau ở mức nhỏ nhất, một mức nhỏ nhất mới có thể lộ ra. Phần dư
+này **đã được gắn cờ** trong dữ liệu (`residual_top_concentration`), và lý do không lặp quy
+tắc đã được **đo bằng mô phỏng** — xem mục V4.5.
+
+### V4.5 Phần dư của quy tắc trần nồng độ: gắn cờ, không xóa (31/10/2026)
+
+**Hiện tượng.** Quy tắc `top_concentration_ties` chỉ chạy **một lượt**, trên các dòng vừa
+qua bộ lọc cơ bản. Sau khi nó bỏ các phân tử ở mức yếu nhất của một assay, phần còn lại có
+thể lộ ra một mức yếu nhất **mới** cũng có ≥ 3 phân tử bằng nhau — như bóc lớp hành.
+
+Ca đã truy đến tận gốc (`bindingdb:11701:1`, protein `ab2b0aae…`, IC50): lúc làm sạch nhóm
+có 11 phân tử đo chính xác (dấu `=`) — 5 ở mức 5,96 và 6 ở mức 6,96. Quy tắc loại đúng 5
+cái ở mức yếu nhất. Sau đó 6,96 thành mức yếu nhất mới của 6 phân tử còn lại. **Quy tắc
+chạy đúng; đây là hệ quả của việc một lượt, không phải lỗi.** (Đã kiểm thêm: quy tắc nhóm
+chạy trên toàn bộ dữ liệu gộp lại, không chạy theo từng khối.)
+
+**Đo được trên v4** (vòng chỉ đọc, `runs/audit/`):
+
+| Mức đo | Số lượng | Tỉ lệ |
+|---|---|---|
+| Nhóm còn dư | 268 nhóm | — |
+| Phân tử-assay còn ở mức yếu nhất | 1.881 / 1.687.498 | 0,111 % |
+| **Bản ghi Δp bị ảnh hưởng (một phía)** | **7.005 / 8.011.271** | **0,087 %** |
+| Bản ghi cả hai phía đều ở mức đó (Δp ≈ 0 có thể giả) | 1.754 | 0,022 % |
+| Trong đó thuộc validation | 964 / 500.704 | 0,19 % |
+
+Phân bố theo endpoint: IC50 6.307, Ki 586, EC50 88, Kd 24 — đúng kỳ vọng, IC50 là loại hay
+bị ghi trần nồng độ nhất.
+
+**Vì sao KHÔNG lặp quy tắc cho hết.** Đã mô phỏng lặp đến khi không còn nhóm nào
+(`runs/audit/simulate_tie_iteration_20261031.txt`):
+
+| Lượt | Phân tử-assay bị bỏ | Số nhóm |
+|---|---|---|
+| 1 | 1.881 | 268 |
+| 2 | 337 | 47 |
+| 3 | 356 | 25 |
+| 4 | 307 | 19 |
+| 5 | 227 | 17 |
+| 6–43 | ~1.146 | chỉ 1–9 nhóm, lặp lại mãi |
+| **Tổng** | **4.254** (0,252 %) | — |
+
+Phải **44 lượt** mới dừng, và từ lượt 6 trở đi chỉ còn gặm đúng 1–4 nhóm. Thủ phạm chính là
+một assay **719 phân tử** bị gặm ở các lượt 7, 8, 9, 11, 14, 16, 19… mỗi lượt mất 33–43
+phân tử: đó là assay đo thật có giá trị trải liên tục, bị quy tắc gọt dần phần đáy ở độ
+phân giải 0,01.
+
+Chia theo tỉ lệ "phần bị bỏ / kích cỡ nhóm ban đầu":
+
+| Dạng nhóm | Lượt-nhóm | Phân tử |
+|---|---|---|
+| < 10 % nhóm (dạng trùng hợp) | 200 | 1.837 |
+| 10–50 % | 88 | 1.288 |
+| ≥ 50 % (dạng trần nồng độ thật) | 181 | 1.129 |
+| **Nhóm lớn (≥ 50 phân tử) mà phần bị bỏ < 10 %** | **193** | **1.815 ← rủi ro xóa oan** |
+
+Tức là: dọn thêm 1.881 phân tử bẩn thì phải xóa oan khoảng 1.815 phân tử đo thật. **Lỗ, nên
+không lặp.**
+
+**Cách xử lý đã chọn: gắn cờ, giữ nguyên dữ liệu.** Hai cột bool mới, có ở cả `evidence`,
+`evaluator_training` và `generator_training` (code: `pipeline.residual_tie_keys`,
+`pipeline.residual_tie_columns`):
+
+| Cột | Nghĩa |
+|---|---|
+| `residual_top_concentration` | một phía của cặp là phân tử vẫn ở mức yếu nhất của assay sau mọi bộ lọc |
+| `residual_top_concentration_both` | cả hai phía đều như vậy |
+
+Cờ dùng **đúng hàm và đúng ngưỡng của quy tắc cũ** (`curation.tie_keys`,
+`min_molecules_at_minimum = 3`, `value_decimals = 2`), chỉ khác là đo lại sau khi mọi bộ
+lọc đã chạy. Hai cờ **không lọc gì**; muốn bộ chặt hơn thì lọc
+`residual_top_concentration = false`.
+
+Số do pipeline ghi ra khớp tuyệt đối với vòng kiểm độc lập: **7.005** và **1.754**.
 
 ## 0. Dataset v2 (24/10/2026)
 
@@ -1006,7 +1198,8 @@ tính chỉ số.
   cờ cho **cặp** (`unseen_pair`).
 - Ba cờ của mục 9.1 không nằm trong `--mode verify`; chúng đã được audit riêng bằng vòng
   chỉ đọc (xem dưới), nhưng chạy lại export thì phải audit lại.
-- Chưa đánh giá mô hình nào trên dataset này; chưa train.
+- Train thật trên v4 mới chỉ chạy ở máy cá nhân để dò lỗi (xem
+  `docs/STAGE3_EVALUATOR.md` mục 4.6); bộ thí nghiệm đầy đủ chạy ở server.
 - Chưa đọc được định dạng `.clstr` của CD-HIT; chỉ đọc TSV hai cột, đủ cho
   `mmseqs easy-cluster`.
 - Lần gom chuỗi thử đầu tiên ngày 22/10/2026 (cov-mode 1, cascade, max-seqs mặc định) ra

@@ -257,10 +257,10 @@
       "bindingdb": "data/dedup_v2/bindingdb202610_observations_dedup.parquet"
     },
     "paths": {
-      "dataset_dir": "data/dataset_v3",
-      "full_dir": "data/dataset_v3/full",
+      "dataset_dir": "data/dataset_v4",
+      "full_dir": "data/dataset_v4/full",
       "runs_dir": "runs/dataset",
-      "version_note": "v3 (29/10/2026) dựng từ data/dedup_v2 (observation v2, định danh parent), ghi vào thư mục mới; v2 (data/dataset_v2, 24/10/2026) và v1 (data/dataset, 21-22/10/2026) giữ nguyên, chỉ đọc, để đối chiếu. Thay đổi của v2 và lý do: docs/AUDIT_20261024.md mục 6 và docs/STAGE2B_DATASET.md mục v2."
+      "version_note": "v4 (31/10/2026): cùng đầu vào data/dedup_v2 như v3, thêm bước làm sạch stage2b.curation trước lượt gom (mỗi dòng bị loại ghi lý do vào full/excluded_observations.parquet); ghi vào thư mục mới. v3 (data/dataset_v3, 29/10/2026), v2 (data/dataset_v2, 24/10/2026) và v1 (data/dataset, 21-22/10/2026) giữ nguyên, chỉ đọc, để đối chiếu. Thay đổi và lý do: docs/STAGE2B_DATASET.md mục v4."
     },
     "files": {
       "molecules": "molecules.parquet",
@@ -277,7 +277,8 @@
       "evaluator": "evaluator_training.parquet",
       "generator": "generator_training.parquet",
       "evidence_records": "evidence_records.parquet",
-      "export_manifest": "export_manifest.json"
+      "export_manifest": "export_manifest.json",
+      "excluded_observations": "excluded_observations.parquet"
     },
     "columns": {
       "observation_id": "observation_id",
@@ -305,15 +306,98 @@
       "document_patent": "document_patent_number",
       "document_id": "document_id",
       "molecule_chembl_type": "molecule_chembl_type",
-      "assay_type": "assay_type"
+      "assay_type": "assay_type",
+      "assay_description": "assay_description",
+      "protein_variant_id": "protein_variant_id",
+      "dedup_reason": "dedup_reason"
     },
     "filter": {
       "resolved_status": "resolved",
       "potential_duplicate_key": "potential_duplicate",
       "potential_duplicate_value": 1,
       "potential_duplicate_regex": "\"potential_duplicate\"\\s*:\\s*\"?1\"?",
-      "note": "Bộ lọc dòng vào dataset: dedup_keep, qualifier thuộc qualifiers.exact, protein_status và assay_status bằng resolved_status, có pActivity, có InChIKey, có SMILES. Dòng ChEMBL có cờ potential_duplicate vẫn được giữ nhưng không tính là phép đo độc lập (n_independent) và không tính là assay độc lập. potential_duplicate_regex chỉ để chọn trước dòng cần parse JSON (giá trị 1 hoặc \"1\" luôn khớp regex); dòng khớp vẫn được parse và so bằng potential_duplicate_key/value.",
+      "note": "Bộ lọc dòng vào dataset: dedup_keep, qualifier thuộc qualifiers.exact, protein_status và assay_status bằng resolved_status, có pActivity, có InChIKey, có SMILES. Đến v3, dòng ChEMBL có cờ potential_duplicate được giữ nhưng không tính là phép đo độc lập (n_independent) và không tính là assay độc lập; từ v4 các dòng này bị loại ở bước làm sạch (stage2b.curation.rules.chembl_potential_duplicate), phần đếm độc lập vẫn giữ nguyên trong code. potential_duplicate_regex chỉ để chọn trước dòng cần parse JSON (giá trị 1 hoặc \"1\" luôn khớp regex); dòng khớp vẫn được parse và so bằng potential_duplicate_key/value.",
       "multi_source_id_note": "Nhóm bước 1 có nhiều molecule_source_id khác nhau (cùng InChIKey, khác ID của nguồn) được giữ và gắn cờ multi_source_id, theo quyết định 2 ở docs/STAGE2A_DEDUP_AUDIT.md mục 5.6."
+    },
+    "curation": {
+      "chembl_input": "chembl",
+      "float_slack": 1e-9,
+      "value_decimals": 2,
+      "json_check_rows": 20000,
+      "rules": {
+        "chembl_data_validity": {
+          "source": "Landrum GA, Riniker S. J. Chem. Inf. Model. 2024, 64(5), 1560-1567, DOI 10.1021/acs.jcim.4c00049: 'For both curation settings, only unqualified activity values with nM standard values, non-null pchembl values, and no data_validity_comment are used'. Lenselink EB et al. J. Cheminform. 2017, 9:45, DOI 10.1186/s13321-017-0232-0: 'no flags on potential duplicate or data validity comment'.",
+          "note": "Dòng ChEMBL có data_validity_comment (bất kỳ giá trị nào). Trên đầu vào v3 (đo 30/10/2026): Outside typical range 48.254, Potential transcription error 3.633, Manually validated 372, Potential author error 54 dòng. Papadatos et al. 2015 (J. Comput. Aided Mol. Des. 29, 885, DOI 10.1007/s10822-015-9860-5) mô tả cờ 'Outside typical range': 'the defined normal ranges used in this process are fairly stringent (e.g., 0.01 nM–100 μM for IC50/Ki values) and some data falling outside of these ranges may be correct'; theo đúng Landrum & Riniker, mọi dòng mang cờ đều bị loại."
+        },
+        "chembl_no_pchembl": {
+          "source": "Landrum & Riniker 2024 (câu trích ở chembl_data_validity): 'non-null pchembl values'. Papadatos et al. 2015: pChEMBL được tính 'for records with dose–response activity types, such as IC50, XC50, EC50, AC50, Ki, Kd, and Potency and where there are no data validity comments'.",
+          "note": "pchembl_value null trong activity_context của ChEMBL."
+        },
+        "chembl_inactive_comment": {
+          "values": ["inactive", "not active", "inconclusive", "undetermined"],
+          "source": "Lenselink et al. 2017 loại các dòng có activity_comment 'not active', 'inactive', 'inconclusive', 'undetermined'. Hu Y, Bajorath J. F1000Research 2014, 3:36, DOI 10.12688/f1000research.3-36.v2: 'inactive or inconclusive compounds and compounds with approximate measurements ... were not considered'.",
+          "note": "So không phân biệt hoa thường, bỏ khoảng trắng hai đầu. Chỉ đúng bốn giá trị của Lenselink; các ghi chú khác (vd. 'uncertain', 535 dòng) không có trong nguồn nên không loại, vẫn được gắn cờ inactive_comment ở bước 5 theo export.inactive_comments."
+        },
+        "chembl_potential_duplicate": {
+          "value": 1,
+          "source": "Lenselink et al. 2017: 'no flags on potential duplicate or data validity comment'. ChEMBL 37 schema: potential_duplicate = 'likely to be a repeat citation of a value reported in a previous ChEMBL paper, rather than a new, independent measurement'.",
+          "note": "v3 giữ dòng này nhưng không tính là độc lập. Đo 31/10/2026 (runs/audit/compare_bf2_20261031.txt): 84 % cặp assay B-B khác tài liệu chép nguyên giá trị của nhau, và khoảng 99,5 % các cặp chép đó có ít nhất một assay mang cờ này, nên loại cờ này bỏ được gần hết bản chép giữa các tài liệu."
+        },
+        "chembl_confidence_not_direct": {
+          "value": 9,
+          "source": "Landrum & Riniker 2024, Lenselink et al. 2017, Hu & Bajorath 2014 đều chỉ dùng confidence_score 9. ChEMBL FAQ (https://chembl.gitbook.io/chembl-interface-documentation/frequently-asked-questions/chembl-data-questions): 9 = 'Direct single protein target assigned', 8 = 'Homologous single protein target assigned'.",
+          "note": "Mức 8 nghĩa là protein đo có thể là đồng đẳng khác loài, trong khi chuỗi protein của dòng lấy theo target được gán, nên nhãn protein có thể sai. Null (chưa gán) cũng bị loại. Đầu vào v3: 640.782 dòng ChEMBL (28,2 %) khác 9."
+        },
+        "chembl_relationship_not_direct": {
+          "value": "D",
+          "source": "Hu & Bajorath 2014: chỉ dùng target relationship type 'D' (direct).",
+          "note": "Trên đầu vào v3 trùng đúng tập dòng của chembl_confidence_not_direct; giữ riêng để đối chiếu với nguồn."
+        },
+        "chembl_mutant_without_variant": {
+          "pattern": "mutant|mutation|variant",
+          "source": "Landrum & Riniker 2024: loại assay có mô tả chứa mutant/mutation/variant mà không có variant_id (mô tả theo phần phương pháp của bài, không phải câu trích).",
+          "note": "So không phân biệt hoa thường trên assay_description, chỉ dòng ChEMBL có protein_variant_id null. docs/AUDIT_20261024.md mục 2.3 đọc tay 30 mô tả: chỉ khoảng 1/3 đến 1/2 là đột biến thật của protein đích, còn lại là cơ chất đột biến hay dải residue; quy tắc vẫn được dùng vì loại nhầm chỉ làm mất dữ liệu, còn giữ lại đột biến thật thì gán sai chuỗi protein. Đầu vào v3: 51.234 dòng."
+        },
+        "p_outside_plausible": {
+          "range": [2.0, 15.0],
+          "source": "Kalliokoski T, Kramer C, Vulpetti A, Gedeck P. PLoS One 2013, 8(4), e61007, DOI 10.1371/journal.pone.0061007: loại giá trị pActivity > 15 hoặc < 2.",
+          "note": "Áp cho cả hai nguồn. Trên ChEMBL, mọi dòng ngoài [2, 15] đều đã mang data_validity_comment (đo 31/10/2026), nên quy tắc này chủ yếu có tác dụng với BindingDB."
+        },
+        "bindingdb_outside_typical_range": {
+          "range": [4.0, 11.0],
+          "source": "Papadatos et al. 2015 (DOI 10.1007/s10822-015-9860-5): ChEMBL gắn cờ 'Outside typical range' theo danh sách khoảng bình thường, 'e.g., 0.01 nM–100 μM for IC50/Ki values', tức p trong [4, 11].",
+          "note": "BindingDB không có cờ tương đương, nên để hai nguồn qua cùng một tiêu chí, khoảng ChEMBL công bố được áp cho dòng BindingDB. Kiểm trên ChEMBL 37 (31/10/2026, 3,71 triệu dòng '='): không dòng nào có p > 11 mà không mang cờ, và 98,4 % dòng p < 4 mang cờ, ở cả bốn endpoint; nên khoảng [4, 11] khớp cách ChEMBL áp thực tế cho Ki, Kd, IC50 và EC50. Bài nói khoảng được nới cho fragment (MW < 350) nhưng không công bố khoảng nới, nên phần đó không áp được. Lý do cần: BindingDB entry 50038479 (PMID 18321038) ghi EC50 A2B là nghịch đảo của giá trị đo (vd. 3.311.311 nM ứng với 302 nM ở ChEMBL CHEMBL904113; p hai bên cộng lại 9,00 với độ lệch chuẩn 0,01; runs/audit/verify_residual_20261031.txt), lỗi mà không quy tắc nào khác bắt được."
+        },
+        "bindingdb_conflicts_chembl": {
+          "markers": ["value_differs", "value_qualifier_differs"],
+          "source": "Quyết định của dự án, không có tài liệu ngoài: Stage 2a (docs/STAGE2A_DEDUP_AUDIT.md) đã chọn ChEMBL là nguồn giữ lại (stage2a.dedup.keep_source) khi hai nguồn cùng chép một tài liệu.",
+          "note": "Dòng BindingDB có bản ChEMBL cùng tài liệu, cùng phân tử, cùng protein, cùng endpoint nhưng giá trị hoặc dấu khác (dedup_reason của Stage 2a). Cùng một phép đo không thể có hai giá trị, nên ít nhất một bên chép sai; giữ bản ChEMBL (đã qua các cờ chất lượng của ChEMBL ở trên), bỏ bản BindingDB. Ví dụ: PMID 20236734, nAChR α7, BindingDB 50031856 và ChEMBL CHEMBL1168510 cho 36 phân tử chung với r = −0,75."
+        },
+        "nonstandard_sequence": {
+          "alphabet": "ACDEFGHIKLMNPQRSTVWYBXZUO",
+          "source": "Không cần ngưỡng: chuỗi có ký tự ngoài 20 acid amin chuẩn và B, X, Z, U, O không phải chuỗi protein (vd. EGFR chèn chữ số, RyR1 'biotin-C6linker-', docs/AUDIT_20261024.md), nên không mã hóa được bằng mô hình ngôn ngữ protein.",
+          "note": "Cùng bảng chữ với stage2b.export.protein_alphabet; chuẩn hóa chuỗi giống hash Stage 1 (bỏ khoảng trắng, viết hoa)."
+        },
+        "unit_error_between_assays": {
+          "shifts": [3.0, 6.0, 9.0],
+          "tolerance": 0.01,
+          "source": "Kalliokoski et al. 2013: 'Remove both entries if their difference is exactly 3, 6, or 9' (log đơn vị). Papadatos et al. 2015: 'Transcription errors consist of otherwise identical entries, whose activity values differ by exactly 3 or 6 orders of magnitude, thus indicating a likely error in the units (e.g., μM instead of nM)'.",
+          "note": "Cùng phân tử, cùng protein, cùng endpoint, ở hai assay khác nhau (mọi nguồn), p trung bình của phân tử lệch đúng 3, 6 hoặc 9 trong sai số tolerance (0,01 = độ phân giải của pChEMBL, cùng mức collapse_tolerance): loại cả hai phía. Ví dụ đo 31/10/2026: patent TYK2 US-10647713-B2 ghi 0,3 nM, US-11396508-B2 ghi 300.000 nM cho cùng phân tử."
+        },
+        "top_concentration_ties": {
+          "min_molecules_at_minimum": 3,
+          "source": "NGƯỠNG CỦA DỰ ÁN, CHƯA CÓ NGUỒN cho con số 3. Căn cứ nội dung: Lenselink 2017 và Hu 2014 loại giá trị không hoạt tính; một assay mà nhiều phân tử cùng đúng giá trị yếu nhất là dấu hiệu nồng độ cao nhất đã thử được ghi thành '=' (vd. PubChem CHEMBL1738682 '= 10 uM' ở 278/580 phân tử; BindingDB 3298:1 99.000 nM ở 264/346; runs/audit/inspect_ceiling_20261030.txt). CHI CHAY MOT LUOT, va phan du da duoc DO: mo phong lap quy tac den khi het (runs/audit/simulate_tie_iteration_20261031.txt) phai 44 luot, bo them 4.254 phan tu-assay, trong do 1.815 (43 %) den tu cac nhom lon (>= 50 phan tu) ma phan bi bo chiem duoi 10 % nhom - tuc la trung hop o do phan giai 0,01 chu khong phai tran nong do; mot assay 719 phan tu bi gam qua hon muoi luot. Vi vay phan du KHONG bi xoa tiep ma duoc gan co residual_top_concentration (7.005 ban ghi, 0,087 %) va residual_top_concentration_both (1.754 ban ghi).",
+          "note": "Trong mỗi (assay, protein, endpoint), lấy p trung bình mỗi phân tử, làm tròn value_decimals chữ số; nếu >= min_molecules_at_minimum phân tử cùng ở giá trị nhỏ nhất thì loại các phân tử ở giá trị đó (các phân tử khác của assay giữ nguyên). Độ nhạy theo ngưỡng (đo trên v3, bản ghi chạm ít nhất một assay có trần): 2 -> 4,84 %, 3 -> 4,63 %, 10 -> 4,38 % bản ghi training, nên kết luận ít phụ thuộc con số chọn."
+        },
+        "binned_assay": {
+          "min_molecules": 10,
+          "top_values": 4,
+          "min_share_of_top_values": 0.95,
+          "source": "NGƯỠNG CỦA DỰ ÁN, CHƯA CÓ NGUỒN cho ba con số. Căn cứ nội dung: BindingDB (Liu T et al. Nucleic Acids Res. 2025, DOI 10.1093/nar/gkae1075, Fig. 5) 'Binned or categorical data (e.g. 'IC50 < 1 μM') are omitted'; nhưng patent ghi dữ liệu theo chữ cái vẫn vào ChEMBL dạng '=' (vd. US9688680B2, Kit D816V: bảng ghi chữ A-E theo khoảng '10.01-100 nM B', '100.01-1000 nM C'...; ChEMBL CHEMBL5730661 lưu '= 550 nM' 288 dòng và '= 55 nM' 23 dòng).",
+          "note": "Assay (assay, protein, endpoint) có >= min_molecules phân tử mà top_values giá trị p phổ biến nhất (làm tròn value_decimals chữ số) chiếm >= min_share_of_top_values số phân tử: loại cả assay. Chọn 4 theo dữ liệu: với assay >= 10 phân tử, số assay theo số giá trị khác nhau là 1: 511, 2: 807, 3: 564, 4: 210, 5: 149, rồi 6-9: 2.716 (runs/audit/inspect_ceiling_20261030.txt mục A, cộng các hàng >= 10 phân tử); 5 là đáy giữa nhóm giá trị chia khoảng và nhóm giá trị đo liên tục. Chọn 0,95 theo dữ liệu (đo 31/10/2026 trên dedup_v2 qua dedup_keep và qualifier =, nhóm có > 4 giá trị): với nhóm >= 50 phân tử, số nhóm theo tỉ phần của 4 giá trị phổ biến nhất là 10-28 ở mỗi khoảng từ 0,60 đến 0,95, rồi 26 ở [0,95; 0,975) và 105 ở >= 0,975; các nhóm >= 0,95 là dữ liệu chia khoảng còn vài giá trị lẻ, vd. CHEMBL5735558 7,26 x133, 6,26 x41, 5,26 x8 trên 188 phân tử (quy tắc cũ '<= 4 giá trị khác nhau' bỏ sót 150 nhóm, 29.652 phân tử). Với nhóm < 20 phân tử, 0,95 trùng với '<= 4 giá trị khác nhau'. Đo 31/10/2026: các cặp patent cùng họ cho Δp ngược dấu hoàn toàn (r = −1,00, p dạng 8,26 / 7,26 / 6,26) chỉ bị quy tắc này bắt (runs/audit/check_bad_assays_20261031.txt). Số đo tỉ phần: runs/audit/binned_share_20261031.txt."
+        }
+      },
+      "note": "Bước làm sạch (v4) chạy trước lượt gom, trên các dòng đã qua stage2b.filter. Mỗi quy tắc tính độc lập trên cùng tập dòng đó; dòng mang ít nhất một lý do bị loại khỏi dataset và được ghi vào full/excluded_observations.parquet (observation_id, nguồn, assay_key, endpoint, danh sách lý do) để truy vết, theo yêu cầu họp 26/10/2026 ('đánh flag ... sau này cần truy vết về thì vẫn truy vết được'). Quy tắc theo nhóm, mỗi bước một lượt: unit_error_between_assays tính trên MỌI dòng (hai phía của một cặp lệch đúng 3/6/9 bậc đều bị loại, kể cả khi một phía đã bị quy tắc khác bắt); top_concentration_ties tính trên các dòng KHÔNG bị quy tắc theo dòng bắt (bản đầu tính trên mọi dòng thì một dòng sai nằm thấp hơn che mất giá trị trần: bindingdb:11549:3 còn 607 phân tử đúng p = 4,00 trong dataset, đo 31/10/2026); binned_assay tính trên các dòng còn lại sau đó, bỏ cả phân tử ở giá trị trần, vì giá trị trần không phải số đo. Không lặp quy tắc trần: bỏ mức thấp nhất rồi tìm tiếp sẽ ăn dần vào assay đo thật ở độ phân giải 0,01. json_check_rows: số dòng ChEMBL đầu tiên của lượt đọc được so kết quả regex với json.loads; lệch thì dừng. Không loại theo: loại assay B/F (đo 31/10/2026, mỗi cặp tài liệu tính một lần: hai assay khác tài liệu lệch > 0,3 log ở 44 % (B-B), 50 % (B-F), 50 % (F-F); giữ cờ mixed_assay_type, sếp đồng ý 31/10/2026); assay lớn nhất mỗi tài liệu và assay > 100 hợp chất của Landrum & Riniker (mục đích của bài là so hai assay, không phải dựng dữ liệu huấn luyện); ghi chú 'uncertain' (không có trong nguồn)."
     },
     "replicate": {
       "merge_tolerance": 0.01,
@@ -386,8 +470,8 @@
     },
     "split": {
       "partitions": ["train", "validation", "test"],
-      "target_ratios": {"train": 0.85, "validation": 0.05, "test": 0.1},
-      "target_ratios_note": "v3: validation 0,05 theo quyết định họp 26/10/2026 (validation khoảng 500.000 cặp, phần còn lại cho train; v2 có 10.684.298 cặp nên 0,05 ≈ 534.000). test giữ 0,1. Đây là quyết định thiết kế của nhóm, không phải ngưỡng lấy từ tài liệu.",
+      "target_ratios": {"train": 0.8375, "validation": 0.0625, "test": 0.1},
+      "target_ratios_note": "v3: validation 0,05 theo quyết định họp 26/10/2026 (validation khoảng 500.000 cặp, phần còn lại cho train; v2 có 10.684.298 cặp nên 0,05 ≈ 534.000). v4 (31/10/2026): dataset còn 8.031.229 cặp nên 0,05 chỉ còn 401.561; đổi validation thành 0,0625 (≈ 502.000) để giữ đúng quyết định 'khoảng 500.000', train nhận phần còn lại (0,8375). test giữ 0,1. Đây là quyết định thiết kế của nhóm, không phải ngưỡng lấy từ tài liệu.",
       "seed": 20261021,
       "old_split_file": "E:/data/molopt_benchmark_split_candidate_v2/P50_GLOBAL_NW_50_CANDIDATE_20260910_V2/protein_to_partition.parquet",
       "clustering": {
@@ -424,11 +508,11 @@
   },
   "stage3": {
     "inputs": {
-      "evaluator": "data/dataset_v3/evaluator_training.parquet",
-      "proteins": "data/dataset_v3/full/proteins.parquet"
+      "evaluator": "data/dataset_v4/evaluator_training.parquet",
+      "proteins": "data/dataset_v4/full/proteins.parquet"
     },
     "paths": {
-      "cache_dir": "work/evaluator_cache_v3",
+      "cache_dir": "work/evaluator_cache_v4",
       "runs_dir": "runs/evaluator"
     },
     "files": {
@@ -478,7 +562,21 @@
       "loss": "huber",
       "huber_delta": 1.0,
       "early_stopping_patience": 2,
+      "eval_every_steps": 2000,
+      "early_stopping_patience_evals": 5,
+      "eval_cadence_note": "eval_every_steps = 0 thi chi do validation o cuoi moi epoch (hanh vi cu). CHUA CO NGUON cho hai con so nay - day la lua chon ky thuat, suy ra tu so do: train co 6.627.559 dong, batch 512 nen mot epoch dai 12.944 buoc; lan train 31/10/2026 (runs/evaluator/train_v4_frozen_direct_console.txt) cho MAE validation tot nhat ngay o epoch 0 (0,6138) roi xau di (0,6241 / 0,6274), tuc diem tot nhat nam BEN TRONG epoch dau va do moi epoch mot lan se bo lo. 2000 buoc cho khoang 6 lan do moi epoch. Khi eval_every_steps > 0 thi kien nhan tinh theo SO LAN DO (early_stopping_patience_evals) chu khong theo so epoch; 5 lan do ~ 10.000 buoc ~ 0,77 epoch khong cai thien. Moi lan do chay tren TOAN BO validation (493.852 dong), khong lay mau, de khong chon checkpoint theo mot mau nhieu.",
       "grad_clip": 1.0,
+      "sharpness": {
+        "enabled": false,
+        "lambda_init": 0.01,
+        "lambda_learning_rate": 0.001,
+        "rho": 0.05,
+        "finite_difference_radius": 0.05,
+        "epsilon": 0.1,
+        "source": "Dao MC, Nguyen PL, Truong TN, Hoang TN. Incorporating Surrogate Gradient Norm to Improve Offline Optimization Techniques. NeurIPS 2024, DOI 10.52202/079017-0258, arXiv:2503.04242. Phuong phap ten IGNITE. Rang buoc (cong thuc 11): rho * ||grad_omega h(omega)|| <= epsilon, voi h(omega) = ky vong dau ra cua surrogate tren du lieu offline; giai bang nhan tu Lagrange lambda cap nhat theo dual ascent (cong thuc 12-14); gradient cua so hang phat duoc xap xi bang sai phan huu han ban kinh r (cong thuc 83-85, Algorithm 1) nen khong phai tinh Hessian.",
+        "values_source": "lambda_init 0.01: muc 5.1 cua bai bao, chon bang grid {0.0001, 0.001, 0.01}. epsilon 0.1: muc 5.1, ablation tren {0.01 ... 0.5}. lambda_learning_rate 0.001: hinh 2b. rho = finite_difference_radius = 0.05: muc 5.1 (grid {0.01, 0.05, 0.1, 0.2}). LUU Y: phu luc G.2 cua chinh bai bao ghi rho = r = 0.2 tren grid {0.01, 0.05, 0.1, 0.2, 0.5} - hai cho trong bai KHONG KHOP nhau; o day lay so cua muc 5.1 va ghi lai mau thuan nay thay vi chon bua.",
+        "note": "enabled = false: mac dinh giu nguyen vong train cu de so sanh. Bat bang --sharpness on tren dong lenh (khong phai sua config) de chay ablation co / khong co so hang phat. Chi phi: moi batch can 3 luot forward thay vi 1 (luot goc, luot tinh gradient dau ra, luot tai diem bi lam nhieu omega + r * g2 / ||g2||), nen cham khoang 3 lan. HAI CHO LECH VOI BAI BAO, co y: (1) bai bao cap nhat omega bang gradient descent thuan, du an nay dung AdamW nhu cac lan train truoc de so sanh duoc; (2) gia thiet 1 cua bai bao can dau ra bi chan trong [0, 1], con nhan Delta p cua du an nay khong bi chan (khoang -10 den 10), nen phan ly thuyet (dinh ly 2) KHONG ap dung truc tiep; day la ly do phai do bang ablation chu khong tin ly thuyet. Keo theo: epsilon 0.1 cua bai bao do tren dau ra nam trong [0, 1], con do sac o day do tren thang Delta p (do lech chuan nhan khoang 0,88), nen epsilon 0.1 KHONG phai cung mot thang do; smoke 31/10/2026 do duoc do sac 0,11-0,14 nen lambda tang dan. Neu ablation cho ket qua xau thi phai quet lai epsilon theo thang Delta p truoc khi ket luan phuong phap khong hieu qua. Bai bao khong noi lambda co bi chan duoi 0 hay khong; code nay chan tai 0 vi dang Lagrange yeu cau lambda > 0."
+      },
       "seed": 20261023,
       "dataloader_workers": 0,
       "device": "auto",
@@ -487,8 +585,9 @@
       "eval_batch_size": 4096,
       "smoke_rows": 20000,
       "smoke_epochs": 2,
-      "finetune_overrides": {"batch_size": 64, "max_residues": 512},
-      "finetune_overrides_note": "CHƯA ĐO trên máy này — đây là phỏng đoán để tránh hết VRAM. GPU hiện có là RTX 3060 Laptop 6 GB; cấu hình finetune giữ ESM2 trong đồ thị nên bộ nhớ tỉ lệ với (số protein phân biệt trong batch × số acid amin). Nếu vẫn hết bộ nhớ thì giảm batch_size trước, rồi mới giảm max_residues.",
+      "finetune_overrides": {"batch_size": 64, "max_residues": 512,
+                             "eval_batch_size": 128},
+      "finetune_overrides_note": "CHUA DO tren GPU nao - day la uoc luong de tranh het VRAM. Cau hinh finetune giu ESM2 trong do thi tinh toan nen bo nho ti le voi (so protein PHAN BIET trong batch x so acid amin x so lop). Uoc tinh cho esm2_t12_35M, 512 acid amin, 12 lop: rieng ma tran attention da la ~21 MiB moi chuoi moi lop, nen mot batch 64 dong (khoang 40 protein phan biet) can khoang 15 GiB khi co gradient. Vi vay batch_size giu o 64 ngay ca tren RTX 4090 24 GB; muon tang thi phai do truoc. eval_batch_size 128 (thay vi 4096 cua frozen): luot du doan khong luu gradient nen nhe hon nhieu, nhung van phai chay ESM2, va 4096 dong co the cham toi hang nghin protein phan biet mot luc -> het VRAM ngay lan do validation dau tien. Neu van het bo nho thi giam batch_size truoc, roi moi giam max_residues.",
       "note": "protein_learning_rate chỉ dùng ở cấu hình finetune: ESM2 đã pretrain nên học với learning rate nhỏ hơn phần đầu dự đoán hai bậc, tránh phá trọng số pretrain. loss = huber (ít nhạy với nhãn ngoại lai hơn MSE, mà dataset còn giữ nguyên giá trị nguồn bất khả thi và chỉ gắn cờ). early_stopping theo validation, KHÔNG dùng partition test. dataloader_workers = 0 vì Windows dùng spawn và cache fingerprint đã nằm trong RAM."
     },
     "metrics": {
