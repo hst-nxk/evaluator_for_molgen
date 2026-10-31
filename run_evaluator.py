@@ -38,6 +38,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from molopt.evaluator import train as evaluator_train  # noqa: E402
 
+MODEL_PREFIX = "model"
 CONFIG_PATH = ROOT / "config.json"
 MODES = ("prepare", "baseline", "smoke", "train", "eval")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
@@ -57,7 +58,8 @@ def setup_logging(log_path: Path) -> None:
                                   logging.FileHandler(log_path, encoding="utf-8")])
 
 
-def apply_overrides(settings: dict, pairs: list[str]) -> dict:
+def apply_overrides(settings: dict, pairs: list[str],
+                    model_settings: dict | None = None) -> dict:
     """Ghi đè các tham số train từ dòng lệnh, dạng ``khóa=giá trị``.
 
     Chỉ cho phép ghi đè khóa ĐÃ CÓ trong ``stage3.train`` và có giá trị là số hoặc
@@ -66,6 +68,9 @@ def apply_overrides(settings: dict, pairs: list[str]) -> dict:
     đang có trong config, nên không cần khai báo kiểu ở dòng lệnh.
 
     Khóa có dấu chấm thì đi vào khối con, ví dụ ``finetune_overrides.batch_size=32``.
+    Khóa bắt đầu bằng ``model.`` thì đi sang ``stage3.model`` thay vì ``stage3.train``,
+    ví dụ ``model.dropout=0.3`` — dropout là nút chống khớp quá dữ liệu nhưng lại nằm
+    trong khối mô tả kiến trúc, không nằm trong khối tham số train.
     Trả về: dict khóa -> giá trị mới, để ghi vào manifest của lần chạy.
     """
     applied: dict = {}
@@ -76,6 +81,13 @@ def apply_overrides(settings: dict, pairs: list[str]) -> dict:
         key = key.strip()
         target = settings
         path = key.split(".")
+        if path[0] == MODEL_PREFIX:
+            if model_settings is None:
+                raise ValueError(f"--set: không nhận {key!r} ở chế độ này")
+            target = model_settings
+            path = path[1:]
+            if not path or not all(path):
+                raise ValueError("--set: thiếu tên tham số sau 'model.'")
         for step in path[:-1]:
             if not isinstance(target, dict) or step not in target:
                 raise ValueError(f"--set: không có khối {step!r} trong {key!r}")
@@ -124,7 +136,8 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        overrides = apply_overrides(settings, args.overrides)
+        overrides = apply_overrides(settings, args.overrides,
+                                    config["stage3"]["model"])
     except ValueError as error:
         parser.error(str(error))
 

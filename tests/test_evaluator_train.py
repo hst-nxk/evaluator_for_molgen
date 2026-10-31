@@ -333,3 +333,91 @@ def test_smoke_caps_the_frozen_batch() -> None:
 def test_finetune_falls_back_when_overrides_are_missing() -> None:
     settings = {"batch_size": 512, "eval_batch_size": 4096, "finetune_overrides": {}}
     assert train.effective_batch_sizes(settings, "finetune", False) == (512, 4096)
+
+
+def test_override_reaches_the_model_block() -> None:
+    """dropout la nut chong khop qua du lieu nhung nam o stage3.model, khong phai
+    stage3.train - --set phai voi toi duoc no."""
+    settings = train_settings()
+    model = {"dropout": 0.1, "ligand_out": 256}
+    applied = run_evaluator.apply_overrides(settings, ["model.dropout=0.3"], model)
+    assert applied == {"model.dropout": 0.3}
+    assert model["dropout"] == 0.3
+    assert "model.dropout" not in settings
+
+
+def test_override_rejects_an_unknown_key_in_the_model_block() -> None:
+    with pytest.raises(ValueError, match="dropuot"):
+        run_evaluator.apply_overrides(train_settings(), ["model.dropuot=0.3"],
+                                      {"dropout": 0.1})
+
+
+def test_override_rejects_the_model_prefix_with_no_key() -> None:
+    with pytest.raises(ValueError, match="thiếu tên tham số"):
+        run_evaluator.apply_overrides(train_settings(), ["model.=0.3"], {"dropout": 0.1})
+
+
+# ------------------------------------------------------------ cộng dồn gradient
+
+
+def run_accum(monkeypatch: pytest.MonkeyPatch, rows: int, batch_size: int,
+              accumulate: int, eval_every: int = 0, on_eval=None):
+    monkeypatch.setattr(train, "batch_tensors", fake_batch)
+    model = FakeModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    return train.train_one_epoch(model, FakeArrays(rows), None, None, "cpu", optimizer,
+                                 torch.nn.MSELoss(), batch_size, 1.0,
+                                 np.random.default_rng(0), None, eval_every, on_eval,
+                                 False, accumulate)
+
+
+def test_accumulation_counts_optimizer_steps_not_micro_batches(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """100 dòng, batch 10 = 10 batch con; gộp 5 -> chỉ 2 lần cập nhật tham số."""
+    _, _, steps = run_accum(monkeypatch, 100, 10, 5)
+    assert steps == 2
+
+
+def test_accumulation_of_one_is_the_old_behaviour(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, steps = run_accum(monkeypatch, 100, 10, 1)
+    assert steps == 10
+
+
+def test_accumulation_still_steps_on_the_leftover_batches(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """10 batch con, gộp 4 -> 2 lần đủ nhóm cộng 1 lần cho 2 batch lẻ cuối."""
+    _, _, steps = run_accum(monkeypatch, 100, 10, 4)
+    assert steps == 3
+
+
+def test_accumulation_gives_the_mean_gradient_of_the_group(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gộp N batch phải cho gradient TRUNG BÌNH, không phải tổng: quên chia thì bước đi
+    lớn gấp N lần, tức learning rate bị đổi ngầm."""
+    monkeypatch.setattr(train, "batch_tensors", fake_batch)
+
+    def gradient_at_first_step(accumulate: int) -> torch.Tensor:
+        model = FakeModel()
+        captured: list[torch.Tensor] = []
+
+        class RecordingSGD(torch.optim.SGD):
+            def step(self, *args, **kwargs):  # noqa: ANN002, ANN003, D102
+                if not captured:
+                    captured.append(model.layer.weight.grad.clone())
+                return super().step(*args, **kwargs)
+
+        optimizer = RecordingSGD(model.parameters(), lr=0.0)
+        train.train_one_epoch(model, FakeArrays(40), None, None, "cpu", optimizer,
+                              torch.nn.MSELoss(), 10, 0.0, None, None, 0, None,
+                              False, accumulate)
+        return captured[0]
+
+    # Mọi batch giả giống hệt nhau, nên trung bình của 4 batch phải bằng 1 batch.
+    assert torch.allclose(gradient_at_first_step(4), gradient_at_first_step(1), atol=1e-6)
+
+
+def test_accumulation_evaluates_on_optimizer_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[int] = []
+    run_accum(monkeypatch, 200, 10, 4, 2, lambda step: seen.append(step) or False)
+    # 20 batch con / gộp 4 = 5 lần cập nhật; đo sau mỗi 2 lần cập nhật.
+    assert seen == [2, 4]

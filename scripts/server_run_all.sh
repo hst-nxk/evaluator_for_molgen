@@ -56,13 +56,32 @@ SMOKE_CONFIGS=("no_protein" "frozen" "finetune")
 # Hai dòng cuối là ablation có / không số hạng phạt, giữ nguyên mọi tham số khác, nên
 # so sánh được trực tiếp với dòng đầu. Chạy sau cùng vì mỗi batch cần 3 lượt forward.
 # Hai lần finetune chạy sau cùng và cần tham số riêng:
-#   gpu_memory_limit_mib 18432 : trần 9 GiB của config là để chia GPU với người khác;
-#       finetune giữ ESM2 trong đồ thị nên cần nhiều hơn hẳn. 18 GiB vẫn chừa ~6 GiB
-#       trên card 24 GB. CHƯA ĐO: nếu hết bộ nhớ thì giảm finetune_overrides.batch_size.
-#   eval_every_steps 20000     : finetune chạy batch 64 nên một epoch dài ~103.500 bước
-#       (gấp 8 lần frozen). Giữ 2000 sẽ thành ~52 lần đo validation mỗi epoch, mà mỗi
-#       lần đo đều phải chạy lại ESM2 -> phần lớn thời gian của đêm dành cho việc đo.
-FINETUNE_SET="--set gpu_memory_limit_mib=18432 --set eval_every_steps=20000"
+#   gpu_memory_limit_mib 20480 : trần 9 GiB của config là để chia GPU với người khác;
+#       finetune giữ ESM2 trong đồ thị nên cần nhiều hơn. 20 GiB vẫn chừa ~4 GiB trên
+#       card 24 GB. Vòng train gom batch theo protein nên mức dùng thường xuyên chỉ
+#       ~1,4 GiB; trần này là để đỡ những batch hiếm chạm nhiều protein cùng lúc.
+#   eval_every_steps 4000      : batch 256 cho 25.889 bước mỗi epoch, nên 4000 bước
+#       là khoảng 6 lần đo validation mỗi epoch, bằng nhịp của frozen.
+FINETUNE_SET="--set gpu_memory_limit_mib=20480 --set eval_every_steps=4000"
+
+# Bộ ba chống khớp quá dữ liệu, dùng lại ở nhiều dòng. Ba nút khác nhau, cùng một bệnh:
+#   huber_delta 0.3   : duoi 0,3 log la sai so thi nghiem (Landrum & Riniker 2024,
+#                       DOI 10.1021/acs.jcim.4c00049) -> phat binh phuong; tren muc do
+#                       phat tuyen tinh. Co nguon, va gan voi MAE dang bao cao.
+#   weight_decay 0.1  : CHUA CO NGUON, gap 10 lan gia tri dang dung.
+#   model.dropout 0.3 : CHUA CO NGUON, gap 3 lan gia tri dang dung (0,1).
+# Cac dong quet rieng tung nut o tren cho biet nut nao thuc su co tac dung; dong nay
+# cho biet gop ca ba lai thi duoc gi.
+BEST_SET="--set huber_delta=0.3 --set weight_decay=0.1 --set model.dropout=0.3"
+
+# Cộng dồn gradient, chỉ cho finetune. Gom batch theo protein khiến 98,5 % batch chỉ
+# chứa MỘT protein, nên gradient mỗi bước lệch hơn hẳn so với lấy mẫu ngẫu nhiên
+# (54,1 protein mỗi batch). Gộp 8 batch rồi mới cập nhật thì hướng đi lại trộn nhiều
+# protein, mà bộ nhớ không đổi vì mỗi lúc vẫn chỉ giữ một batch con trong đồ thị.
+# eval_every_steps chia 8 theo, vì một "bước" giờ là một lần cập nhật tham số.
+# CHƯA CÓ NGUỒN cho con số 8: hai dòng cuối chạy có cộng dồn, hai dòng trước không,
+# để ĐO xem nó thực sự giúp hay hại chứ không đoán.
+ACCUM_SET="--set accumulate_steps=8 --set eval_every_steps=500"
 
 # Mỗi dòng: "<cấu hình> <đầu ra> <sharpness on|off> [--set khóa=giá_trị ...]"
 # Sáu dòng đầu là ablation kiến trúc, giữ nguyên tham số của config để so sánh được.
@@ -81,11 +100,18 @@ TRAIN_RUNS=(
     "frozen direct on"
     "no_protein direct on"
     "frozen direct off --set huber_delta=0.3"
+    "frozen direct off --set weight_decay=0.03"
     "frozen direct off --set weight_decay=0.1"
-    "frozen direct off --set huber_delta=0.3 --set weight_decay=0.1"
-    "frozen direct on --set huber_delta=0.3 --set weight_decay=0.1"
+    "frozen direct off --set weight_decay=0.3"
+    "frozen direct off --set model.dropout=0.3"
+    "frozen direct off --set model.dropout=0.5"
+    "frozen direct off $BEST_SET"
+    "frozen direct on $BEST_SET"
+    "no_protein direct off $BEST_SET"
     "finetune direct off $FINETUNE_SET"
-    "finetune direct off $FINETUNE_SET --set huber_delta=0.3 --set weight_decay=0.1"
+    "finetune direct off $FINETUNE_SET $BEST_SET"
+    "finetune direct off $FINETUNE_SET $ACCUM_SET"
+    "finetune direct off $FINETUNE_SET $BEST_SET $ACCUM_SET"
 )
 
 # --- 1. Chốt thư mục: script phải nằm đúng trong PROJECT_ROOT -----------------------------

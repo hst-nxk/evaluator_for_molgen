@@ -216,3 +216,62 @@ def test_identity_sides_sets_b_to_a_and_the_label_to_zero() -> None:
     assert identity.fragment_b.tolist() == arrays.fragment_a.tolist()
     assert identity.target.tolist() == [0.0, 0.0]
 
+
+
+# ------------------------------------------------- gom batch theo protein (finetune)
+
+
+def test_protein_batches_use_every_row_exactly_once() -> None:
+    """Như iter_batches: không được mất dòng nào, không được lặp dòng nào."""
+    proteins = np.array([0, 1, 0, 2, 1, 1, 2, 0, 3])
+    rows = np.concatenate(list(data.iter_protein_batches(proteins, 2,
+                                                         np.random.default_rng(0))))
+    assert sorted(rows.tolist()) == list(range(proteins.size))
+
+
+def test_protein_batches_keep_rows_of_one_protein_together() -> None:
+    """4 dòng mỗi protein, batch 4 -> mỗi batch đúng một protein."""
+    proteins = np.repeat([10, 20, 30], 4)
+    batches = list(data.iter_protein_batches(proteins, 4, np.random.default_rng(1)))
+    assert len(batches) == 3
+    for batch in batches:
+        assert len(set(proteins[batch])) == 1
+
+
+def test_protein_batches_cut_far_fewer_proteins_than_random_batches() -> None:
+    """Lý do tồn tại của hàm này: bộ nhớ của finetune tỉ lệ với số protein phân biệt."""
+    rng = np.random.default_rng(2)
+    proteins = rng.integers(0, 50, size=4000)
+    grouped = max(len(set(proteins[b]))
+                  for b in data.iter_protein_batches(proteins, 64, rng))
+    shuffled = max(len(set(proteins[b]))
+                   for b in data.iter_batches(proteins.size, 64, rng))
+    assert grouped <= 3
+    assert shuffled >= 30
+
+
+def test_protein_batches_are_deterministic_without_an_rng() -> None:
+    proteins = np.array([2, 0, 1, 0, 2])
+    once = [b.tolist() for b in data.iter_protein_batches(proteins, 2)]
+    twice = [b.tolist() for b in data.iter_protein_batches(proteins, 2)]
+    assert once == twice
+
+
+def test_protein_batches_shuffle_when_given_an_rng() -> None:
+    proteins = np.repeat(np.arange(20), 10)
+    first = np.concatenate(list(data.iter_protein_batches(proteins, 10,
+                                                          np.random.default_rng(0))))
+    second = np.concatenate(list(data.iter_protein_batches(proteins, 10,
+                                                           np.random.default_rng(1))))
+    assert first.tolist() != second.tolist()
+
+
+def test_protein_batches_keep_the_short_last_batch() -> None:
+    proteins = np.array([0, 0, 0, 0, 0])
+    sizes = [b.size for b in data.iter_protein_batches(proteins, 2)]
+    assert sizes == [2, 2, 1]
+
+
+def test_protein_batches_reject_a_bad_batch_size() -> None:
+    with pytest.raises(ValueError, match="batch_size"):
+        list(data.iter_protein_batches(np.array([0, 1]), 0))

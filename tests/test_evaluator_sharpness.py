@@ -152,3 +152,43 @@ def test_apply_refuses_a_model_with_nothing_to_train() -> None:
     with pytest.raises(ValueError, match="gradient"):
         penalty.apply(torch.nn.functional.mse_loss(prediction, target), prediction,
                       list(model.parameters()), lambda: prediction.mean())
+
+
+def test_penalty_adds_to_an_existing_gradient_when_accumulating() -> None:
+    """Lỗi âm thầm nếu quên: apply() vốn GHI ĐÈ .grad, nên cộng dồn qua nhiều batch con
+    sẽ xóa sạch gradient của những batch trước mà không báo gì."""
+    model = toy_mlp()
+    inputs, targets = toy_batch()
+    penalty = sharpness.SharpnessPenalty(SETTINGS)
+    parameters = list(model.parameters())
+
+    prediction = model(inputs).squeeze(-1)
+    loss = torch.nn.functional.mse_loss(prediction, targets)
+    penalty.apply(loss, prediction, parameters,
+                  lambda: model(inputs).squeeze(-1).mean(), 1.0, False)
+    once = [p.grad.clone() for p in parameters]
+
+    prediction = model(inputs).squeeze(-1)
+    loss = torch.nn.functional.mse_loss(prediction, targets)
+    penalty.apply(loss, prediction, parameters,
+                  lambda: model(inputs).squeeze(-1).mean(), 1.0, True)
+    for first, parameter in zip(once, parameters):
+        assert torch.allclose(parameter.grad, first * 2, atol=1e-5)
+
+
+def test_penalty_weight_scales_the_whole_gradient() -> None:
+    """Trọng số phải nhân vào gradient TỔNG, kể cả số hạng phạt - không thể thay bằng
+    cách chia mất mát, vì số hạng phạt tính từ prediction.mean()."""
+    def gradient(weight: float) -> list[Any]:
+        model = toy_mlp()
+        inputs, targets = toy_batch()
+        penalty = sharpness.SharpnessPenalty(dict(SETTINGS, lambda_init=5.0))
+        parameters = list(model.parameters())
+        prediction = model(inputs).squeeze(-1)
+        loss = torch.nn.functional.mse_loss(prediction, targets)
+        penalty.apply(loss, prediction, parameters,
+                      lambda: model(inputs).squeeze(-1).mean(), weight, False)
+        return [p.grad.clone() for p in parameters]
+
+    for half, full in zip(gradient(0.5), gradient(1.0)):
+        assert torch.allclose(half * 2, full, atol=1e-5)

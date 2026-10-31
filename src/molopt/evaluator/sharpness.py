@@ -71,12 +71,19 @@ class SharpnessPenalty:
         self.last_gradient_norm = 0.0
 
     def apply(self, loss: Any, prediction: Any, parameters: Sequence[Any],
-              recompute_mean: Callable[[], Any]) -> None:
+              recompute_mean: Callable[[], Any], share: float = 1.0,
+              accumulate: bool = False) -> None:
         """Ghi gradient tổng vào ``.grad``, rồi cập nhật ``lambda``.
 
         Nhận: mất mát của batch; đầu ra của batch (chưa lấy trung bình); danh sách tham số
         cần gradient; hàm chạy lại forward trên ĐÚNG batch đó và trả về đầu ra trung bình
         (cần vì sai phân hữu hạn phải đo ở tham số đã bị làm nhiễu).
+
+        ``share`` nhân vào gradient tổng, và ``accumulate`` thì CỘNG vào ``.grad`` sẵn
+        có thay vì ghi đè. Hai tham số này để cộng dồn gradient qua nhiều batch con:
+        ghi đè sẽ xóa mất gradient của những batch trước mà không báo gì. Phải nhân
+        trọng số vào gradient TỔNG chứ không phải vào ``loss``, vì số hạng phạt tính từ
+        ``prediction.mean()`` nên không chịu ảnh hưởng của việc chia nhỏ mất mát.
         """
         import torch
 
@@ -109,7 +116,11 @@ class SharpnessPenalty:
             total = list(loss_grad)
 
         for parameter, part in zip(trainable, total):
-            parameter.grad = part
+            scaled = part if share == 1.0 else part * share
+            if accumulate and parameter.grad is not None:
+                parameter.grad = parameter.grad + scaled
+            else:
+                parameter.grad = scaled
 
         # Dual ascent. Bài báo không nói lambda có bị chặn dưới hay không; chặn tại 0 vì
         # dạng Lagrange ở công thức 12 yêu cầu lambda > 0.

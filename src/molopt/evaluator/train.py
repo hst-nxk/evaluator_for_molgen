@@ -689,12 +689,24 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
                     grad_clip: float, rng: np.random.Generator,
                     penalty: sharpness.SharpnessPenalty | None = None,
                     eval_every: int = 0,
-                    on_eval: Callable[[int], bool] | None = None
-                    ) -> tuple[float, bool, int]:
+                    on_eval: Callable[[int], bool] | None = None,
+                    group_by_protein: bool = False,
+                    accumulate_steps: int = 1) -> tuple[float, bool, int]:
     """Một epoch; trả về (mất mát trung bình theo dòng, có dừng sớm không, số bước).
 
     ``penalty`` khác None thì mỗi batch đi theo Algorithm 1 của IGNITE thay vì
     ``loss.backward()`` (xem molopt.evaluator.sharpness).
+
+    ``group_by_protein`` gom batch theo protein (xem data.iter_protein_batches): bắt
+    buộc ở cấu hình finetune, nếu không mỗi batch chạm tới hàng chục protein và ESM2
+    phải chạy từng ấy lượt trong đồ thị tính toán.
+
+    ``accumulate_steps`` > 1 thì gộp bấy nhiêu batch con lại rồi mới cập nhật tham số
+    một lần. Dùng cùng ``group_by_protein``: gom theo protein làm mỗi batch chỉ còn
+    một protein, nên gradient của một bước rất lệch; cộng dồn vài batch rồi mới bước
+    thì hướng đi lại trộn nhiều protein như khi lấy mẫu ngẫu nhiên, mà bộ nhớ vẫn thấp.
+    "Bước" đếm theo số lần CẬP NHẬT THAM SỐ, không phải số batch con, nên nhịp đo
+    validation của ``eval_every`` giữ nguyên ý nghĩa.
 
     ``eval_every`` > 0 thì cứ sau bấy nhiêu bước lại gọi ``on_eval(step)`` để đo
     validation NGAY GIỮA epoch. Cần thiết vì một epoch dài ~12.900 bước mà lần train
@@ -713,24 +725,35 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
     seen = 0
     step = 0
     stopped = False
-    for rows in data.iter_batches(len(arrays), batch_size, rng):
+    batches = (data.iter_protein_batches(arrays.protein, batch_size, rng)
+               if group_by_protein else data.iter_batches(len(arrays), batch_size, rng))
+    pending = 0
+    optimizer.zero_grad(set_to_none=True)
+    for rows in batches:
         batch = batch_tensors(arrays, rows, caches, protein_source, device,
                               model.uses_edit_branch)
-        optimizer.zero_grad(set_to_none=True)
         prediction = model(batch["ligand_a"], batch["ligand_b"], batch["fragment_a"],
                            batch["fragment_b"], batch["protein"], batch["endpoint"])
         loss = criterion(prediction, batch["target"])
+        share = 1.0 / accumulate_steps
         if penalty is None:
-            loss.backward()
+            # PyTorch vốn CỘNG vào .grad, nên chia mất mát là đủ để lấy trung bình.
+            (loss * share if accumulate_steps > 1 else loss).backward()
         else:
             penalty.apply(loss, prediction, trainable,
                           lambda rows=rows: forward_mean(model, arrays, rows, caches,
-                                                         protein_source, device))
+                                                         protein_source, device),
+                          share, accumulate_steps > 1)
+        total += float(loss.detach().to("cpu")) * rows.size
+        seen += rows.size
+        pending += 1
+        if pending < accumulate_steps:
+            continue
         if grad_clip > 0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
-        total += float(loss.detach().to("cpu")) * rows.size
-        seen += rows.size
+        optimizer.zero_grad(set_to_none=True)
+        pending = 0
         step += 1
         if eval_every > 0 and on_eval is not None and step % eval_every == 0:
             stopped = on_eval(step)
@@ -740,6 +763,13 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
                 protein_source.train(True)
             if stopped:
                 break
+    if pending:
+        # Batch lẻ ở cuối epoch: vẫn cập nhật, không vứt gradient đã tính.
+        if grad_clip > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        step += 1
     return total / max(seen, 1), stopped, step
 
 
@@ -804,6 +834,10 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
     limit = int(settings["smoke_rows"]) if smoke else None
     epochs = int(settings["smoke_epochs"] if smoke else settings["epochs"])
     batch_size, eval_batch_size = effective_batch_sizes(settings, protein_mode, smoke)
+    # Gom batch theo protein CHỈ ở finetune: chỉ ở đó ESM2 mới nằm trong đồ thị
+    # tính toán nên số protein phân biệt mỗi batch mới quyết định bộ nhớ.
+    group_by_protein = protein_mode == models.PROTEIN_FINETUNE
+    accumulate_steps = max(1, int(settings.get("accumulate_steps", 1) or 1))
 
     caches = Caches(config, root, need_protein=protein_mode == models.PROTEIN_FROZEN)
     sequences: dict[str, str] = {}
@@ -927,7 +961,8 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         loss, stopped, steps = train_one_epoch(
             model, train_arrays, caches, protein_source, device, optimizer, criterion,
             batch_size, float(settings["grad_clip"]), rng, penalty, eval_every,
-            lambda step, current=epoch: consider(current, step, None))
+            lambda step, current=epoch: consider(current, step, None),
+            group_by_protein, accumulate_steps)
         LOGGER.info("epoch %s: %s bước", epoch, f"{steps:,}")
         if stopped or consider(epoch, None, loss):
             break
@@ -952,6 +987,7 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "device": device, "seed": int(settings["seed"]),
         "epochs_run": 1 + max((record["epoch"] for record in history), default=-1),
         "measurements": len(history), "eval_every_steps": eval_every,
+        "group_by_protein": group_by_protein, "accumulate_steps": accumulate_steps,
         "overrides": dict(overrides or {}), "batch_size": batch_size,
         "learning_rate": float(settings["learning_rate"]),
         "weight_decay": float(settings["weight_decay"]),

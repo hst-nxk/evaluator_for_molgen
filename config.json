@@ -562,6 +562,8 @@
       "loss": "huber",
       "huber_delta": 1.0,
       "early_stopping_patience": 2,
+      "accumulate_steps": 1,
+      "accumulate_steps_note": "Gop bao nhieu batch con lai roi moi cap nhat tham so mot lan. 1 = cap nhat moi batch (mac dinh, giong truoc gio). Chi co y nghia o cau hinh finetune, noi vong train gom batch theo protein: khi do 98,5 phan tram batch chi chua DUNG MOT protein, nen gradient cua mot buoc rat lech so voi lay mau ngau nhien (do duoc 54,1 protein moi batch). Cong don vai batch roi moi buoc thi huong di lai tron nhieu protein, ma bo nho van thap vi moi luc chi giu mot batch con trong do thi. CHUA CO NGUON cho gia tri cu the; dot chay 01/11/2026 quet 1 va 8 de do xem co anh huong that khong. Luu y: so buoc moi epoch chia cho accumulate_steps, nen eval_every_steps phai chia theo neu muon giu nguyen nhip do.",
       "eval_every_steps": 2000,
       "early_stopping_patience_evals": 5,
       "eval_cadence_note": "eval_every_steps = 0 thi chi do validation o cuoi moi epoch (hanh vi cu). CHUA CO NGUON cho hai con so nay - day la lua chon ky thuat, suy ra tu so do: train co 6.627.559 dong, batch 512 nen mot epoch dai 12.944 buoc; lan train 31/10/2026 (runs/evaluator/train_v4_frozen_direct_console.txt) cho MAE validation tot nhat ngay o epoch 0 (0,6138) roi xau di (0,6241 / 0,6274), tuc diem tot nhat nam BEN TRONG epoch dau va do moi epoch mot lan se bo lo. 2000 buoc cho khoang 6 lan do moi epoch. Khi eval_every_steps > 0 thi kien nhan tinh theo SO LAN DO (early_stopping_patience_evals) chu khong theo so epoch; 5 lan do ~ 10.000 buoc ~ 0,77 epoch khong cai thien. Moi lan do chay tren TOAN BO validation (493.852 dong), khong lay mau, de khong chon checkpoint theo mot mau nhieu.",
@@ -585,9 +587,9 @@
       "eval_batch_size": 4096,
       "smoke_rows": 20000,
       "smoke_epochs": 2,
-      "finetune_overrides": {"batch_size": 64, "max_residues": 512,
-                             "eval_batch_size": 128},
-      "finetune_overrides_note": "CHUA DO tren GPU nao - day la uoc luong de tranh het VRAM. Cau hinh finetune giu ESM2 trong do thi tinh toan nen bo nho ti le voi (so protein PHAN BIET trong batch x so acid amin x so lop). Uoc tinh cho esm2_t12_35M, 512 acid amin, 12 lop: rieng ma tran attention da la ~21 MiB moi chuoi moi lop, nen mot batch 64 dong (khoang 40 protein phan biet) can khoang 15 GiB khi co gradient. Vi vay batch_size giu o 64 ngay ca tren RTX 4090 24 GB; muon tang thi phai do truoc. eval_batch_size 128 (thay vi 4096 cua frozen): luot du doan khong luu gradient nen nhe hon nhieu, nhung van phai chay ESM2, va 4096 dong co the cham toi hang nghin protein phan biet mot luc -> het VRAM ngay lan do validation dau tien. Neu van het bo nho thi giam batch_size truoc, roi moi giam max_residues.",
+      "finetune_overrides": {"batch_size": 256, "max_residues": 512,
+                             "eval_batch_size": 512},
+      "finetune_overrides_note": "Cau hinh finetune giu ESM2 trong do thi tinh toan, nen bo nho ti le voi so protein PHAN BIET trong batch chu KHONG phai so dong. Vi vay vong train gom batch theo protein o cau hinh nay (data.iter_protein_batches). DO DUOC tren train v4 (31/10/2026): lay batch ngau nhien thi 64 dong cham ~54,1 protein; gom theo protein thi batch 256 chi cham 1,10 protein trung binh (p99 = 4, xau nhat 13) va 98 phan tram batch chi co dung mot protein. Smoke tren RTX 4090 do duoc 17 GB o muc 13,6 protein moi batch, suy ra khoang 1,25 GB moi protein: batch 256 can ~1,4 GB thuong xuyen va ~16 GB o batch xau nhat. batch_size 256 chon de so buoc moi epoch con 25.889 (batch 64 la 103.556) ma van du khoang an toan. eval_batch_size 512: luot du doan chay duoi no_grad nen khong giu activation, nhe hon han luot train; thu tu doc la tuan tu nen batch 512 chi cham 2,84 protein trung binh. Card nho hon 24 GB thi giam batch_size truoc, roi moi giam max_residues.",
       "note": "protein_learning_rate chỉ dùng ở cấu hình finetune: ESM2 đã pretrain nên học với learning rate nhỏ hơn phần đầu dự đoán hai bậc, tránh phá trọng số pretrain. loss = huber (ít nhạy với nhãn ngoại lai hơn MSE, mà dataset còn giữ nguyên giá trị nguồn bất khả thi và chỉ gắn cờ). early_stopping theo validation, KHÔNG dùng partition test. dataloader_workers = 0 vì Windows dùng spawn và cache fingerprint đã nằm trong RAM."
     },
     "metrics": {

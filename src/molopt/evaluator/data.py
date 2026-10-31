@@ -270,6 +270,44 @@ def iter_batches(count: int, batch_size: int, rng: np.random.Generator | None = 
         yield indices[start:start + batch_size]
 
 
+def iter_protein_batches(proteins: np.ndarray, batch_size: int,
+                         rng: np.random.Generator | None = None) -> Iterator[np.ndarray]:
+    """Chia batch sao cho MỖI BATCH CHỈ CHẠM ÍT PROTEIN; vẫn dùng hết mọi dòng một lần.
+
+    Vì sao cần: ở cấu hình finetune, ESM2 nằm trong đồ thị tính toán và chạy một lượt cho
+    mỗi protein PHÂN BIỆT trong batch, giữ lại activation cho lượt lùi. Lấy batch ngẫu
+    nhiên thì 64 dòng chạm tới ~54 protein khác nhau (đo trên train v4), tức 54 lượt ESM2
+    — ước tính ~68 GB, quá sức mọi card. Gom theo protein thì phần lớn batch chỉ có 1-2
+    protein, nên bộ nhớ giảm khoảng một bậc mà SỐ BƯỚC MỖI EPOCH KHÔNG ĐỔI.
+
+    Cách làm: xáo trộn dòng trong từng protein, xáo trộn thứ tự protein, nối lại rồi cắt
+    thành các batch liên tiếp. Mỗi dòng xuất hiện đúng một lần mỗi epoch, như iter_batches.
+
+    ĐÁNH ĐỔI, phải ghi vào paper: các dòng trong một batch không còn độc lập (phần lớn
+    cùng một protein), nên gradient của mỗi bước nhiễu hơn so với lấy mẫu ngẫu nhiên.
+    Đây là lý do hàm này CHỈ dùng cho finetune, còn frozen vẫn lấy mẫu ngẫu nhiên: ở
+    frozen vector protein đã tính sẵn nên không có gì để tiết kiệm.
+
+    Nhận: `proteins` là chỉ số protein của từng dòng (PairArrays.protein); cỡ batch; rng
+    (None = không xáo trộn, để test lặp lại được).
+    Trả về: lần lượt từng mảng chỉ số dòng.
+    """
+    if batch_size < 1:
+        raise ValueError(f"batch_size phải >= 1, nhận {batch_size}")
+    order = np.argsort(proteins, kind="stable")
+    sorted_proteins = proteins[order]
+    # Ranh giới giữa các protein trong mảng đã sắp xếp.
+    cuts = np.flatnonzero(np.diff(sorted_proteins)) + 1
+    groups = np.split(order, cuts)
+    if rng is not None:
+        for group in groups:
+            rng.shuffle(group)
+        groups = [groups[i] for i in rng.permutation(len(groups))]
+    flat = np.concatenate(groups) if groups else np.empty(0, dtype=np.int64)
+    for start in range(0, flat.size, batch_size):
+        yield flat[start:start + batch_size]
+
+
 def distinct_strings(table: pa.Table, columns: Sequence[str]) -> pa.Array:
     """Tập giá trị chuỗi phân biệt trên nhiều cột, đã sắp xếp.
 
