@@ -158,16 +158,15 @@ mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$HF_HOME" "$TORCH_HOME" \
     "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH" "$MPLCONFIGDIR" "$TMPDIR"
 
 # --- 4. Chốt dữ liệu --------------------------------------------------------------------
+# Chỉ hai file ĐẦU VÀO là bắt buộc phải có sẵn: chúng nằm trong data/, bị gitignore, nên
+# phải chép tay sang server. Bốn file cache trong work/ KHÔNG kiểm ở đây vì chính bước
+# prepare dựng ra chúng — đòi chúng tại đây thì script chết trước khi kịp chạy prepare.
 for required in \
     data/dataset_v4/evaluator_training.parquet \
-    data/dataset_v4/full/proteins.parquet \
-    work/evaluator_cache_v4/cache_manifest.json \
-    work/evaluator_cache_v4/fragment_fingerprints.parquet \
-    work/evaluator_cache_v4/molecule_fingerprints.parquet \
-    work/evaluator_cache_v4/protein_embeddings.parquet; do
-    [[ -f "$required" ]] || fail "thiếu $required"
+    data/dataset_v4/full/proteins.parquet; do
+    [[ -f "$required" ]] || fail "thiếu $required (chép tay sang server, data/ bị gitignore)"
 done
-echo "dữ liệu: đủ 6 file"
+echo "dữ liệu đầu vào: đủ 2 file; cache sẽ dựng ở bước prepare"
 
 # --- 5. Chọn 1 GPU ----------------------------------------------------------------------
 nvidia-smi || fail "không gọi được nvidia-smi"
