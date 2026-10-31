@@ -37,6 +37,9 @@ def inputs(protein: bool = True) -> dict[str, Any]:
 
 
 def build(head: str, protein_mode: str) -> models.EvaluatorModel:
+    # Trọng số khởi tạo cố định: kết quả test không phụ thuộc trạng thái ngẫu nhiên mà các
+    # test chạy trước để lại.
+    torch.manual_seed(0)
     dimension = None if protein_mode == models.PROTEIN_NONE else PROTEIN_DIM
     return models.EvaluatorModel(SETTINGS, LIGAND_BITS, FRAGMENT_BITS, dimension,
                                  ENDPOINTS, head, protein_mode)

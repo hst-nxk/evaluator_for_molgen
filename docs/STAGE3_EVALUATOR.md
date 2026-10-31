@@ -240,6 +240,93 @@ thì dự đoán thay đổi theo từng ứng viên nên không có kênh nào 
 thích trên suy ra từ cơ chế và khớp với số liệu, **chưa kiểm chứng trực tiếp**; cách kiểm
 là chạy lại với `expand_both_directions = false`, khi đó `endpoint_mean` phải cho đúng 0 %.
 
+### 4.5.1 Mốc dưới đo lại trên dataset_v4 (31/10/2026)
+
+Validation của v4 có 500.704 cặp; bỏ các dòng thiếu nhãn còn n = 493.852.
+
+| baseline | MAE | RMSE | R² | Spearman |
+|---|---|---|---|---|
+| `endpoint_mean` (trung bình theo endpoint) | **0,5880** | **0,8115** | −0,0000 | 0,0039 |
+| `random` | 0,8760 | 1,1484 | −1,0026 | −0,0006 |
+
+`endpoint_mean` là mốc phải vượt. Hai lần train thử ở máy cá nhân (`frozen direct`) **chưa
+vượt được mốc này về MAE**: 0,6138 ở learning rate 1e-3 và 0,6247 ở 2e-4, cả hai đều dừng
+sớm với MAE validation tăng dần. Nhưng cả hai **vượt rõ về xếp hạng** (Spearman 0,12 so với
+0,004 của baseline; tỉ lệ đúng chiều 0,55 so với 0,50). Đọc đúng số này: mô hình học được
+*thứ tự* tốt hơn hẳn mức ngẫu nhiên nhưng *giá trị tuyệt đối* còn kém cách đoán trung bình,
+và nó overfit trong epoch đầu. Đó là lý do có mục 4.6.
+
+## 4.6 Số hạng phạt chuẩn gradient đầu ra (IGNITE), tùy chọn
+
+Nguồn: Dao MC, Nguyen PL, Truong TN, Hoang TN. *Incorporating Surrogate Gradient Norm to
+Improve Offline Optimization Techniques*. NeurIPS 2024, DOI 10.52202/079017-0258,
+arXiv:2503.04242. Code tham chiếu của tác giả: `github.com/cuong-dm/IGNITE`.
+
+**Vì sao liên quan.** Evaluator của dự án đúng là một *surrogate offline*: nó học từ dữ
+liệu đã có rồi sẽ bị generator hỏi ở những cặp chưa từng thấy. Bài báo chỉ ra chỗ hỏng của
+kiểu mô hình này là *độ sắc* — đổi tham số một chút thì đầu ra đổi nhiều — và phạt chuẩn
+gradient đầu ra làm nó bớt sắc, nhờ đó đáng tin hơn ngoài vùng dữ liệu. Đo trên v4 ngày
+31/10/2026, vòng train thường **overfit ngay trong epoch đầu** (train loss 0,107 → 0,052
+trong khi MAE validation tăng 0,614 → 0,627), và hạ learning rate từ 1e-3 xuống 2e-4
+**không** cứu được (MAE 0,625). Nói cách khác vấn đề là tổng quát hóa, đúng chỗ bài báo
+nhắm tới — nên phương pháp được cài vào code để **đo bằng ablation**, không phải để tin
+sẵn.
+
+**Công thức.** Bài báo ước lượng độ sắc bằng `rho * ||grad_omega h(omega)||` với
+`h(omega)` là đầu ra trung bình của surrogate trên dữ liệu offline (công thức 10, 18), rồi
+giải bài toán có ràng buộc `rho * ||grad_omega h|| <= epsilon` (công thức 11) bằng nhân tử
+Lagrange `lambda` cập nhật theo dual ascent (công thức 12-14). Gradient của số hạng phạt
+cần Hessian, nên bài báo xấp xỉ bằng sai phân hữu hạn bán kính `r` (công thức 83-85,
+Algorithm 1) — chỉ cần gradient bậc nhất, nhưng thêm một lượt forward.
+
+Một bước, đúng theo Algorithm 1 (code: `src/molopt/evaluator/sharpness.py`):
+
+```
+g1 = grad (mất mát trung bình)
+g2 = grad (đầu ra trung bình)                  # = grad_omega h
+omega_hat = omega + r * g2 / ||g2||
+g3 = grad (đầu ra trung bình, tại omega_hat)
+g  = g1 + lambda * (rho / r) * (g3 - g2)
+lambda <- lambda + eta_lambda * (rho * ||g2|| - epsilon)
+```
+
+Có test ghim rằng cách xấp xỉ này được cài đúng: trên mô hình **tuyến tính** (Hessian bằng
+0) số hạng phạt phải triệt tiêu đúng bằng 0 dù `lambda` lớn, còn trên MLP thì không.
+
+**Cách chạy.** Mặc định **tắt** (`stage3.train.sharpness.enabled = false`) để các lần train
+cũ vẫn so sánh được. Bật bằng dòng lệnh, không phải sửa config:
+
+```
+python run_evaluator.py --mode train --config frozen --head direct --sharpness on
+```
+
+`scripts/server_run_all.sh` chạy ablation: bốn lần train như cũ (`sharpness=off`) rồi
+`frozen direct` và `no_protein direct` với `sharpness=on`, mọi tham số khác giữ nguyên.
+
+**Tham số, lấy từ bài báo** (`stage3.train.sharpness`): `lambda_init` 0,01 (grid
+{1e-4, 1e-3, 1e-2}, mục 5.1); `epsilon` 0,1 (mục 5.1, ablation {0,01 … 0,5});
+`lambda_learning_rate` 1e-3 (hình 2b); `rho` = `r` = 0,05 (mục 5.1, grid
+{0,01, 0,05, 0,1, 0,2}). **Bài báo tự mâu thuẫn ở chỗ này**: phụ lục G.2 ghi `rho = r = 0,2`
+trên grid rộng hơn. Config lấy số của mục 5.1 và ghi lại mâu thuẫn chứ không chọn bừa.
+
+**Bốn chỗ phải nói rõ khi viết paper:**
+
+1. Bài báo cập nhật tham số bằng gradient descent thuần; dự án dùng **AdamW** cho khớp các
+   lần train trước, nên đây không phải bản sao y nguyên.
+2. Giả thiết 1 của bài báo cần **đầu ra bị chặn trong [0, 1]**; nhãn Δp của dự án không bị
+   chặn (khoảng −10 đến 10). Vì vậy định lý 2 **không áp dụng trực tiếp**; chỉ còn lại lý
+   do trực giác cộng số đo ablation.
+3. Kéo theo điều trên: `epsilon` 0,1 của bài báo đo trên thang [0, 1], còn độ sắc ở đây đo
+   trên thang Δp. Smoke ngày 31/10/2026 đo được độ sắc 0,11–0,14 nên `lambda` tăng dần.
+   Nếu ablation cho kết quả xấu thì phải quét lại `epsilon` theo thang Δp **trước khi** kết
+   luận phương pháp không hiệu quả.
+4. Bài báo không nói `lambda` có bị chặn dưới 0 hay không; code chặn tại 0 vì dạng Lagrange
+   ở công thức 12 yêu cầu `lambda > 0`.
+
+**Chi phí.** Mỗi batch cần 3 lượt forward thay vì 1 (lượt gốc, lượt lấy gradient đầu ra,
+lượt tại điểm bị làm nhiễu), nên chậm khoảng 3 lần. VRAM đo được ở smoke: 328 MiB, gần như
+không đổi so với 314–320 MiB của vòng train thường.
+
 ## 5. Ba cấu hình
 
 | cấu hình | nhánh protein | mục đích |
