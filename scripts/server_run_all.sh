@@ -17,14 +17,19 @@
 #     HOME, cache Hugging Face/torch/triton/CUDA và file tạm đều chuyển vào .cache/.
 #   - Chỉ dùng conda env ENV_NAME; sai env thì dừng ngay.
 #   - Chỉ dùng 1 GPU: GPU còn trống nhiều bộ nhớ nhất lúc bắt đầu.
-#   - VRAM bị chặn trên bởi stage3.train.gpu_memory_limit_mib trong config.json (9 GiB).
+#   - VRAM bị chặn trên bởi stage3.train.gpu_memory_limit_mib trong config.json (9 GiB);
+#     riêng các lần finetune tự nâng trần bằng --set gpu_memory_limit_mib.
 #   - Không dùng partition test: code Stage 3 chỉ đọc train và validation.
-#   - Không chạy finetune: theo ước tính (chưa đo) nó cần quá trần VRAM ở batch hiện tại;
-#     cần đo riêng trước khi đưa vào.
+#   - Finetune chạy SAU CÙNG: nó đắt nhất và trần VRAM của nó chưa đo được lần nào, nên
+#     nếu nó hỏng thì mọi kết quả frozen / no_protein đã xong và đã ghi ra đĩa từ trước.
 #
-# Thứ tự: kiểm tra môi trường -> pytest -> baseline -> smoke -> train. Kiểm tra môi trường
-# hoặc pytest lỗi thì dừng hẳn. Từ baseline trở đi, một bước lỗi chỉ được ghi lại, các bước
-# sau vẫn chạy; riêng smoke của cấu hình nào lỗi thì bỏ train của cấu hình đó.
+# Thứ tự: kiểm tra môi trường -> pytest -> prepare -> baseline -> smoke -> train. Kiểm tra
+# môi trường, pytest hoặc prepare lỗi thì dừng hẳn. Từ baseline trở đi, một bước lỗi chỉ
+# được ghi lại, các bước sau vẫn chạy; riêng smoke của cấu hình nào lỗi thì bỏ train của
+# cấu hình đó.
+#
+# CẦN CÓ SẴN TRÊN SERVER: data/dataset_v4/ (2,4 GB, bị gitignore nên git pull KHÔNG mang
+# theo). Thiếu nó thì bước prepare hỏng ngay và script dừng. Chép bằng rsync từ máy cá nhân.
 set -u -o pipefail
 
 MODE="${1:-all}"
@@ -44,13 +49,43 @@ MIN_FREE_GPU_MIB=10240
 # Ngưỡng này gấp khoảng 6 lần số đo đó.
 MIN_FREE_GPU_MIB_EVAL=2048
 SECONDS_PER_MINUTE=60
-SMOKE_CONFIGS=("no_protein" "frozen")
+SMOKE_CONFIGS=("no_protein" "frozen" "finetune")
 # Thứ tự train theo docs/STAGE3_EVALUATOR.md, chưa gồm finetune.
+# Mỗi dòng: "<cấu hình> <đầu ra> <sharpness on|off>". Cột thứ ba bật số hạng phạt chuẩn
+# gradient đầu ra (IGNITE, arXiv:2503.04242); thiếu cột thì coi là off.
+# Hai dòng cuối là ablation có / không số hạng phạt, giữ nguyên mọi tham số khác, nên
+# so sánh được trực tiếp với dòng đầu. Chạy sau cùng vì mỗi batch cần 3 lượt forward.
+# Hai lần finetune chạy sau cùng và cần tham số riêng:
+#   gpu_memory_limit_mib 18432 : trần 9 GiB của config là để chia GPU với người khác;
+#       finetune giữ ESM2 trong đồ thị nên cần nhiều hơn hẳn. 18 GiB vẫn chừa ~6 GiB
+#       trên card 24 GB. CHƯA ĐO: nếu hết bộ nhớ thì giảm finetune_overrides.batch_size.
+#   eval_every_steps 20000     : finetune chạy batch 64 nên một epoch dài ~103.500 bước
+#       (gấp 8 lần frozen). Giữ 2000 sẽ thành ~52 lần đo validation mỗi epoch, mà mỗi
+#       lần đo đều phải chạy lại ESM2 -> phần lớn thời gian của đêm dành cho việc đo.
+FINETUNE_SET="--set gpu_memory_limit_mib=18432 --set eval_every_steps=20000"
+
+# Mỗi dòng: "<cấu hình> <đầu ra> <sharpness on|off> [--set khóa=giá_trị ...]"
+# Sáu dòng đầu là ablation kiến trúc, giữ nguyên tham số của config để so sánh được.
+# Bốn dòng sau là quét tham số chống overfit trên kiến trúc rẻ nhất (frozen direct):
+# lần train 31/10/2026 cho train loss tụt (0,107 -> 0,052) trong khi MAE validation
+# tăng (0,614 -> 0,627), tức khớp quá dữ liệu train chứ không phải thiếu dung lượng.
+#   huber_delta 0.3 : dưới 0,3 log là sai số thí nghiệm (Landrum & Riniker 2024,
+#                     DOI 10.1021/acs.jcim.4c00049) nên phạt bình phương; trên mức đó
+#                     phạt tuyến tính. Vừa hợp nguồn vừa gần với MAE đang báo cáo.
+#   weight_decay 0.1: CHƯA CÓ NGUỒN, gấp 10 lần giá trị đang dùng, chỉ để xem hướng.
 TRAIN_RUNS=(
-    "frozen direct"
-    "no_protein direct"
-    "frozen direct_no_edit"
-    "frozen twin"
+    "frozen direct off"
+    "no_protein direct off"
+    "frozen direct_no_edit off"
+    "frozen twin off"
+    "frozen direct on"
+    "no_protein direct on"
+    "frozen direct off --set huber_delta=0.3"
+    "frozen direct off --set weight_decay=0.1"
+    "frozen direct off --set huber_delta=0.3 --set weight_decay=0.1"
+    "frozen direct on --set huber_delta=0.3 --set weight_decay=0.1"
+    "finetune direct off $FINETUNE_SET"
+    "finetune direct off $FINETUNE_SET --set huber_delta=0.3 --set weight_decay=0.1"
 )
 
 # --- 1. Chốt thư mục: script phải nằm đúng trong PROJECT_ROOT -----------------------------
@@ -124,12 +159,12 @@ mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$HF_HOME" "$TORCH_HOME" \
 
 # --- 4. Chốt dữ liệu --------------------------------------------------------------------
 for required in \
-    data/dataset_v3/evaluator_training.parquet \
-    data/dataset_v3/full/proteins.parquet \
-    work/evaluator_cache_v3/cache_manifest.json \
-    work/evaluator_cache_v3/fragment_fingerprints.parquet \
-    work/evaluator_cache_v3/molecule_fingerprints.parquet \
-    work/evaluator_cache_v3/protein_embeddings.parquet; do
+    data/dataset_v4/evaluator_training.parquet \
+    data/dataset_v4/full/proteins.parquet \
+    work/evaluator_cache_v4/cache_manifest.json \
+    work/evaluator_cache_v4/fragment_fingerprints.parquet \
+    work/evaluator_cache_v4/molecule_fingerprints.parquet \
+    work/evaluator_cache_v4/protein_embeddings.parquet; do
     [[ -f "$required" ]] || fail "thiếu $required"
 done
 echo "dữ liệu: đủ 6 file"
@@ -223,26 +258,47 @@ if ! run_step "pytest" python -m pytest -q; then
     fail "pytest lỗi, không train"
 fi
 
+# Cache fingerprint + embedding protein nằm trong work/, mà work/ bị gitignore: sau khi
+# `git pull` về server thì cache CHƯA CÓ (hoặc còn là cache của dataset cũ). Dựng lại ở
+# đây để một lệnh là đủ. Hỏng bước này thì mọi lần train sau đều hỏng, nên dừng hẳn.
+if ! run_step "prepare (cache fingerprint + ESM2)" python run_evaluator.py --mode prepare
+then
+    print_summary
+    fail "prepare lỗi, không train"
+fi
+
 run_step "baseline" python run_evaluator.py --mode baseline
 
 declare -A smoke_ok=()
 for configuration in "${SMOKE_CONFIGS[@]}"; do
+    # Smoke của finetune phải chạy với ĐÚNG trần VRAM mà lần train của nó sẽ dùng: giữ
+    # trần 9 GiB ở đây thì smoke hết bộ nhớ, script coi là finetune hỏng và bỏ luôn cả
+    # hai lần train finetune — mất cả đêm vì một con số không liên quan.
+    smoke_extra=""
+    if [[ "$configuration" == "finetune" ]]; then
+        smoke_extra="$FINETUNE_SET"
+    fi
+    # shellcheck disable=SC2086
     if run_step "smoke $configuration" \
-        python run_evaluator.py --mode smoke --config "$configuration"; then
+        python run_evaluator.py --mode smoke --config "$configuration" $smoke_extra; then
         smoke_ok[$configuration]=1
     fi
 done
 
 for entry in "${TRAIN_RUNS[@]}"; do
-    read -r configuration head <<<"$entry"
-    label="train $configuration $head"
+    read -r configuration head penalty extra <<<"$entry"
+    penalty="${penalty:-off}"
+    label="train $configuration $head sharpness=$penalty${extra:+ $extra}"
     if [[ " ${SMOKE_CONFIGS[*]} " == *" $configuration "* && -z "${smoke_ok[$configuration]:-}" ]]
     then
         summary+=("$label: BỎ QUA (smoke $configuration lỗi)")
         continue
     fi
+    # $extra KHÔNG được bọc nháy: nó phải tách thành nhiều tham số --set riêng biệt.
+    # shellcheck disable=SC2086
     run_step "$label" \
-        python run_evaluator.py --mode train --config "$configuration" --head "$head"
+        python run_evaluator.py --mode train --config "$configuration" --head "$head" \
+        --sharpness "$penalty" $extra
 done
 
 print_summary

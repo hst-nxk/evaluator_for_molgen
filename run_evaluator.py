@@ -3,8 +3,9 @@
     python run_evaluator.py --mode prepare  [--skip-protein]
     python run_evaluator.py --mode baseline
     python run_evaluator.py --mode smoke   [--config frozen|finetune|no_protein]
-                                           [--head direct|twin]
+                                           [--head direct|twin] [--sharpness on|off]
     python run_evaluator.py --mode train   [--config ...] [--head ...]
+                                           [--sharpness on|off] [--set khóa=giá_trị ...]
     python run_evaluator.py --mode eval    --checkpoint runs/evaluator/<file>.pt
 """
 # ---------------------------------------------------------------------------------------
@@ -56,6 +57,46 @@ def setup_logging(log_path: Path) -> None:
                                   logging.FileHandler(log_path, encoding="utf-8")])
 
 
+def apply_overrides(settings: dict, pairs: list[str]) -> dict:
+    """Ghi đè các tham số train từ dòng lệnh, dạng ``khóa=giá trị``.
+
+    Chỉ cho phép ghi đè khóa ĐÃ CÓ trong ``stage3.train`` và có giá trị là số hoặc
+    chuỗi: gõ sai tên khóa sẽ báo lỗi ngay thay vì âm thầm bỏ qua, nếu không cả một đợt
+    quét tham số có thể chạy xong mới phát hiện là vô nghĩa. Kiểu được suy từ giá trị
+    đang có trong config, nên không cần khai báo kiểu ở dòng lệnh.
+
+    Khóa có dấu chấm thì đi vào khối con, ví dụ ``finetune_overrides.batch_size=32``.
+    Trả về: dict khóa -> giá trị mới, để ghi vào manifest của lần chạy.
+    """
+    applied: dict = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise ValueError(f"--set cần dạng khóa=giá trị, nhận {pair!r}")
+        key, _, raw = pair.partition("=")
+        key = key.strip()
+        target = settings
+        path = key.split(".")
+        for step in path[:-1]:
+            if not isinstance(target, dict) or step not in target:
+                raise ValueError(f"--set: không có khối {step!r} trong {key!r}")
+            target = target[step]
+        leaf = path[-1]
+        if not isinstance(target, dict) or leaf not in target:
+            raise ValueError(f"--set: không có tham số {key!r} trong stage3.train")
+        current = target[leaf]
+        if isinstance(current, bool) or not isinstance(current, (int, float, str)):
+            raise ValueError(f"--set: không ghi đè được {key!r} "
+                             f"(kiểu {type(current).__name__})")
+        value: object = raw
+        if isinstance(current, int):
+            value = int(raw)
+        elif isinstance(current, float):
+            value = float(raw)
+        target[leaf] = value
+        applied[key] = value
+    return applied
+
+
 def main() -> int:
     """Nhận tham số dòng lệnh, chạy chế độ tương ứng. Trả về mã thoát (0 = xong)."""
     config = load_config(CONFIG_PATH)
@@ -70,8 +111,22 @@ def main() -> int:
                              "bỏ nhánh edit; twin: chấm riêng từng phân tử rồi lấy hiệu")
     parser.add_argument("--skip-protein", action="store_true",
                         help="prepare: chỉ dựng cache fingerprint, bỏ qua ESM2")
+    parser.add_argument("--sharpness", choices=("on", "off"), default=None,
+                        help="smoke/train: bật hoặc tắt số hạng phạt chuẩn gradient đầu ra "
+                             "(IGNITE, arXiv:2503.04242); không truyền thì theo config "
+                             "stage3.train.sharpness.enabled")
+    parser.add_argument("--set", dest="overrides", action="append", default=[],
+                        metavar="KHÓA=GIÁ_TRỊ",
+                        help="smoke/train: ghi đè một tham số trong stage3.train mà không "
+                             "sửa config.json, ví dụ --set weight_decay=0.1 "
+                             "--set huber_delta=0.3; dùng được nhiều lần")
     parser.add_argument("--checkpoint", type=Path, help="eval: file .pt cần nạp")
     args = parser.parse_args()
+
+    try:
+        overrides = apply_overrides(settings, args.overrides)
+    except ValueError as error:
+        parser.error(str(error))
 
     stamp = datetime.now().strftime(evaluator_train.TIMESTAMP_FORMAT)
     runs_dir = ROOT / config["stage3"]["paths"]["runs_dir"]
@@ -84,8 +139,11 @@ def main() -> int:
         evaluator_train.run_baselines(config, ROOT, stamp)
         return 0
     if args.mode in ("smoke", "train"):
+        if overrides:
+            logging.info("ghi đè tham số train: %s", overrides)
         evaluator_train.run_train(config, ROOT, args.configuration, args.head,
-                                  smoke=args.mode == "smoke", stamp=stamp)
+                                  smoke=args.mode == "smoke", stamp=stamp,
+                                  sharpness_mode=args.sharpness, overrides=overrides)
         return 0
     if args.checkpoint is None:
         parser.error("--mode eval cần --checkpoint")

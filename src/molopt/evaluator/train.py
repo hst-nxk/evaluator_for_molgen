@@ -22,7 +22,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from . import data, features, metrics
+from . import data, features, metrics, sharpness
 
 LOGGER = logging.getLogger(__name__)
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
@@ -468,7 +468,8 @@ def evaluate(arrays: data.PairArrays, prediction: np.ndarray, keys: Mapping[str,
 
 
 def asymmetry_report(model: Any, arrays: data.PairArrays, caches: Caches, protein_source: Any,
-                     device: str, config: Mapping[str, Any]) -> dict[str, Any] | None:
+                     device: str, config: Mapping[str, Any],
+                     eval_batch_size: int) -> dict[str, Any] | None:
     """Đo mức bất đối xứng của mô hình đã train, trên một mẫu dòng validation.
 
     Dự án CHỌN KHÔNG cưỡng chế đối xứng cho đầu ra `direct` (cưỡng chế sẽ làm thay đổi
@@ -493,7 +494,7 @@ def asymmetry_report(model: Any, arrays: data.PairArrays, caches: Caches, protei
     else:
         rows = np.arange(len(arrays), dtype=np.int64)
     sample = data.take_rows(arrays, rows)
-    batch_size = int(train_settings["eval_batch_size"])
+    batch_size = eval_batch_size
     forward = predict(model, sample, caches, protein_source, device, batch_size)
     backward = predict(model, data.swap_sides(sample), caches, protein_source, device,
                        batch_size)
@@ -669,17 +670,49 @@ def loss_function(settings: Mapping[str, Any]):
     raise ValueError(f"loss lạ: {name!r}; chỉ có 'huber' hoặc 'mse'")
 
 
+def forward_mean(model: Any, arrays: data.PairArrays, rows: np.ndarray, caches: Caches,
+                 protein_source: Any, device: str) -> Any:
+    """Đầu ra trung bình của một batch, dựng lại batch từ đầu.
+
+    Chỉ IGNITE dùng hàm này, cho lượt forward ở tham số đã bị làm nhiễu. Phải dựng lại
+    batch (không dùng lại tensor cũ) vì ở cấu hình finetune nhánh protein cũng đang được
+    train, nên vector protein phải được tính lại theo tham số mới.
+    """
+    batch = batch_tensors(arrays, rows, caches, protein_source, device,
+                          model.uses_edit_branch)
+    return model(batch["ligand_a"], batch["ligand_b"], batch["fragment_a"],
+                 batch["fragment_b"], batch["protein"], batch["endpoint"]).mean()
+
+
 def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein_source: Any,
                     device: str, optimizer: Any, criterion: Any, batch_size: int,
-                    grad_clip: float, rng: np.random.Generator) -> float:
-    """Một epoch; trả về mất mát trung bình theo dòng."""
+                    grad_clip: float, rng: np.random.Generator,
+                    penalty: sharpness.SharpnessPenalty | None = None,
+                    eval_every: int = 0,
+                    on_eval: Callable[[int], bool] | None = None
+                    ) -> tuple[float, bool, int]:
+    """Một epoch; trả về (mất mát trung bình theo dòng, có dừng sớm không, số bước).
+
+    ``penalty`` khác None thì mỗi batch đi theo Algorithm 1 của IGNITE thay vì
+    ``loss.backward()`` (xem molopt.evaluator.sharpness).
+
+    ``eval_every`` > 0 thì cứ sau bấy nhiêu bước lại gọi ``on_eval(step)`` để đo
+    validation NGAY GIỮA epoch. Cần thiết vì một epoch dài ~12.900 bước mà lần train
+    31/10/2026 cho điểm tốt nhất ngay ở epoch 0: đo mỗi epoch một lần thì điểm tốt nhất
+    đã trôi qua từ lâu. ``on_eval`` trả về True nghĩa là dừng sớm.
+    """
     import torch
 
     model.train()
     if isinstance(protein_source, ProteinEncoderRuntime):
         protein_source.train(True)
+    trainable = list(model.parameters())
+    if isinstance(protein_source, ProteinEncoderRuntime):
+        trainable += list(protein_source.parameters())
     total = 0.0
     seen = 0
+    step = 0
+    stopped = False
     for rows in data.iter_batches(len(arrays), batch_size, rng):
         batch = batch_tensors(arrays, rows, caches, protein_source, device,
                               model.uses_edit_branch)
@@ -687,13 +720,52 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
         prediction = model(batch["ligand_a"], batch["ligand_b"], batch["fragment_a"],
                            batch["fragment_b"], batch["protein"], batch["endpoint"])
         loss = criterion(prediction, batch["target"])
-        loss.backward()
+        if penalty is None:
+            loss.backward()
+        else:
+            penalty.apply(loss, prediction, trainable,
+                          lambda rows=rows: forward_mean(model, arrays, rows, caches,
+                                                         protein_source, device))
         if grad_clip > 0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         total += float(loss.detach().to("cpu")) * rows.size
         seen += rows.size
-    return total / max(seen, 1)
+        step += 1
+        if eval_every > 0 and on_eval is not None and step % eval_every == 0:
+            stopped = on_eval(step)
+            # `predict` đã chuyển model sang chế độ eval, phải bật lại chế độ train.
+            model.train()
+            if isinstance(protein_source, ProteinEncoderRuntime):
+                protein_source.train(True)
+            if stopped:
+                break
+    return total / max(seen, 1), stopped, step
+
+
+def effective_batch_sizes(settings: Mapping[str, Any], protein_mode: str,
+                          smoke: bool) -> tuple[int, int]:
+    """Kích thước batch cho train và cho dự đoán, đã tính tới cấu hình finetune.
+
+    Ở finetune, ESM2 nằm trong đồ thị tính toán nên bộ nhớ tỉ lệ với số protein PHÂN
+    BIỆT trong batch nhân số acid amin — kể cả lượt dự đoán, vì vẫn phải chạy ESM2.
+    Dùng ``eval_batch_size`` 4096 của cấu hình frozen ở đây sẽ hết VRAM ngay lượt đo
+    validation đầu tiên, nên finetune có giá trị riêng trong ``finetune_overrides``.
+    Trả về: (batch train, batch dự đoán).
+    """
+    from . import models
+
+    batch_size = int(settings["batch_size"])
+    eval_batch_size = int(settings["eval_batch_size"])
+    if protein_mode == models.PROTEIN_FINETUNE:
+        overrides = settings.get("finetune_overrides", {})
+        batch_size = int(overrides.get("batch_size", batch_size))
+        eval_batch_size = int(overrides.get("eval_batch_size", eval_batch_size))
+    if smoke:
+        # Smoke chỉ để xác nhận pipeline thông, batch nhỏ cho nhanh — nhưng KHÔNG được
+        # lớn hơn batch thật của finetune, nếu không smoke lại tốn VRAM hơn lần train.
+        batch_size = min(batch_size, 128)
+    return batch_size, eval_batch_size
 
 
 def prepare_arrays(config: Mapping[str, Any], root: Path, partition: str, caches: Caches,
@@ -710,11 +782,15 @@ def prepare_arrays(config: Mapping[str, Any], root: Path, partition: str, caches
 
 
 def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: str,
-              smoke: bool, stamp: str) -> dict[str, Any]:
+              smoke: bool, stamp: str, sharpness_mode: str | None = None,
+              overrides: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Train một cấu hình; chọn checkpoint theo MAE trên validation.
 
     Nhận: config; thư mục gốc; cấu hình ('frozen' | 'finetune' | 'no_protein'); kiểu đầu
-    ra ('direct' | 'twin'); smoke; nhãn thời gian của lần chạy.
+    ra ('direct' | 'twin'); smoke; nhãn thời gian của lần chạy; ``sharpness_mode``
+    ('on' | 'off' | None) để bật/tắt số hạng phạt IGNITE mà không phải sửa config;
+    ``overrides`` là các tham số đã bị dòng lệnh ghi đè, CHỈ để ghi vào manifest (giá
+    trị đã nằm sẵn trong config lúc gọi — xem run_evaluator.apply_overrides).
     Trả về: manifest của lần chạy (đã ghi ra đĩa).
     """
     from . import models
@@ -727,13 +803,7 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
     _, runs_dir = layout(config, root)
     limit = int(settings["smoke_rows"]) if smoke else None
     epochs = int(settings["smoke_epochs"] if smoke else settings["epochs"])
-    batch_size = int(settings["batch_size"])
-    if smoke:
-        # Smoke chỉ để xác nhận pipeline thông trên CPU, nên batch nhỏ cho nhanh.
-        batch_size = min(batch_size, 128)
-    elif protein_mode == models.PROTEIN_FINETUNE:
-        overrides = settings.get("finetune_overrides", {})
-        batch_size = int(overrides.get("batch_size", batch_size))
+    batch_size, eval_batch_size = effective_batch_sizes(settings, protein_mode, smoke)
 
     caches = Caches(config, root, need_protein=protein_mode == models.PROTEIN_FROZEN)
     sequences: dict[str, str] = {}
@@ -773,61 +843,105 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
     optimizer = build_optimizer(model, protein_source, settings)
     criterion = loss_function(settings)
     rng = np.random.default_rng(int(settings["seed"]))
-    patience = int(settings["early_stopping_patience"])
+    penalty_settings = settings["sharpness"]
+    penalty = (sharpness.SharpnessPenalty(penalty_settings)
+               if sharpness.is_enabled(penalty_settings, sharpness_mode) else None)
+    if penalty is None:
+        LOGGER.info("số hạng phạt IGNITE: TẮT")
+    else:
+        LOGGER.info("số hạng phạt IGNITE: BẬT (lambda đầu %.4g, rho %.4g, epsilon %.4g)",
+                    penalty.lambda_value, penalty.rho, penalty.epsilon)
+    eval_every = int(settings.get("eval_every_steps", 0) or 0)
+    if smoke:
+        # Smoke chỉ chạy vài nghìn dòng nên một epoch ngắn hơn eval_every rất nhiều;
+        # đo giữa epoch ở đây chỉ làm chậm mà không nói thêm điều gì.
+        eval_every = 0
+    patience = int(settings["early_stopping_patience_evals"] if eval_every > 0
+                   else settings["early_stopping_patience"])
     checkpoint_path = runs_dir / f"{configuration}_{head}_{stamp}.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     history: list[dict[str, Any]] = []
     best_mae = math.inf
-    best_epoch = -1
+    best_point = -1
     since_best = 0
     started = time.perf_counter()
-    for epoch in range(epochs):
-        epoch_started = time.perf_counter()
-        loss = train_one_epoch(model, train_arrays, caches, protein_source, device,
-                               optimizer, criterion, batch_size, float(settings["grad_clip"]),
-                               rng)
+
+    def consider(epoch: int, step: int | None, train_loss: float | None) -> bool:
+        """Đo validation tại một mốc, lưu checkpoint nếu tốt nhất; True = dừng sớm.
+
+        ``step`` bằng None là mốc cuối epoch, khác None là mốc giữa epoch.
+        """
+        nonlocal best_mae, best_point, since_best
+        import torch
+
+        measured = time.perf_counter()
         prediction = predict(model, validation_arrays, caches, protein_source, device,
-                             int(settings["eval_batch_size"]))
+                             eval_batch_size)
         scores = evaluate(validation_arrays, prediction, validation_keys, config)
         mae = scores["all"]["regression"]["mae"]
-        history.append({"epoch": epoch, "train_loss": loss,
-                        "validation": scores["all"],
-                        "seconds": round(time.perf_counter() - epoch_started, 1)})
-        for line in metrics.format_metrics(f"epoch {epoch} validation",
+        label = f"epoch {epoch}" if step is None else f"epoch {epoch} bước {step}"
+        record: dict[str, Any] = {"epoch": epoch, "step": step,
+                                  "validation": scores["all"],
+                                  "seconds": round(time.perf_counter() - measured, 1)}
+        if train_loss is not None:
+            record["train_loss"] = train_loss
+        if penalty is not None:
+            record["sharpness"] = penalty.state()
+        history.append(record)
+        for line in metrics.format_metrics(f"{label} validation",
                                            scores["all"]["regression"],
                                            scores["all"].get("ranking"),
                                            scores["all"].get("change_classes")):
             LOGGER.info("%s", line)
-        LOGGER.info("epoch %s: train loss %.4f", epoch, loss)
-        if mae is not None and mae < best_mae:
-            import torch
-
-            best_mae, best_epoch, since_best = mae, epoch, 0
-            state = {"model": model.state_dict(), "epoch": epoch, "configuration":
-                     configuration, "head": head, "protein_mode": protein_mode,
-                     "protein_dim": protein_dim, "ligand_bits": caches.ligand_bits,
+        if train_loss is not None:
+            LOGGER.info("%s: train loss %.4f", label, train_loss)
+        if penalty is not None:
+            penalty_state = penalty.state()
+            LOGGER.info("%s: lambda %.4g | ||grad đầu ra|| %.4g | độ sắc ước lượng "
+                        "%.4g (ngưỡng epsilon %.4g)", label, penalty_state["lambda"],
+                        penalty_state["output_gradient_norm"],
+                        penalty_state["sharpness_estimate"], penalty.epsilon)
+        if mae is None:
+            return False
+        if mae < best_mae:
+            best_mae, since_best = mae, 0
+            best_point = len(history) - 1
+            state = {"model": model.state_dict(), "epoch": epoch, "step": step,
+                     "configuration": configuration, "head": head,
+                     "protein_mode": protein_mode, "protein_dim": protein_dim,
+                     "ligand_bits": caches.ligand_bits,
                      "fragment_bits": caches.fragment_bits}
             if isinstance(protein_source, ProteinEncoderRuntime):
                 state["protein_encoder"] = protein_source.model.state_dict()
             torch.save(state, checkpoint_path)
-            LOGGER.info("checkpoint tốt nhất -> %s", checkpoint_path)
-        else:
-            since_best += 1
-            if since_best >= patience:
-                LOGGER.info("dừng sớm: %s epoch không cải thiện MAE validation", since_best)
-                break
+            LOGGER.info("checkpoint tốt nhất (%s) -> %s", label, checkpoint_path)
+            return False
+        since_best += 1
+        if since_best >= patience:
+            LOGGER.info("dừng sớm: %s lần đo không cải thiện MAE validation", since_best)
+            return True
+        return False
 
-    if best_epoch >= 0:
+    for epoch in range(epochs):
+        loss, stopped, steps = train_one_epoch(
+            model, train_arrays, caches, protein_source, device, optimizer, criterion,
+            batch_size, float(settings["grad_clip"]), rng, penalty, eval_every,
+            lambda step, current=epoch: consider(current, step, None))
+        LOGGER.info("epoch %s: %s bước", epoch, f"{steps:,}")
+        if stopped or consider(epoch, None, loss):
+            break
+
+    if best_point >= 0:
         # Số cuối cùng (theo lát cắt, theo endpoint, bất đối xứng) phải là của checkpoint
         # TỐT NHẤT đã lưu, không phải của epoch cuối: dừng sớm nghĩa là epoch cuối kém hơn.
         load_best_checkpoint(checkpoint_path, model, protein_source, device)
     final = evaluate(validation_arrays, predict(model, validation_arrays, caches,
                                                 protein_source, device,
-                                                int(settings["eval_batch_size"])),
+                                                eval_batch_size),
                      validation_keys, config)
     asymmetry = asymmetry_report(model, validation_arrays, caches, protein_source, device,
-                                 config)
+                                 config, eval_batch_size)
     if asymmetry is not None:
         for line in metrics.format_asymmetry("bất đối xứng (validation)", asymmetry):
             LOGGER.info("%s", line)
@@ -835,16 +949,31 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "stage": "stage3_train", "mode": "smoke" if smoke else "train",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "configuration": configuration, "head": head, "protein_mode": protein_mode,
-        "device": device, "seed": int(settings["seed"]), "epochs_run": len(history),
-        "batch_size": batch_size,
+        "device": device, "seed": int(settings["seed"]),
+        "epochs_run": 1 + max((record["epoch"] for record in history), default=-1),
+        "measurements": len(history), "eval_every_steps": eval_every,
+        "overrides": dict(overrides or {}), "batch_size": batch_size,
+        "learning_rate": float(settings["learning_rate"]),
+        "weight_decay": float(settings["weight_decay"]),
+        "loss": str(settings["loss"]), "huber_delta": float(settings["huber_delta"]),
         "rows": {"train": len(train_arrays), "validation": len(validation_arrays)},
         "protein_embedding_dim": protein_dim,
         "parameters": models.count_parameters(model),
         "fingerprint_bits": {"ligand": caches.ligand_bits, "fragment": caches.fragment_bits},
         "uses_edit_branch": model.uses_edit_branch,
-        "best_epoch": best_epoch, "best_validation_mae": None if best_epoch < 0 else best_mae,
-        "final_metrics_epoch": best_epoch if best_epoch >= 0 else len(history) - 1,
-        "checkpoint": str(checkpoint_path) if best_epoch >= 0 else None,
+        "sharpness_penalty": None if penalty is None else {
+            "source": "IGNITE, NeurIPS 2024, arXiv:2503.04242",
+            "rho": penalty.rho, "epsilon": penalty.epsilon,
+            "finite_difference_radius": penalty.radius,
+            "lambda_init": float(penalty_settings["lambda_init"]),
+            "lambda_learning_rate": penalty.lambda_learning_rate,
+            "lambda_final": penalty.lambda_value,
+        },
+        "best_epoch": None if best_point < 0 else history[best_point]["epoch"],
+        "best_step": None if best_point < 0 else history[best_point]["step"],
+        "best_validation_mae": None if best_point < 0 else best_mae,
+        "final_metrics_index": best_point if best_point >= 0 else len(history) - 1,
+        "checkpoint": str(checkpoint_path) if best_point >= 0 else None,
         "history": history, "validation_metrics": final, "asymmetry": asymmetry,
         "seconds": round(time.perf_counter() - started, 1),
         "gpu_peak_reserved_mib": peak_gpu_memory_mib(device),
@@ -894,8 +1023,8 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
     model.to(device)
     arrays, keys, _ = prepare_arrays(config, root, data.VALIDATION, caches,
                                      protein_vocabulary, None)
-    prediction = predict(model, arrays, caches, protein_source, device,
-                         int(settings["eval_batch_size"]))
+    _, eval_batch_size = effective_batch_sizes(settings, protein_mode, False)
+    prediction = predict(model, arrays, caches, protein_source, device, eval_batch_size)
     scores = evaluate(arrays, prediction, keys, config)
     for name, block in scores.items():
         if name == "by_endpoint" or not isinstance(block, dict):
@@ -903,7 +1032,8 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
         for line in metrics.format_metrics(f"validation/{name}", block["regression"],
                                            block.get("ranking"), block.get("change_classes")):
             LOGGER.info("%s", line)
-    asymmetry = asymmetry_report(model, arrays, caches, protein_source, device, config)
+    asymmetry = asymmetry_report(model, arrays, caches, protein_source, device, config,
+                                 eval_batch_size)
     if asymmetry is not None:
         for line in metrics.format_asymmetry("bất đối xứng (validation)", asymmetry):
             LOGGER.info("%s", line)

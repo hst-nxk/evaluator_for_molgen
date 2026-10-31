@@ -5,7 +5,8 @@
 
 Nguồn số, theo thứ tự ưu tiên cho mỗi cặp (cấu hình, đầu ra):
     1. eval_<cấu hình>_<đầu ra>_*.json mới nhất: số của checkpoint TỐT NHẤT, đủ mọi lát cắt;
-    2. nếu chưa có: train_<cấu hình>_<đầu ra>_*.json mới nhất, lấy history[best_epoch]
+    2. nếu chưa có: train_<cấu hình>_<đầu ra>_*.json mới nhất, lấy
+       history[final_metrics_index] (mốc tốt nhất, có thể nằm giữa epoch)
        (chỉ có lát 'all').
 Baseline lấy từ baseline_*.json mới nhất. Không đọc gì của partition test.
 """
@@ -90,11 +91,15 @@ def main() -> int:
             continue
         trained = latest(list(runs_dir.glob(f"train_{configuration}_{head}_*.json")))
         manifest = load(trained)
-        if args.slice != DEFAULT_SLICE or manifest["best_epoch"] < 0:
+        index = manifest.get("final_metrics_index")
+        if args.slice != DEFAULT_SLICE or index is None or index < 0:
             print_row(name, row_values(None), "chưa có eval cho lát này")
             continue
-        block = manifest["history"][manifest["best_epoch"]]["validation"]
-        print_row(name, row_values(block), f"epoch tốt nhất {manifest['best_epoch']} (train)")
+        best = manifest["history"][index]
+        where = f"epoch {best['epoch']}"
+        if best.get("step") is not None:
+            where += f" bước {best['step']}"
+        print_row(name, row_values(best["validation"]), f"mốc tốt nhất {where} (train)")
     return 0
 
 
