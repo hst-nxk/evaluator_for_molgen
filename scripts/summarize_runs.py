@@ -33,12 +33,18 @@ def show(value: float | None) -> str:
 
 
 def label(manifest: dict[str, Any]) -> str:
-    """Tên ngắn của một lần chạy: cấu hình, đầu ra, IGNITE, rồi các tham số đã đổi."""
+    """Tên ngắn của một lần chạy: cấu hình, đầu ra, IGNITE, cộng dồn, tham số đã đổi."""
     parts = [str(manifest["configuration"]), str(manifest["head"])]
     if manifest.get("sharpness_penalty"):
         parts.append("ignite")
+    # Cộng dồn gradient đọc từ KHÓA RIÊNG của manifest, không đọc từ `overrides`: các
+    # lần finetune chạy trước 01/11/2026 ghi sai khối overrides (trùng tên biến trong
+    # train.py), nên dựa vào overrides là mất dấu đúng tham số cần so.
+    steps = int(manifest.get("accumulate_steps") or 1)
+    if steps > 1:
+        parts.append(f"accum={steps}")
     overrides = manifest.get("overrides") or {}
-    skip = {"gpu_memory_limit_mib", "eval_every_steps"}
+    skip = {"gpu_memory_limit_mib", "eval_every_steps", "accumulate_steps"}
     for key, value in overrides.items():
         if key not in skip:
             parts.append(f"{key.split('.')[-1]}={value}")
@@ -56,6 +62,19 @@ def best_block(manifest: dict[str, Any], slice_name: str) -> dict[str, Any] | No
     if index is None or index < 0 or index >= len(history):
         return None
     return history[index].get("validation")
+
+
+def cadence(manifest: dict[str, Any]) -> str:
+    """Cứ bao nhiêu bước thì đo validation một lần; 0 = chỉ đo cuối mỗi epoch.
+
+    Phải hiện thành cột riêng vì đây là một CONFOUND: đo dày hơn thì cơ hội bắt được
+    checkpoint tốt cũng nhiều hơn, nên hai lần chạy khác nhịp đo thì chỉ số không so
+    trực tiếp với nhau được.
+    """
+    every = manifest.get("eval_every_steps")
+    if every is None:
+        return "-"
+    return "epoch" if int(every) <= 0 else str(int(every))
 
 
 def where(manifest: dict[str, Any]) -> str:
@@ -94,7 +113,7 @@ def main() -> int:
             rows.append((order, [
                 f"baseline {name}", show(regression.get("mae")),
                 show(regression.get("rmse")), show(regression.get("r2")),
-                show(regression.get("spearman")), "-", "-"]))
+                show(regression.get("spearman")), "-", "-", "-"]))
 
     for path in sorted(runs_dir.glob("train_*.json")):
         manifest = load(path)
@@ -108,9 +127,10 @@ def main() -> int:
         rows.append((order, [
             label(manifest), show(regression.get("mae")), show(regression.get("rmse")),
             show(regression.get("r2")), show(regression.get("spearman")),
-            where(manifest), f"{manifest.get('seconds', 0) / 60:.0f}p"]))
+            where(manifest), cadence(manifest),
+            f"{manifest.get('seconds', 0) / 60:.0f}p"]))
 
-    header = ["lần chạy", "MAE", "RMSE", "R2", "Spearman", "mốc", "giờ"]
+    header = ["lần chạy", "MAE", "RMSE", "R2", "Spearman", "mốc", "đo", "giờ"]
     rows.sort(key=lambda row: row[0])
     table = [header] + [row[1] for row in rows]
     widths = [max(len(row[i]) for row in table) for i in range(len(header))]

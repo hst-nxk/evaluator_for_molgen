@@ -64,54 +64,40 @@ SMOKE_CONFIGS=("no_protein" "frozen" "finetune")
 #       là khoảng 6 lần đo validation mỗi epoch, bằng nhịp của frozen.
 FINETUNE_SET="--set gpu_memory_limit_mib=20480 --set eval_every_steps=4000"
 
-# Bộ ba chống khớp quá dữ liệu, dùng lại ở nhiều dòng. Ba nút khác nhau, cùng một bệnh:
-#   huber_delta 0.3   : duoi 0,3 log la sai so thi nghiem (Landrum & Riniker 2024,
-#                       DOI 10.1021/acs.jcim.4c00049) -> phat binh phuong; tren muc do
-#                       phat tuyen tinh. Co nguon, va gan voi MAE dang bao cao.
-#   weight_decay 0.1  : CHUA CO NGUON, gap 10 lan gia tri dang dung.
-#   model.dropout 0.3 : CHUA CO NGUON, gap 3 lan gia tri dang dung (0,1).
-# Cac dong quet rieng tung nut o tren cho biet nut nao thuc su co tac dung; dong nay
-# cho biet gop ca ba lai thi duoc gi.
-BEST_SET="--set huber_delta=0.3 --set weight_decay=0.1 --set model.dropout=0.3"
-
-# Cộng dồn gradient, chỉ cho finetune. Gom batch theo protein khiến 98,5 % batch chỉ
-# chứa MỘT protein, nên gradient mỗi bước lệch hơn hẳn so với lấy mẫu ngẫu nhiên
-# (54,1 protein mỗi batch). Gộp 8 batch rồi mới cập nhật thì hướng đi lại trộn nhiều
-# protein, mà bộ nhớ không đổi vì mỗi lúc vẫn chỉ giữ một batch con trong đồ thị.
-# eval_every_steps chia 8 theo, vì một "bước" giờ là một lần cập nhật tham số.
-# CHƯA CÓ NGUỒN cho con số 8: hai dòng cuối chạy có cộng dồn, hai dòng trước không,
-# để ĐO xem nó thực sự giúp hay hại chứ không đoán.
-ACCUM_SET="--set accumulate_steps=8 --set eval_every_steps=500"
-
 # Mỗi dòng: "<cấu hình> <đầu ra> <sharpness on|off> [--set khóa=giá_trị ...]"
-# Sáu dòng đầu là ablation kiến trúc, giữ nguyên tham số của config để so sánh được.
-# Bốn dòng sau là quét tham số chống overfit trên kiến trúc rẻ nhất (frozen direct):
-# lần train 31/10/2026 cho train loss tụt (0,107 -> 0,052) trong khi MAE validation
-# tăng (0,614 -> 0,627), tức khớp quá dữ liệu train chứ không phải thiếu dung lượng.
-#   huber_delta 0.3 : dưới 0,3 log là sai số thí nghiệm (Landrum & Riniker 2024,
-#                     DOI 10.1021/acs.jcim.4c00049) nên phạt bình phương; trên mức đó
-#                     phạt tuyến tính. Vừa hợp nguồn vừa gần với MAE đang báo cáo.
-#   weight_decay 0.1: CHƯA CÓ NGUỒN, gấp 10 lần giá trị đang dùng, chỉ để xem hướng.
+#
+# ĐỢT 2 (01/11/2026). Đợt 1 gồm 19 dòng ablation kiến trúc + quét chống overfit; kết
+# quả của nó (đọc bằng scripts/summarize_runs.py) quyết định đợt này:
+#   - Tốt nhất đợt 1: frozen direct model.dropout=0.5 -> MAE 0,5852, Spearman 0,1343,
+#     R2 0,0173, thắng ở epoch 0 bước 10000. Baseline luôn đoán 0: MAE 0,5879.
+#   - dropout là nút DUY NHẤT ăn rõ, và 0,5 tốt hơn 0,3 -> chưa tới đỉnh, nên đợt này
+#     đi tiếp 0,6 và 0,7. Chỉ khi MAE xấu đi mới biết đã quá đỉnh.
+#   - weight_decay đứng một mình đều làm xấu (0,03/0,1/0,3 -> 0,6006/0,6019/0,5979 so
+#     với 0,5976 khi để trần) -> đợt này BỎ weight_decay.
+#   - IGNITE xấu hơn đối chứng cả hai lần (0,6018 / 0,5976 và 0,5880 / 0,5864)
+#     -> đợt này BỎ sharpness, mọi dòng đều off.
+#   - Gộp cả ba nút (huber_delta=0.3 + weight_decay=0.1 + dropout=0.3) ra 0,5864,
+#     TỆ hơn chỉ dropout=0.5 một mình -> bỏ cách gộp đó,
+#     chỉ còn thử ghép dropout với huber_delta vì huber_delta có nguồn.
+# Hai dòng cuối tách một CONFOUND của đợt 1: đợt đó đổi cả accumulate_steps (1->8)
+# VÀ eval_every_steps (4000->500), nên không biết phần thắng là nhờ cộng dồn gradient
+# hay chỉ nhờ đo validation dày hơn. Mốc thắng của các lần cộng dồn là bước 3000, mà
+# với nhịp 4000 thì bước đó CHƯA TỪNG được đo. Hai dòng này giữ nhịp đo 500 và để
+# accumulate_steps = 1, nên hiệu so với đợt 1 là tác dụng của nhịp đo một mình:
+#   - dòng frozen (rẻ, ~5 phút) so với 0,5852 của dropout=0.5 nhịp 2000.
+#   - dòng finetune (~18 phút) so với 0,5874 của lần cộng dồn nhịp 500.
+# huber_delta 0.3: dưới 0,3 log là sai số thí nghiệm (Landrum & Riniker 2024,
+# DOI 10.1021/acs.jcim.4c00049) nên phạt bình phương, trên mức đó phạt tuyến tính.
+# Là nút DUY NHẤT ở đây có nguồn, nên giữ lại để thử ghép với dropout.
+# model.dropout 0.6 / 0.7: CHƯA CÓ NGUỒN, nối tiếp thang 0,1 -> 0,3 -> 0,5 đợt 1.
+# eval_every_steps 1000 / 500: CHƯA CÓ NGUỒN, chỉ dùng để tách confound nói trên.
 TRAIN_RUNS=(
-    "frozen direct off"
-    "no_protein direct off"
-    "frozen direct_no_edit off"
-    "frozen twin off"
-    "frozen direct on"
-    "no_protein direct on"
-    "frozen direct off --set huber_delta=0.3"
-    "frozen direct off --set weight_decay=0.03"
-    "frozen direct off --set weight_decay=0.1"
-    "frozen direct off --set weight_decay=0.3"
-    "frozen direct off --set model.dropout=0.3"
-    "frozen direct off --set model.dropout=0.5"
-    "frozen direct off $BEST_SET"
-    "frozen direct on $BEST_SET"
-    "no_protein direct off $BEST_SET"
-    "finetune direct off $FINETUNE_SET"
-    "finetune direct off $FINETUNE_SET $BEST_SET"
-    "finetune direct off $FINETUNE_SET $ACCUM_SET"
-    "finetune direct off $FINETUNE_SET $BEST_SET $ACCUM_SET"
+    "frozen direct off --set model.dropout=0.6"
+    "frozen direct off --set model.dropout=0.7"
+    "frozen direct off --set model.dropout=0.5 --set huber_delta=0.3"
+    "frozen direct off --set model.dropout=0.6 --set huber_delta=0.3"
+    "frozen direct off --set model.dropout=0.5 --set eval_every_steps=1000"
+    "finetune direct off $FINETUNE_SET --set eval_every_steps=500"
 )
 
 # --- 1. Chốt thư mục: script phải nằm đúng trong PROJECT_ROOT -----------------------------

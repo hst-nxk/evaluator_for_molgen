@@ -691,7 +691,8 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
                     eval_every: int = 0,
                     on_eval: Callable[[int], bool] | None = None,
                     group_by_protein: bool = False,
-                    accumulate_steps: int = 1) -> tuple[float, bool, int]:
+                    accumulate_steps: int = 1,
+                    max_proteins: int = 0) -> tuple[float, bool, int]:
     """Một epoch; trả về (mất mát trung bình theo dòng, có dừng sớm không, số bước).
 
     ``penalty`` khác None thì mỗi batch đi theo Algorithm 1 của IGNITE thay vì
@@ -725,7 +726,7 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
     seen = 0
     step = 0
     stopped = False
-    batches = (data.iter_protein_batches(arrays.protein, batch_size, rng)
+    batches = (data.iter_protein_batches(arrays.protein, batch_size, rng, max_proteins)
                if group_by_protein else data.iter_batches(len(arrays), batch_size, rng))
     pending = 0
     optimizer.zero_grad(set_to_none=True)
@@ -838,6 +839,8 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
     # tính toán nên số protein phân biệt mỗi batch mới quyết định bộ nhớ.
     group_by_protein = protein_mode == models.PROTEIN_FINETUNE
     accumulate_steps = max(1, int(settings.get("accumulate_steps", 1) or 1))
+    max_proteins = int(settings.get("finetune_overrides", {}).get("max_proteins_per_batch", 0)
+                       ) if group_by_protein else 0
 
     caches = Caches(config, root, need_protein=protein_mode == models.PROTEIN_FROZEN)
     sequences: dict[str, str] = {}
@@ -854,9 +857,12 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
             encoder_settings = dict(config["stage3"]["protein_encoder"])
             # finetune bắt buộc cắt chuỗi: bộ nhớ gradient tỉ lệ với số acid amin.
             encoder_settings["long_sequence"] = "truncate"
-            overrides = settings.get("finetune_overrides", {})
-            if "max_residues" in overrides:
-                encoder_settings["max_residues"] = int(overrides["max_residues"])
+            # KHÔNG đặt tên biến này là `overrides`: trùng với tham số của hàm, và
+            # manifest ở cuối hàm ghi `overrides` — trùng tên thì mọi lần finetune ghi
+            # finetune_overrides thay cho danh sách --set, mất dấu tham số đã quét.
+            tuning = settings.get("finetune_overrides", {})
+            if "max_residues" in tuning:
+                encoder_settings["max_residues"] = int(tuning["max_residues"])
             ordered = [sequences[key] for key in protein_vocabulary.to_pylist()]
             protein_source = ProteinEncoderRuntime(encoder_settings, ordered, device)
             protein_dim = protein_source.dimension
@@ -962,7 +968,7 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
             model, train_arrays, caches, protein_source, device, optimizer, criterion,
             batch_size, float(settings["grad_clip"]), rng, penalty, eval_every,
             lambda step, current=epoch: consider(current, step, None),
-            group_by_protein, accumulate_steps)
+            group_by_protein, accumulate_steps, max_proteins)
         LOGGER.info("epoch %s: %s bước", epoch, f"{steps:,}")
         if stopped or consider(epoch, None, loss):
             break
@@ -988,6 +994,7 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "epochs_run": 1 + max((record["epoch"] for record in history), default=-1),
         "measurements": len(history), "eval_every_steps": eval_every,
         "group_by_protein": group_by_protein, "accumulate_steps": accumulate_steps,
+        "max_proteins_per_batch": max_proteins,
         "overrides": dict(overrides or {}), "batch_size": batch_size,
         "learning_rate": float(settings["learning_rate"]),
         "weight_decay": float(settings["weight_decay"]),
