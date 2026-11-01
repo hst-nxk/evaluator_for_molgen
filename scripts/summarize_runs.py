@@ -3,6 +3,7 @@
     python scripts/summarize_runs.py                 # xếp theo MAE, tốt nhất lên đầu
     python scripts/summarize_runs.py --sort spearman # xếp theo Spearman
     python scripts/summarize_runs.py --slice clean
+    python scripts/summarize_runs.py --ranking       # chỉ số xếp hạng trong cùng query
 
 Khác `summarize_evaluator.py`: file kia gom theo (cấu hình, đầu ra) rồi chỉ lấy lần MỚI
 NHẤT của mỗi cặp, nên một đợt quét tham số có 15 lần `frozen direct` sẽ chỉ hiện một dòng.
@@ -82,6 +83,19 @@ def cadence(manifest: dict[str, Any]) -> str:
     return "epoch" if int(every) <= 0 else str(int(every))
 
 
+def ranking_cells(block: dict[str, Any] | None) -> list[str]:
+    """Các ô xếp hạng của một khối lát cắt: đúng chiều, top-1, top-3, 3 lớp.
+
+    Đúng chiều và top-k tính TRONG CÙNG MỘT QUERY (phân tử tham chiếu, protein, endpoint),
+    xem docs/STAGE3_EVALUATOR.md mục 4.2–4.3. Ba lớp kém / ngang / tốt chia ở ±0,3 log.
+    """
+    ranking = (block or {}).get("ranking") or {}
+    classes = (block or {}).get("change_classes") or {}
+    return [show(ranking.get("pairwise_accuracy_macro")), show(ranking.get("top_1")),
+            show(ranking.get("top_3")), show(classes.get("accuracy")),
+            show(classes.get("macro_f1"))]
+
+
 def where(manifest: dict[str, Any]) -> str:
     """Mốc nào cho kết quả tốt nhất, dạng 'epoch 0 bước 4000'."""
     epoch, step = manifest.get("best_epoch"), manifest.get("best_step")
@@ -95,6 +109,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--slice", default=DEFAULT_SLICE)
     parser.add_argument("--sort", default="mae", choices=("mae", "spearman", "rmse"))
+    parser.add_argument("--ranking", action="store_true",
+                        help="in chỉ số xếp hạng (đúng chiều, top-k, 3 lớp) thay cho RMSE/R2")
     args = parser.parse_args()
 
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -115,10 +131,10 @@ def main() -> int:
             value = regression.get(args.sort)
             order = float("inf") if value is None else (-value if args.sort == "spearman"
                                                         else value)
-            rows.append((order, [
-                f"baseline {name}", show(regression.get("mae")),
-                show(regression.get("rmse")), show(regression.get("r2")),
-                show(regression.get("spearman")), "-", "-", "-"]))
+            middle = (ranking_cells(block) if args.ranking
+                      else [show(regression.get("rmse")), show(regression.get("r2"))])
+            rows.append((order, [f"baseline {name}", show(regression.get("mae")), *middle,
+                                 show(regression.get("spearman")), "-", "-", "-"]))
 
     for path in sorted(runs_dir.glob("train_*.json")):
         manifest = load(path)
@@ -129,13 +145,19 @@ def main() -> int:
         # Spearman càng lớn càng tốt, MAE/RMSE càng nhỏ càng tốt.
         order = float("inf") if value is None else (-value if args.sort == "spearman"
                                                     else value)
+        # Chỉ số xếp hạng chỉ tính ở bước cuối, sau khi nạp lại checkpoint tốt nhất, nên
+        # lấy từ validation_metrics chứ không từ history (history chỉ có regression).
+        final = (manifest.get("validation_metrics") or {}).get(args.slice)
+        middle = (ranking_cells(final) if args.ranking
+                  else [show(regression.get("rmse")), show(regression.get("r2"))])
         rows.append((order, [
-            label(manifest), show(regression.get("mae")), show(regression.get("rmse")),
-            show(regression.get("r2")), show(regression.get("spearman")),
-            where(manifest), cadence(manifest),
+            label(manifest), show(regression.get("mae")), *middle,
+            show(regression.get("spearman")), where(manifest), cadence(manifest),
             f"{manifest.get('seconds', 0) / 60:.0f}p"]))
 
-    header = ["lần chạy", "MAE", "RMSE", "R2", "Spearman", "mốc", "đo", "giờ"]
+    middle = (["đúng chiều", "top-1", "top-3", "đúng 3 lớp", "F1 3 lớp"] if args.ranking
+              else ["RMSE", "R2"])
+    header = ["lần chạy", "MAE", *middle, "Spearman", "mốc", "đo", "giờ"]
     rows.sort(key=lambda row: row[0])
     table = [header] + [row[1] for row in rows]
     widths = [max(len(row[i]) for row in table) for i in range(len(header))]
