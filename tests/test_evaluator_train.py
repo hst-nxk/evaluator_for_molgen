@@ -357,6 +357,46 @@ def test_override_rejects_the_model_prefix_with_no_key() -> None:
         run_evaluator.apply_overrides(train_settings(), ["model.=0.3"], {"dropout": 0.1})
 
 
+def encoder_blocks() -> dict:
+    """Hai khối CLI truyền thêm: protein_encoder và paths, giống config.json."""
+    return {"protein_encoder": {"model": "facebook/esm2_t12_35M_UR50D",
+                                "embedding_dim": 480},
+            "paths": {"cache_dir": "work/evaluator_cache_v4", "runs_dir": "runs/evaluator"}}
+
+
+def test_override_switches_the_protein_encoder_and_its_cache() -> None:
+    """Thử ESM2 650M phải làm được bằng --set, không sửa config.json, và phải trỏ
+    cache sang thư mục khác để không đè cache của model đang dùng."""
+    blocks = encoder_blocks()
+    settings = train_settings()
+    applied = run_evaluator.apply_overrides(
+        settings, ["protein_encoder.model=facebook/esm2_t33_650M_UR50D",
+                   "protein_encoder.embedding_dim=1280",
+                   "paths.cache_dir=work/evaluator_cache_v4_esm650m"], {}, blocks)
+    assert applied == {"protein_encoder.model": "facebook/esm2_t33_650M_UR50D",
+                       "protein_encoder.embedding_dim": 1280,
+                       "paths.cache_dir": "work/evaluator_cache_v4_esm650m"}
+    assert blocks["protein_encoder"]["model"] == "facebook/esm2_t33_650M_UR50D"
+    assert isinstance(blocks["protein_encoder"]["embedding_dim"], int)
+    assert blocks["paths"] == {"cache_dir": "work/evaluator_cache_v4_esm650m",
+                               "runs_dir": "runs/evaluator"}
+    assert settings == train_settings()
+
+
+def test_override_rejects_an_unknown_key_in_the_encoder_block() -> None:
+    with pytest.raises(ValueError, match="protein_encoder.embeding_dim"):
+        run_evaluator.apply_overrides(train_settings(), ["protein_encoder.embeding_dim=1280"],
+                                      {}, encoder_blocks())
+
+
+def test_override_of_the_encoder_needs_the_block_to_be_passed() -> None:
+    """Không truyền khối thì khóa đó không được âm thầm ghi vào stage3.train."""
+    settings = train_settings()
+    with pytest.raises(ValueError, match="protein_encoder"):
+        run_evaluator.apply_overrides(settings, ["protein_encoder.model=x"])
+    assert settings == train_settings()
+
+
 # ------------------------------------------------------------ cộng dồn gradient
 
 

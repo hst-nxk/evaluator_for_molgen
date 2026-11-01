@@ -49,13 +49,11 @@ MIN_FREE_GPU_MIB=10240
 # Ngưỡng này gấp khoảng 6 lần số đo đó.
 MIN_FREE_GPU_MIB_EVAL=2048
 SECONDS_PER_MINUTE=60
-SMOKE_CONFIGS=("no_protein" "frozen" "finetune")
-# Thứ tự train theo docs/STAGE3_EVALUATOR.md, chưa gồm finetune.
-# Mỗi dòng: "<cấu hình> <đầu ra> <sharpness on|off>". Cột thứ ba bật số hạng phạt chuẩn
-# gradient đầu ra (IGNITE, arXiv:2503.04242); thiếu cột thì coi là off.
-# Hai dòng cuối là ablation có / không số hạng phạt, giữ nguyên mọi tham số khác, nên
-# so sánh được trực tiếp với dòng đầu. Chạy sau cùng vì mỗi batch cần 3 lượt forward.
-# Hai lần finetune chạy sau cùng và cần tham số riêng:
+# Đợt 3 chỉ train frozen và no_protein, nên chỉ smoke hai cấu hình đó. Smoke finetune
+# tốn VRAM mà không chặn được dòng train nào của đợt này.
+SMOKE_CONFIGS=("frozen" "no_protein")
+# Thứ tự train theo docs/STAGE3_EVALUATOR.md.
+# Finetune (dùng ở đợt 1–2) cần tham số riêng:
 #   gpu_memory_limit_mib 20480 : trần 9 GiB của config là để chia GPU với người khác;
 #       finetune giữ ESM2 trong đồ thị nên cần nhiều hơn. 20 GiB vẫn chừa ~4 GiB trên
 #       card 24 GB. Vòng train gom batch theo protein nên mức dùng thường xuyên chỉ
@@ -64,40 +62,44 @@ SMOKE_CONFIGS=("no_protein" "frozen" "finetune")
 #       là khoảng 6 lần đo validation mỗi epoch, bằng nhịp của frozen.
 FINETUNE_SET="--set gpu_memory_limit_mib=20480 --set eval_every_steps=4000"
 
-# Mỗi dòng: "<cấu hình> <đầu ra> <sharpness on|off> [--set khóa=giá_trị ...]"
+# ESM2 650M ở chế độ frozen, KHÔNG sửa config.json:
+#   - model và embedding_dim: embedding_dim là CHỐT KIỂM, features.load_protein_encoder
+#     so nó với hidden_size đo từ model và dừng nếu lệch, nên ghi sai thì chương trình
+#     dừng ở prepare chứ không chạy sai.
+#   - cache_dir RIÊNG: cache embedding chỉ có một file và train.Caches từ chối cache dựng
+#     bằng model khác config, nên dùng chung thư mục thì đè mất cache 35M.
+# Dòng `prepare` dựng cache ấy (fingerprint + embedding 5.335 protein); dòng train sau đó
+# PHẢI mang cùng ESM650_SET để đọc đúng cache.
+ESM650_SET="--set protein_encoder.model=facebook/esm2_t33_650M_UR50D"
+ESM650_SET+=" --set protein_encoder.embedding_dim=1280"
+ESM650_SET+=" --set paths.cache_dir=work/evaluator_cache_v4_esm650m"
+
+# Mỗi dòng: "<cấu hình> <đầu ra> <sharpness on|off> [--set khóa=giá_trị ...]", hoặc
+# "prepare [--set ...]" để dựng thêm một bộ cache giữa chừng (xem vòng lặp bên dưới).
 #
-# ĐỢT 2 (01/11/2026). Đợt 1 gồm 19 dòng ablation kiến trúc + quét chống overfit; kết
-# quả của nó (đọc bằng scripts/summarize_runs.py) quyết định đợt này:
-#   - Tốt nhất đợt 1: frozen direct model.dropout=0.5 -> MAE 0,5852, Spearman 0,1343,
-#     R2 0,0173, thắng ở epoch 0 bước 10000. Baseline luôn đoán 0: MAE 0,5879.
-#   - dropout là nút DUY NHẤT ăn rõ, và 0,5 tốt hơn 0,3 -> chưa tới đỉnh, nên đợt này
-#     đi tiếp 0,6 và 0,7. Chỉ khi MAE xấu đi mới biết đã quá đỉnh.
-#   - weight_decay đứng một mình đều làm xấu (0,03/0,1/0,3 -> 0,6006/0,6019/0,5979 so
-#     với 0,5976 khi để trần) -> đợt này BỎ weight_decay.
-#   - IGNITE xấu hơn đối chứng cả hai lần (0,6018 / 0,5976 và 0,5880 / 0,5864)
-#     -> đợt này BỎ sharpness, mọi dòng đều off.
-#   - Gộp cả ba nút (huber_delta=0.3 + weight_decay=0.1 + dropout=0.3) ra 0,5864,
-#     TỆ hơn chỉ dropout=0.5 một mình -> bỏ cách gộp đó,
-#     chỉ còn thử ghép dropout với huber_delta vì huber_delta có nguồn.
-# Hai dòng cuối tách một CONFOUND của đợt 1: đợt đó đổi cả accumulate_steps (1->8)
-# VÀ eval_every_steps (4000->500), nên không biết phần thắng là nhờ cộng dồn gradient
-# hay chỉ nhờ đo validation dày hơn. Mốc thắng của các lần cộng dồn là bước 3000, mà
-# với nhịp 4000 thì bước đó CHƯA TỪNG được đo. Hai dòng này giữ nhịp đo 500 và để
-# accumulate_steps = 1, nên hiệu so với đợt 1 là tác dụng của nhịp đo một mình:
-#   - dòng frozen (rẻ, ~5 phút) so với 0,5852 của dropout=0.5 nhịp 2000.
-#   - dòng finetune (~18 phút) so với 0,5874 của lần cộng dồn nhịp 500.
-# huber_delta 0.3: dưới 0,3 log là sai số thí nghiệm (Landrum & Riniker 2024,
-# DOI 10.1021/acs.jcim.4c00049) nên phạt bình phương, trên mức đó phạt tuyến tính.
-# Là nút DUY NHẤT ở đây có nguồn, nên giữ lại để thử ghép với dropout.
-# model.dropout 0.6 / 0.7: CHƯA CÓ NGUỒN, nối tiếp thang 0,1 -> 0,3 -> 0,5 đợt 1.
-# eval_every_steps 1000 / 500: CHƯA CÓ NGUỒN, chỉ dùng để tách confound nói trên.
+# ĐỢT 3 (01/11/2026). Kết quả đợt 2 (đọc bằng scripts/summarize_runs.py):
+#   - dropout 0,5 -> 0,6 -> 0,7: MAE 0,5852 -> 0,5825 -> 0,5842; Spearman 0,1343 -> 0,1452
+#     -> 0,1281. Đỉnh ở 0,6. Ghép thêm huber_delta 0.3 không giúp (0,5840 với 0,6).
+#   - Đo mỗi 1000 bước ra GIỐNG HỆT đo mỗi 2000 (0,5852, cùng thắng ở bước 10000).
+#   - Mọi số trên đều là MỘT seed (20261023), và khoảng cách 0,5 với 0,6 chỉ 0,0027.
+# Đợt này trả lời ba câu, theo thứ tự rẻ trước:
+#   1. Dao động theo seed là bao nhiêu (4 dòng seed): cần cho dạng "trung bình ± độ lệch"
+#      trên slide, và để biết 0,6 hơn 0,5 có thật không. Seed 1 và 2 CHƯA CÓ NGUỒN, chỉ
+#      cần khác seed gốc; ba seed là mức tối thiểu để tính được độ lệch.
+#   2. Nhánh protein đáng bao nhiêu ở tham số tốt nhất (no_protein dropout 0.6): đợt 1
+#      chỉ đo điều này ở tham số cũ.
+#   3. ESM2 650M có hơn 35M không (dòng prepare + dòng train cuối), cùng dropout 0.6 và
+#      cùng seed gốc nên so thẳng được với 0,5825.
+# Dòng prepare 650M nằm SAU các dòng 35M: nếu việc tải hoặc embed 650M hỏng thì mọi kết
+# quả 35M đã ghi xong từ trước.
 TRAIN_RUNS=(
-    "frozen direct off --set model.dropout=0.6"
-    "frozen direct off --set model.dropout=0.7"
-    "frozen direct off --set model.dropout=0.5 --set huber_delta=0.3"
-    "frozen direct off --set model.dropout=0.6 --set huber_delta=0.3"
-    "frozen direct off --set model.dropout=0.5 --set eval_every_steps=1000"
-    "finetune direct off $FINETUNE_SET --set eval_every_steps=500"
+    "frozen direct off --set model.dropout=0.6 --set seed=1"
+    "frozen direct off --set model.dropout=0.6 --set seed=2"
+    "frozen direct off --set model.dropout=0.5 --set seed=1"
+    "frozen direct off --set model.dropout=0.5 --set seed=2"
+    "no_protein direct off --set model.dropout=0.6"
+    "prepare $ESM650_SET"
+    "frozen direct off --set model.dropout=0.6 $ESM650_SET"
 )
 
 # --- 1. Chốt thư mục: script phải nằm đúng trong PROJECT_ROOT -----------------------------
@@ -297,6 +299,15 @@ for configuration in "${SMOKE_CONFIGS[@]}"; do
 done
 
 for entry in "${TRAIN_RUNS[@]}"; do
+    if [[ "$entry" == "prepare "* ]]; then
+        # Dựng thêm một bộ cache (vd. ESM2 khác, thư mục khác). Lỗi ở đây không dừng
+        # script: dòng train dùng cache đó sẽ tự báo lỗi vì thiếu file, còn các dòng
+        # khác vẫn chạy.
+        extra="${entry#prepare }"
+        # shellcheck disable=SC2086
+        run_step "prepare $extra" python run_evaluator.py --mode prepare $extra
+        continue
+    fi
     read -r configuration head penalty extra <<<"$entry"
     penalty="${penalty:-off}"
     label="train $configuration $head sharpness=$penalty${extra:+ $extra}"

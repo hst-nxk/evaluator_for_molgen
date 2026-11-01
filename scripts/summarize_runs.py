@@ -44,9 +44,14 @@ def label(manifest: dict[str, Any]) -> str:
     if steps > 1:
         parts.append(f"accum={steps}")
     overrides = manifest.get("overrides") or {}
-    skip = {"gpu_memory_limit_mib", "eval_every_steps", "accumulate_steps"}
+    # embedding_dim và cache_dir chỉ đi kèm việc đổi model ESM2, không phải tham số
+    # riêng; in tên model là đủ để phân biệt lần chạy.
+    skip = {"gpu_memory_limit_mib", "eval_every_steps", "accumulate_steps",
+            "protein_encoder.embedding_dim", "paths.cache_dir"}
     for key, value in overrides.items():
-        if key not in skip:
+        if key == "protein_encoder.model":
+            parts.append(str(value).split("/")[-1])
+        elif key not in skip:
             parts.append(f"{key.split('.')[-1]}={value}")
     return " ".join(parts)
 

@@ -1,6 +1,6 @@
 """CLI cho Stage 3 — evaluator baseline (dự đoán Δp của một cặp chỉnh sửa).
 
-    python run_evaluator.py --mode prepare  [--skip-protein]
+    python run_evaluator.py --mode prepare  [--skip-protein] [--set khóa=giá_trị ...]
     python run_evaluator.py --mode baseline
     python run_evaluator.py --mode smoke   [--config frozen|finetune|no_protein]
                                            [--head direct|twin] [--sharpness on|off]
@@ -59,7 +59,8 @@ def setup_logging(log_path: Path) -> None:
 
 
 def apply_overrides(settings: dict, pairs: list[str],
-                    model_settings: dict | None = None) -> dict:
+                    model_settings: dict | None = None,
+                    blocks: dict[str, dict] | None = None) -> dict:
     """Ghi đè các tham số train từ dòng lệnh, dạng ``khóa=giá trị``.
 
     Chỉ cho phép ghi đè khóa ĐÃ CÓ trong ``stage3.train`` và có giá trị là số hoặc
@@ -71,8 +72,16 @@ def apply_overrides(settings: dict, pairs: list[str],
     Khóa bắt đầu bằng ``model.`` thì đi sang ``stage3.model`` thay vì ``stage3.train``,
     ví dụ ``model.dropout=0.3`` — dropout là nút chống khớp quá dữ liệu nhưng lại nằm
     trong khối mô tả kiến trúc, không nằm trong khối tham số train.
+
+    ``blocks`` thêm các khối khác theo cùng cách, tên khối -> dict của khối. CLI truyền
+    ``protein_encoder`` và ``paths`` để thử một model ESM2 khác mà không sửa config.json:
+    ``protein_encoder.model=... protein_encoder.embedding_dim=... paths.cache_dir=...``.
+    Đổi cả ``paths.cache_dir`` là bắt buộc trên thực tế: cache embedding chỉ có một file,
+    và ``train.Caches`` từ chối cache dựng bằng model khác config, nên dùng chung thư mục
+    thì lần dựng mới đè mất cache của model đang dùng.
     Trả về: dict khóa -> giá trị mới, để ghi vào manifest của lần chạy.
     """
+    routes: dict[str, dict | None] = {MODEL_PREFIX: model_settings, **(blocks or {})}
     applied: dict = {}
     for pair in pairs:
         if "=" not in pair:
@@ -81,13 +90,14 @@ def apply_overrides(settings: dict, pairs: list[str],
         key = key.strip()
         target = settings
         path = key.split(".")
-        if path[0] == MODEL_PREFIX:
-            if model_settings is None:
+        if path[0] in routes:
+            if routes[path[0]] is None:
                 raise ValueError(f"--set: không nhận {key!r} ở chế độ này")
-            target = model_settings
+            target = routes[path[0]]
+            prefix = path[0]
             path = path[1:]
             if not path or not all(path):
-                raise ValueError("--set: thiếu tên tham số sau 'model.'")
+                raise ValueError(f"--set: thiếu tên tham số sau '{prefix}.'")
         for step in path[:-1]:
             if not isinstance(target, dict) or step not in target:
                 raise ValueError(f"--set: không có khối {step!r} trong {key!r}")
@@ -129,21 +139,26 @@ def main() -> int:
                              "stage3.train.sharpness.enabled")
     parser.add_argument("--set", dest="overrides", action="append", default=[],
                         metavar="KHÓA=GIÁ_TRỊ",
-                        help="smoke/train: ghi đè một tham số trong stage3.train mà không "
-                             "sửa config.json, ví dụ --set weight_decay=0.1 "
-                             "--set huber_delta=0.3; dùng được nhiều lần")
+                        help="ghi đè một tham số mà không sửa config.json, ví dụ "
+                             "--set weight_decay=0.1 (stage3.train), --set model.dropout=0.6 "
+                             "(stage3.model), --set protein_encoder.model=... và "
+                             "--set paths.cache_dir=... (dùng cả cho prepare); dùng được "
+                             "nhiều lần")
     parser.add_argument("--checkpoint", type=Path, help="eval: file .pt cần nạp")
     args = parser.parse_args()
 
     try:
-        overrides = apply_overrides(settings, args.overrides,
-                                    config["stage3"]["model"])
+        overrides = apply_overrides(settings, args.overrides, config["stage3"]["model"],
+                                    {"protein_encoder": config["stage3"]["protein_encoder"],
+                                     "paths": config["stage3"]["paths"]})
     except ValueError as error:
         parser.error(str(error))
 
     stamp = datetime.now().strftime(evaluator_train.TIMESTAMP_FORMAT)
     runs_dir = ROOT / config["stage3"]["paths"]["runs_dir"]
     setup_logging(runs_dir / f"{args.mode}_{stamp}.log")
+    if overrides:
+        logging.info("ghi đè tham số: %s", overrides)
 
     if args.mode == "prepare":
         evaluator_train.run_prepare(config, ROOT, args.skip_protein)
@@ -152,8 +167,6 @@ def main() -> int:
         evaluator_train.run_baselines(config, ROOT, stamp)
         return 0
     if args.mode in ("smoke", "train"):
-        if overrides:
-            logging.info("ghi đè tham số train: %s", overrides)
         evaluator_train.run_train(config, ROOT, args.configuration, args.head,
                                   smoke=args.mode == "smoke", stamp=stamp,
                                   sharpness_mode=args.sharpness, overrides=overrides)
