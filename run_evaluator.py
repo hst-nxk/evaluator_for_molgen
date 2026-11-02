@@ -7,6 +7,7 @@
     python run_evaluator.py --mode train   [--config ...] [--head ...]
                                            [--sharpness on|off] [--set khóa=giá_trị ...]
     python run_evaluator.py --mode eval    --checkpoint runs/evaluator/<file>.pt
+                                           [--partition validation|train]
 """
 # ---------------------------------------------------------------------------------------
 # File này chỉ là điểm vào: đọc config.json, bật logging, rồi gọi hàm trong
@@ -41,6 +42,8 @@ from molopt.evaluator import train as evaluator_train  # noqa: E402
 MODEL_PREFIX = "model"
 CONFIG_PATH = ROOT / "config.json"
 MODES = ("prepare", "baseline", "smoke", "train", "eval")
+# Partition mà --mode eval được chấm. Không có test: test chỉ chạy một lần ở cuối.
+EVAL_PARTITIONS = ("validation", "train")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
 
@@ -145,6 +148,9 @@ def main() -> int:
                              "--set paths.cache_dir=... (dùng cả cho prepare); dùng được "
                              "nhiều lần")
     parser.add_argument("--checkpoint", type=Path, help="eval: file .pt cần nạp")
+    parser.add_argument("--partition", default=EVAL_PARTITIONS[0], choices=EVAL_PARTITIONS,
+                        help="eval: partition được chấm; train để so với validation xem "
+                             "mô hình overfit hay chưa học được (test luôn bị chặn)")
     args = parser.parse_args()
 
     try:
@@ -175,7 +181,7 @@ def main() -> int:
         parser.error("--mode eval cần --checkpoint")
     if not args.checkpoint.is_file():
         parser.error(f"không thấy checkpoint {args.checkpoint}")
-    evaluator_train.run_eval(config, ROOT, args.checkpoint, stamp)
+    evaluator_train.run_eval(config, ROOT, args.checkpoint, stamp, args.partition)
     return 0
 
 

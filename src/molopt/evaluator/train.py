@@ -1025,10 +1025,12 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
 
 
 def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
-             stamp: str) -> dict[str, Any]:
-    """Nạp checkpoint rồi báo cáo chỉ số trên validation theo từng lát cắt.
+             stamp: str, partition: str = data.VALIDATION) -> dict[str, Any]:
+    """Nạp checkpoint rồi báo cáo chỉ số trên một partition theo từng lát cắt.
 
-    Không train, không chạm partition test.
+    ``partition`` là validation (mặc định) hoặc train. Chấm trên train để so với validation:
+    hai số gần nhau là mô hình chưa học được cả dữ liệu đã thấy, train cao hẳn là overfit.
+    Không train, không chạm partition test (read_partition chặn).
     """
     import torch
 
@@ -1060,7 +1062,7 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
                                   len(config["endpoints"]), str(state["head"]), protein_mode)
     model.load_state_dict(state["model"])
     model.to(device)
-    arrays, keys, _ = prepare_arrays(config, root, data.VALIDATION, caches,
+    arrays, keys, _ = prepare_arrays(config, root, partition, caches,
                                      protein_vocabulary, None)
     _, eval_batch_size = effective_batch_sizes(settings, protein_mode, False)
     prediction = predict(model, arrays, caches, protein_source, device, eval_batch_size)
@@ -1068,21 +1070,23 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
     for name, block in scores.items():
         if name == "by_endpoint" or not isinstance(block, dict):
             continue
-        for line in metrics.format_metrics(f"validation/{name}", block["regression"],
+        for line in metrics.format_metrics(f"{partition}/{name}", block["regression"],
                                            block.get("ranking"), block.get("change_classes")):
             LOGGER.info("%s", line)
     asymmetry = asymmetry_report(model, arrays, caches, protein_source, device, config,
                                  eval_batch_size)
     if asymmetry is not None:
-        for line in metrics.format_asymmetry("bất đối xứng (validation)", asymmetry):
+        for line in metrics.format_asymmetry(f"bất đối xứng ({partition})", asymmetry):
             LOGGER.info("%s", line)
     _, runs_dir = layout(config, root)
+    # Khóa "validation_metrics" giữ nguyên tên cũ vì scripts/summarize_*.py đọc khóa này.
     manifest = {"stage": "stage3_eval", "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "checkpoint": str(checkpoint), "configuration": configuration,
                 "head": str(state["head"]), "protein_mode": protein_mode, "device": device,
-                "rows": len(arrays), "validation_metrics": scores,
-                "asymmetry": asymmetry}
-    path = runs_dir / f"eval_{configuration}_{state['head']}_{stamp}.json"
+                "partition": partition, "rows": len(arrays),
+                f"{partition}_metrics": scores, "asymmetry": asymmetry}
+    suffix = "" if partition == data.VALIDATION else f"_{partition}"
+    path = runs_dir / f"eval_{configuration}_{state['head']}{suffix}_{stamp}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     LOGGER.info("manifest đánh giá: %s", path)
