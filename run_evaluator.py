@@ -8,6 +8,9 @@
                                            [--sharpness on|off] [--set khóa=giá_trị ...]
     python run_evaluator.py --mode eval    --checkpoint runs/evaluator/<file>.pt
                                            [--partition validation|train]
+    python run_evaluator.py --mode errors  --checkpoint runs/evaluator/<file>.pt
+                                           [--partition validation|train]
+    python run_evaluator.py --mode features --checkpoint runs/evaluator/<file>.pt
 """
 # ---------------------------------------------------------------------------------------
 # File này chỉ là điểm vào: đọc config.json, bật logging, rồi gọi hàm trong
@@ -19,6 +22,9 @@
 #   smoke    : train trên một mẫu nhỏ, chạy được trên CPU, chỉ xác nhận pipeline thông.
 #   train    : train thật; chọn checkpoint theo MAE trên validation.
 #   eval     : nạp checkpoint rồi báo cáo chỉ số theo từng lát cắt.
+#   errors   : nạp checkpoint rồi chia lỗi theo nhóm (việc 6, họp 02/11/2026).
+#   features : nạp checkpoint rồi xuất vector sau encoder của một mẫu train và
+#              validation, để vẽ t-SNE (việc 4).
 #
 # Thứ tự chạy: baseline -> prepare -> smoke -> train -> eval.
 # Partition `test` không được dùng ở bất kỳ chế độ nào (xem molopt.evaluator.data).
@@ -41,7 +47,7 @@ from molopt.evaluator import train as evaluator_train  # noqa: E402
 
 MODEL_PREFIX = "model"
 CONFIG_PATH = ROOT / "config.json"
-MODES = ("prepare", "baseline", "smoke", "train", "eval")
+MODES = ("prepare", "baseline", "smoke", "train", "eval", "errors", "features")
 # Partition mà --mode eval được chấm. Không có test: test chỉ chạy một lần ở cuối.
 EVAL_PARTITIONS = ("validation", "train")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
@@ -147,9 +153,10 @@ def main() -> int:
                              "(stage3.model), --set protein_encoder.model=... và "
                              "--set paths.cache_dir=... (dùng cả cho prepare); dùng được "
                              "nhiều lần")
-    parser.add_argument("--checkpoint", type=Path, help="eval: file .pt cần nạp")
+    parser.add_argument("--checkpoint", type=Path,
+                        help="eval, errors, features: file .pt cần nạp")
     parser.add_argument("--partition", default=EVAL_PARTITIONS[0], choices=EVAL_PARTITIONS,
-                        help="eval: partition được chấm; train để so với validation xem "
+                        help="eval, errors: partition được chấm; train để so với validation xem "
                              "mô hình overfit hay chưa học được (test luôn bị chặn)")
     args = parser.parse_args()
 
@@ -178,10 +185,15 @@ def main() -> int:
                                   sharpness_mode=args.sharpness, overrides=overrides)
         return 0
     if args.checkpoint is None:
-        parser.error("--mode eval cần --checkpoint")
+        parser.error(f"--mode {args.mode} cần --checkpoint")
     if not args.checkpoint.is_file():
         parser.error(f"không thấy checkpoint {args.checkpoint}")
-    evaluator_train.run_eval(config, ROOT, args.checkpoint, stamp, args.partition)
+    if args.mode == "errors":
+        evaluator_train.run_errors(config, ROOT, args.checkpoint, stamp, args.partition)
+    elif args.mode == "features":
+        evaluator_train.run_features(config, ROOT, args.checkpoint, stamp)
+    else:
+        evaluator_train.run_eval(config, ROOT, args.checkpoint, stamp, args.partition)
     return 0
 
 

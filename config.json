@@ -547,6 +547,15 @@
       "endpoint_dim": 16,
       "head_hidden": [512, 256],
       "dropout": 0.1,
+      "fusion": "concat",
+      "fusion_dim": 256,
+      "attention_heads": 4,
+      "attention_layers": 2,
+      "attention_dropout": 0.1,
+      "head_block": "plain",
+      "residual_width": 512,
+      "residual_blocks": 2,
+      "fusion_note": "Việc giao họp 02/11/2026 (projector, attention, normalization + skip connection). fusion: concat = bản v1 (ghép thẳng, mặc định để kết quả cũ không đổi); projector = mỗi nhánh Linear + LayerNorm về cùng fusion_dim rồi ghép; attention = như projector rồi self-attention giữa các token nhánh (attention_layers lớp Transformer encoder pre-LN, attention_heads head). head_block: plain = MLP head_hidden như v1; residual = residual_blocks khối dư rộng residual_width theo ResNet của Gorishniy và cs. 2021 (NeurIPS, arXiv:2106.11959, phương trình 2), thay BatchNorm bằng LayerNorm (chưa có nguồn, vì batch finetune gom theo protein). Nguồn khác: embedding vai trò = modal-type embedding của ViLT (arXiv:2102.03334); pre-LN = Xiong và cs. 2020 (arXiv:2002.04745); feed-forward 4 x width và attention_dropout 0.1 = Vaswani và cs. 2017 (arXiv:1706.03762). LayerNorm sau lớp chiếu và việc nối token thay cho token CLS: chưa có nguồn. Khi fusion khác concat thì protein_out và endpoint_dim không dùng (mọi nhánh ra fusion_dim); khi head_block = residual thì head_hidden không dùng. Các con số fusion_dim 256, attention_heads 4, attention_layers 2, residual_width 512, residual_blocks 2 là lựa chọn ban đầu, CHƯA CÓ NGUỒN: fusion_dim 256 bằng ligand_out, residual_width 512 bằng lớp đầu của head_hidden; cần quét trên validation. attention_dropout tách riêng khỏi dropout vì dropout đang quét ở 0,5-0,6, mức đó trên ma trận attention chỉ có 4-6 token là quá mạnh (chưa đo). Đổi bằng --set model.fusion=attention, --set model.head_block=residual.",
       "heads_note": "Ba đầu ra: direct (thấy cả A và B, có nhánh edit), direct_no_edit (thấy cả A và B, không có nhánh edit), twin (chấm điểm riêng từng phân tử rồi lấy hiệu). direct vs direct_no_edit tách tác dụng riêng của nhánh edit; direct_no_edit vs twin tách tác dụng riêng của việc tính Δ thẳng. Ô thứ tư (twin có nhánh edit) không tồn tại được vì một phép sửa là thuộc tính của cặp, không của một phân tử.",
       "note": "protein_out = 128: giảm chiều embedding protein trước khi concat để đầu dự đoán không bị một nhánh áp đảo. endpoint_dim = 16 cho 4 endpoint."
     },
@@ -588,7 +597,7 @@
       "smoke_rows": 20000,
       "smoke_epochs": 2,
       "finetune_overrides": {"batch_size": 256, "max_residues": 512,
-                             "eval_batch_size": 512},
+                             "eval_batch_size": 512, "max_proteins_per_batch": 6},
       "finetune_overrides_note": "Cau hinh finetune giu ESM2 trong do thi tinh toan, nen bo nho ti le voi so protein PHAN BIET trong batch chu KHONG phai so dong. Vi vay vong train gom batch theo protein o cau hinh nay (data.iter_protein_batches). DO DUOC tren train v4 (31/10/2026): lay batch ngau nhien thi 64 dong cham ~54,1 protein; gom theo protein thi batch 256 chi cham 1,10 protein trung binh (p99 = 4, xau nhat 13) va 98 phan tram batch chi co dung mot protein. Smoke tren RTX 4090 do duoc 17 GB o muc 13,6 protein moi batch, suy ra khoang 1,25 GB moi protein: batch 256 can ~1,4 GB thuong xuyen va ~16 GB o batch xau nhat. batch_size 256 chon de so buoc moi epoch con 25.889 (batch 64 la 103.556) ma van du khoang an toan. eval_batch_size 512: luot du doan chay duoi no_grad nen khong giu activation, nhe hon han luot train; thu tu doc la tuan tu nen batch 512 chi cham 2,84 protein trung binh. Card nho hon 24 GB thi giam batch_size truoc, roi moi giam max_residues.",
       "note": "protein_learning_rate chỉ dùng ở cấu hình finetune: ESM2 đã pretrain nên học với learning rate nhỏ hơn phần đầu dự đoán hai bậc, tránh phá trọng số pretrain. loss = huber (ít nhạy với nhãn ngoại lai hơn MSE, mà dataset còn giữ nguyên giá trị nguồn bất khả thi và chỉ gắn cờ). early_stopping theo validation, KHÔNG dùng partition test. dataloader_workers = 0 vì Windows dùng spawn và cache fingerprint đã nằm trong RAM."
     },
@@ -612,6 +621,14 @@
       "asymmetry_note": "Đầu ra direct KHÔNG được cưỡng chế đối xứng (cưỡng chế sẽ làm thay đổi bản chất của ablation direct-vs-twin). Thay vào đó mức lệch được ĐO và ghi vào manifest: |f(A,B)+f(B,A)|/2 phải bằng 0 nếu mô hình đối xứng, và |f(A,A)| phải bằng 0 vì phép sửa không sửa gì. Cặp (A,A) không tồn tại trong dataset nên số đo thứ hai nói về ngoại suy, không nói về chất lượng khớp. asymmetry_rows là cỡ mẫu ngẫu nhiên có seed cố định; 0 nghĩa là dùng toàn bộ validation.",
       "baselines_note": "Ba baseline tầm thường làm mốc dưới: zero luôn đoán Δp = 0; endpoint_mean đoán trung bình Δp của endpoint, ước lượng CHỈ trên train; random lấy mẫu có hoàn lại từ phân bố nhãn train với seed cố định (stage3.train.seed). zero và endpoint_mean cho dự đoán không đổi trong mỗi query nên tỉ lệ đúng chiều của chúng bằng 0 theo quy ước hòa-tính-sai, KHÔNG phải 50 %; phần so sánh được của hai cái đó là MAE/RMSE/R². random cho dự đoán liên tục và độc lập với dòng đang xét nên hầu như không có hòa, và tỉ lệ đúng chiều của nó là mốc 50 % thật để so; lấy mẫu từ phân bố nhãn train chứ không từ một phân bố tự chọn như N(0,1) để không thêm tham số tùy ý.",
       "note": "Ranking CHỈ trong cùng một query = (phân tử tham chiếu, protein, endpoint). expand_both_directions = true: mỗi dòng (A, B, Δp) sinh hai hướng A->B (Δp) và B->A (−Δp), vì dataset lưu cặp theo chiều khóa A < B nên nếu chỉ nhóm theo smiles_a thì query bị cắt vụn theo thứ tự khóa chứ không theo hóa học. min_candidates = 2: query một ứng viên không xếp hạng được nên bị loại khỏi MẪU SỐ của ranking, vẫn tính regression. top_k chỉ tính trên query có ít nhất k ứng viên, và mẫu số được ghi riêng cho từng k. Mọi chỉ số ranking báo cáo CẢ macro (trung bình theo query) và micro (gộp mọi cặp ứng viên)."
+    },
+    "analysis": {
+      "quantile_bins": 5,
+      "min_group_rows": 100,
+      "min_group_queries": 20,
+      "worst_count": 20,
+      "feature_rows_per_partition": 20000,
+      "note": "Việc 6 họp 02/11/2026 (phân tích ca sai) và vector sau encoder cho t-SNE (việc 4). --mode errors chấm một checkpoint trên train hoặc validation rồi chia lỗi theo nhóm: endpoint, độ lớn |Δp|, độ nhiễu của nhãn (n_assays, n_documents, n_distinct_values, max_replicate_std, mixed_assay_type, plausible_range, cảnh báo nguồn), độ hiếm (số dòng của protein, của phân tử, của phép sửa), cỡ query. Ngưỡng đúng dấu dùng lại metrics.direction_tolerance (0,3 log, có nguồn ở threshold_source). Các con số ở khối này CHỈ là cách chia và lọc bảng báo cáo, không ảnh hưởng train hay chỉ số chính, CHƯA CÓ NGUỒN: quantile_bins = số nhóm chia theo phân vị cho cột số; min_group_rows, min_group_queries = cỡ tối thiểu để một protein hay một phép sửa được đưa vào danh sách tệ nhất (nhóm quá nhỏ thì tỉ lệ dao động ngẫu nhiên); worst_count = độ dài danh sách đó; feature_rows_per_partition = số dòng lấy mẫu (seed stage3.train.seed) mỗi partition cho --mode features. Không bao giờ đọc partition test."
     }
   },
   "audit": {

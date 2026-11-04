@@ -23,6 +23,7 @@ import logging
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -948,7 +949,9 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
                      "configuration": configuration, "head": head,
                      "protein_mode": protein_mode, "protein_dim": protein_dim,
                      "ligand_bits": caches.ligand_bits,
-                     "fragment_bits": caches.fragment_bits}
+                     "fragment_bits": caches.fragment_bits,
+                     "model_settings": models.architecture_settings(
+                         config["stage3"]["model"])}
             if isinstance(protein_source, ProteinEncoderRuntime):
                 state["protein_encoder"] = protein_source.model.state_dict()
             torch.save(state, checkpoint_path)
@@ -987,6 +990,7 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "stage": "stage3_train", "mode": "smoke" if smoke else "train",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "configuration": configuration, "head": head, "protein_mode": protein_mode,
+        "model": models.architecture_settings(config["stage3"]["model"]),
         "device": device, "seed": int(settings["seed"]),
         "epochs_run": 1 + max((record["epoch"] for record in history), default=-1),
         "measurements": len(history), "eval_every_steps": eval_every,
@@ -1024,14 +1028,25 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
     return manifest
 
 
-def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
-             stamp: str, partition: str = data.VALIDATION) -> dict[str, Any]:
-    """Nạp checkpoint rồi báo cáo chỉ số trên một partition theo từng lát cắt.
+@dataclass
+class LoadedCheckpoint:
+    """Một checkpoint đã nạp, sẵn sàng chấm điểm (dùng chung cho eval, errors, features)."""
 
-    ``partition`` là validation (mặc định) hoặc train. Chấm trên train để so với validation:
-    hai số gần nhau là mô hình chưa học được cả dữ liệu đã thấy, train cao hẳn là overfit.
-    Không train, không chạm partition test (read_partition chặn).
-    """
+    state: dict[str, Any]
+    model: Any
+    caches: Caches
+    protein_source: Any
+    protein_vocabulary: pa.Array
+    protein_mode: str
+    configuration: str
+    head: str
+    device: str
+    eval_batch_size: int
+
+
+def load_checkpoint(config: Mapping[str, Any], root: Path,
+                    checkpoint: Path) -> LoadedCheckpoint:
+    """Nạp checkpoint, cache và nguồn vector protein đúng như lúc train."""
     import torch
 
     from . import models
@@ -1040,7 +1055,6 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
     device = resolve_device(settings["device"])
     limit_gpu_memory(settings, device)
     state = torch.load(checkpoint, map_location=device, weights_only=False)
-    configuration = str(state["configuration"])
     protein_mode = str(state["protein_mode"])
     caches = Caches(config, root, need_protein=protein_mode == models.PROTEIN_FROZEN)
     protein_source: Any = None
@@ -1057,14 +1071,41 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
             protein_source = ProteinEncoderRuntime(encoder_settings, ordered, device)
             if "protein_encoder" in state:
                 protein_source.model.load_state_dict(state["protein_encoder"])
-    model = models.EvaluatorModel(config["stage3"]["model"], int(state["ligand_bits"]),
+    # Checkpoint trước 03/11/2026 không lưu kiến trúc; khi đó chỉ có concat + plain, nên
+    # ép đúng hai giá trị đó dù config hiện tại đang đặt gì. Chiều các lớp vẫn lấy từ
+    # config: các khóa đó chưa từng đổi, và nếu đổi thì load_state_dict báo lỗi lệch chiều.
+    model_settings = state.get("model_settings") or {
+        **config["stage3"]["model"], "fusion": models.FUSION_CONCAT,
+        "head_block": models.HEAD_BLOCK_PLAIN}
+    model = models.EvaluatorModel(model_settings, int(state["ligand_bits"]),
                                   int(state["fragment_bits"]), state["protein_dim"],
                                   len(config["endpoints"]), str(state["head"]), protein_mode)
     model.load_state_dict(state["model"])
     model.to(device)
+    _, eval_batch_size = effective_batch_sizes(settings, protein_mode, False)
+    return LoadedCheckpoint(state=state, model=model, caches=caches,
+                            protein_source=protein_source,
+                            protein_vocabulary=protein_vocabulary, protein_mode=protein_mode,
+                            configuration=str(state["configuration"]),
+                            head=str(state["head"]), device=device,
+                            eval_batch_size=eval_batch_size)
+
+
+def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
+             stamp: str, partition: str = data.VALIDATION) -> dict[str, Any]:
+    """Nạp checkpoint rồi báo cáo chỉ số trên một partition theo từng lát cắt.
+
+    ``partition`` là validation (mặc định) hoặc train. Chấm trên train để so với validation:
+    hai số gần nhau là mô hình chưa học được cả dữ liệu đã thấy, train cao hẳn là overfit.
+    Không train, không chạm partition test (read_partition chặn).
+    """
+    loaded = load_checkpoint(config, root, checkpoint)
+    model, caches, device = loaded.model, loaded.caches, loaded.device
+    protein_source, protein_vocabulary = loaded.protein_source, loaded.protein_vocabulary
+    state, configuration, protein_mode = loaded.state, loaded.configuration, loaded.protein_mode
+    eval_batch_size = loaded.eval_batch_size
     arrays, keys, _ = prepare_arrays(config, root, partition, caches,
                                      protein_vocabulary, None)
-    _, eval_batch_size = effective_batch_sizes(settings, protein_mode, False)
     prediction = predict(model, arrays, caches, protein_source, device, eval_batch_size)
     scores = evaluate(arrays, prediction, keys, config)
     for name, block in scores.items():
@@ -1090,4 +1131,260 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     LOGGER.info("manifest đánh giá: %s", path)
+    return manifest
+
+
+# ------------------------------------------------------------------ phân tích ca sai
+
+
+# Cột chỉ đọc thêm cho phân tích, không có trong data.PAIR_COLUMNS. pair_id để khớp dòng.
+ANALYSIS_EXTRA_COLUMNS = ["pair_id", "max_replicate_std", "p_a_range", "mixed_assay_type",
+                          "assay_types"]
+
+
+def flag_groups(column: pa.ChunkedArray) -> tuple[np.ndarray, list[str]]:
+    """Cột bool -> nhóm False / True / thiếu."""
+    from .analysis import MISSING_LABEL
+
+    missing = np.asarray(pc.is_null(column).to_numpy(zero_copy_only=False), dtype=bool)
+    values = np.asarray(pc.fill_null(column, False).to_numpy(zero_copy_only=False), dtype=bool)
+    codes = np.where(missing, 2, values.astype(np.int64))
+    return codes, ["False", "True", MISSING_LABEL]
+
+
+def string_groups(column: pa.ChunkedArray) -> tuple[np.ndarray, list[str]]:
+    """Cột chuỗi -> một nhóm cho mỗi giá trị khác nhau; null vào nhóm 'thiếu'."""
+    from .analysis import MISSING_LABEL
+
+    encoded = pc.dictionary_encode(column.combine_chunks())
+    names = [str(value) for value in encoded.dictionary.to_pylist()]
+    codes = np.asarray(pc.fill_null(encoded.indices, len(names)).to_numpy(
+        zero_copy_only=False), dtype=np.int64)
+    return codes, names + [MISSING_LABEL]
+
+
+def numeric(table: pa.Table, name: str) -> np.ndarray:
+    """Một cột số thành float64; null thành NaN."""
+    return np.asarray(pc.cast(table.column(name), pa.float64()).to_numpy(
+        zero_copy_only=False), dtype=np.float64)
+
+
+def run_errors(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp: str,
+               partition: str = data.VALIDATION) -> dict[str, Any]:
+    """Việc 6 (họp 02/11/2026): mô hình sai ở đâu trên một partition (train hoặc validation).
+
+    Ghi vào runs_dir/errors_<cấu hình>_<đầu ra>_<partition>_<stamp>/:
+        report.json    : mọi bảng chia nhóm, độ co dự đoán, protein và phép sửa tệ nhất
+        rows.parquet   : từng dòng — nhãn, dự đoán, lỗi, đúng dấu, độ hiếm; nối với dataset
+                         qua pair_id để xem thêm cột khác
+        queries.parquet: từng query — số ứng viên, số cặp đúng chiều, Spearman, top-1
+    Cách chia nhóm và ngưỡng: xem ghi chú stage3.analysis trong config và module analysis.
+    """
+    from . import analysis
+
+    loaded = load_checkpoint(config, root, checkpoint)
+    caches = loaded.caches
+    arrays, keys, table = prepare_arrays(config, root, partition, caches,
+                                         loaded.protein_vocabulary, None)
+    extra = data.read_columns(config, root, partition, ANALYSIS_EXTRA_COLUMNS)
+    if not extra.column("pair_id").equals(table.column("pair_id")):
+        raise ValueError("hai lần đọc partition cho thứ tự dòng khác nhau; không khớp được")
+    prediction = predict(loaded.model, arrays, caches, loaded.protein_source, loaded.device,
+                         loaded.eval_batch_size)
+    truth = arrays.target.astype(np.float64)
+    predicted = prediction.astype(np.float64)
+    metric_settings = config["stage3"]["metrics"]
+    settings = config["stage3"]["analysis"]
+    tolerance = float(metric_settings["direction_tolerance"])
+    bins = int(settings["quantile_bins"])
+    endpoints = list(config["endpoints"])
+
+    protein_rows = analysis.code_frequency(arrays.protein)
+    molecule_a_rows, molecule_b_rows = analysis.molecule_frequency(arrays.molecule_a,
+                                                                   arrays.molecule_b)
+    edits = analysis.edit_codes(arrays.fragment_a, arrays.fragment_b)
+    edit_rows = analysis.code_frequency(edits)
+    warning = np.asarray(pc.is_valid(table.column("source_quality_warning")).to_numpy(
+        zero_copy_only=False), dtype=np.int64)
+    groupings: dict[str, tuple[np.ndarray, list[str]]] = {
+        "endpoint": (arrays.endpoint.astype(np.int64), endpoints),
+        "abs_delta_p": analysis.magnitude_groups(truth, tolerance, bins),
+        "n_assays": analysis.quantile_groups(numeric(table, "n_assays"), bins),
+        "n_documents": analysis.quantile_groups(numeric(table, "n_documents"), bins),
+        "n_distinct_values": analysis.quantile_groups(numeric(table, "n_distinct_values"),
+                                                      bins),
+        "max_replicate_std": analysis.quantile_groups(numeric(extra, "max_replicate_std"),
+                                                      bins),
+        "p_a_range": analysis.quantile_groups(numeric(extra, "p_a_range"), bins),
+        "mixed_assay_type": flag_groups(extra.column("mixed_assay_type")),
+        "assay_types": string_groups(extra.column("assay_types")),
+        "plausible_range": flag_groups(table.column("plausible_range")),
+        "source_quality_warning": (warning, ["không cảnh báo", "có cảnh báo"]),
+        "unseen_pair": flag_groups(table.column("unseen_pair")),
+        "qc_status": string_groups(table.column("qc_status")),
+        "protein_rows": analysis.quantile_groups(protein_rows.astype(np.float64), bins),
+        "molecule_a_rows": analysis.quantile_groups(molecule_a_rows.astype(np.float64), bins),
+        "edit_rows": analysis.quantile_groups(edit_rows.astype(np.float64), bins),
+    }
+    row_tables = {name: analysis.group_table(codes, names, truth, predicted, tolerance)
+                  for name, (codes, names) in groupings.items()}
+
+    queries = analysis.query_table(keys, truth, predicted, tolerance,
+                                   int(metric_settings["min_candidates"]),
+                                   bool(metric_settings["expand_both_directions"]))
+    protein_counts = np.bincount(arrays.protein, minlength=len(loaded.protein_vocabulary))
+    query_groupings = {
+        "candidates": analysis.quantile_groups(queries["candidates"].astype(np.float64), bins),
+        "endpoint": (queries["endpoint"], endpoints),
+        "protein_rows": analysis.quantile_groups(
+            protein_counts[queries["protein"]].astype(np.float64), bins),
+    }
+    query_tables = {name: analysis.query_group_table(codes, names, queries)
+                    for name, (codes, names) in query_groupings.items()}
+    overall = analysis.query_group_table(np.zeros(queries["agree"].size, dtype=np.int64),
+                                         ["toàn bộ"], queries)
+
+    worst_count = int(settings["worst_count"])
+    proteins = analysis.worst_proteins(queries, int(settings["min_group_queries"]),
+                                       worst_count)
+    for entry in proteins:
+        entry["protein_hash"] = loaded.protein_vocabulary[entry.pop("protein")].as_py()
+    edit_list = analysis.worst_edits(edits, arrays.fragment_a, arrays.fragment_b, truth,
+                                     predicted, tolerance, int(settings["min_group_rows"]),
+                                     worst_count)
+    for entry in edit_list:
+        entry.pop("edit")
+        entry["variable_a"] = caches.fragment_keys[entry.pop("fragment_a")].as_py()
+        entry["variable_b"] = caches.fragment_keys[entry.pop("fragment_b")].as_py()
+
+    spread = analysis.spread_report(truth, predicted)
+    LOGGER.info("độ co dự đoán (%s): %s", partition, spread)
+    for line in analysis.format_group_table(f"đúng chiều theo query ({partition})", overall):
+        LOGGER.info("%s", line)
+    for name, rows in row_tables.items():
+        for line in analysis.format_group_table(f"theo dòng / {name}", rows):
+            LOGGER.info("%s", line)
+    for name, rows in query_tables.items():
+        for line in analysis.format_group_table(f"theo query / {name}", rows):
+            LOGGER.info("%s", line)
+
+    _, runs_dir = layout(config, root)
+    folder = runs_dir / f"errors_{loaded.configuration}_{loaded.head}_{partition}_{stamp}"
+    folder.mkdir(parents=True, exist_ok=True)
+    counted, correct = analysis.sign_agreement(truth, predicted, tolerance)
+    pq.write_table(pa.table({
+        "pair_id": table.column("pair_id"),
+        "endpoint": table.column("endpoint"),
+        "protein_hash": table.column("protein_hash"),
+        "delta_p": pa.array(truth),
+        "prediction": pa.array(predicted),
+        "error": pa.array(predicted - truth),
+        "sign_counted": pa.array(counted),
+        "sign_correct": pa.array(correct),
+        "protein_rows": pa.array(protein_rows),
+        "molecule_a_rows": pa.array(molecule_a_rows),
+        "molecule_b_rows": pa.array(molecule_b_rows),
+        "edit_rows": pa.array(edit_rows),
+    }), folder / "rows.parquet")
+    pq.write_table(pa.table({
+        "reference_smiles": caches.molecule_keys.take(pa.array(queries["reference"])),
+        "protein_hash": loaded.protein_vocabulary.take(pa.array(queries["protein"])),
+        "endpoint": pa.array([endpoints[int(code)] for code in queries["endpoint"]],
+                             pa.string()),
+        **{name: pa.array(queries[name]) for name in ("candidates", "agree", "counted",
+                                                      "spearman", "top_1")},
+    }), folder / "queries.parquet")
+    report = {
+        "stage": "stage3_errors", "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "checkpoint": str(checkpoint), "configuration": loaded.configuration,
+        "head": loaded.head, "partition": partition, "rows": len(arrays),
+        "direction_tolerance": tolerance, "settings": dict(settings),
+        "spread": spread, "queries_overall": overall[0] if overall else None,
+        "by_row": row_tables, "by_query": query_tables,
+        "worst_proteins": proteins, "worst_edits": edit_list,
+    }
+    path = folder / "report.json"
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    LOGGER.info("phân tích ca sai: %s", folder)
+    return report
+
+
+# ------------------------------------------------------------------ vector cho t-SNE
+
+
+def represent(model: Any, arrays: data.PairArrays, caches: Caches, protein_source: Any,
+              device: str, batch_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """(vector trước đầu dự đoán, Δp dự đoán) cho mọi dòng; ở twin vector là [A, B] nối lại."""
+    import torch
+
+    model.eval()
+    if isinstance(protein_source, ProteinEncoderRuntime):
+        protein_source.train(False)
+    vectors: list[np.ndarray] = []
+    outputs = np.empty(len(arrays), dtype=np.float32)
+    with torch.no_grad():
+        for rows in data.iter_batches(len(arrays), batch_size):
+            batch = batch_tensors(arrays, rows, caches, protein_source, device,
+                                  model.uses_edit_branch)
+            inputs = (batch["ligand_a"], batch["ligand_b"], batch["fragment_a"],
+                      batch["fragment_b"], batch["protein"], batch["endpoint"])
+            pieces = model.representations(*inputs)
+            vectors.append(torch.cat(pieces, dim=1).to("cpu").numpy().astype(np.float32))
+            outputs[rows] = model(*inputs).to("cpu").numpy()
+    if not vectors:
+        raise ValueError("không có dòng nào để lấy vector")
+    return np.concatenate(vectors), outputs
+
+
+def run_features(config: Mapping[str, Any], root: Path, checkpoint: Path,
+                 stamp: str) -> dict[str, Any]:
+    """Vector sau encoder của một mẫu dòng train và validation, để vẽ t-SNE (việc 4).
+
+    Mỗi partition lấy ngẫu nhiên stage3.analysis.feature_rows_per_partition dòng (seed
+    stage3.train.seed). Ghi runs_dir/features_<cấu hình>_<đầu ra>_<stamp>.parquet với cột
+    partition, pair_id, endpoint, protein_hash, delta_p, prediction và feature (mảng số
+    thực cố định độ dài), kèm file .json mô tả. Không đọc test.
+    """
+    loaded = load_checkpoint(config, root, checkpoint)
+    per_partition = int(config["stage3"]["analysis"]["feature_rows_per_partition"])
+    seed = int(config["stage3"]["train"]["seed"])
+    rng = np.random.default_rng(seed)
+    parts: list[pa.Table] = []
+    counts: dict[str, int] = {}
+    width = 0
+    for partition in (data.TRAIN, data.VALIDATION):
+        arrays, _, table = prepare_arrays(config, root, partition, loaded.caches,
+                                          loaded.protein_vocabulary, None)
+        count = min(per_partition, len(arrays))
+        rows = np.sort(rng.choice(len(arrays), size=count, replace=False))
+        sample = data.take_rows(arrays, rows)
+        vectors, prediction = represent(loaded.model, sample, loaded.caches,
+                                        loaded.protein_source, loaded.device,
+                                        loaded.eval_batch_size)
+        width = int(vectors.shape[1])
+        picked = pa.array(rows)
+        parts.append(pa.table({
+            "partition": pa.array([partition] * count, pa.string()),
+            "pair_id": table.column("pair_id").take(picked),
+            "endpoint": table.column("endpoint").take(picked),
+            "protein_hash": table.column("protein_hash").take(picked),
+            "delta_p": pa.array(sample.target),
+            "prediction": pa.array(prediction),
+            "feature": pa.FixedSizeListArray.from_arrays(pa.array(vectors.ravel()), width),
+        }))
+        counts[partition] = count
+        LOGGER.info("vector %s: %s dòng x %s chiều", partition, f"{count:,}", width)
+    _, runs_dir = layout(config, root)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    path = runs_dir / f"features_{loaded.configuration}_{loaded.head}_{stamp}.parquet"
+    pq.write_table(pa.concat_tables(parts), path)
+    manifest = {"stage": "stage3_features", "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "checkpoint": str(checkpoint), "configuration": loaded.configuration,
+                "head": loaded.head, "rows": counts, "feature_dim": width, "seed": seed,
+                "file": str(path),
+                "feature_note": "vector ngay trước MLP dự đoán (mọi nhánh đã mã hóa và ghép); "
+                                "ở twin là [vector A, vector B] nối lại"}
+    path.with_suffix(".json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
+                                         encoding="utf-8")
+    LOGGER.info("vector cho t-SNE: %s", path)
     return manifest
