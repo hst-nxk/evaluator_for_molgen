@@ -461,3 +461,34 @@ def test_accumulation_evaluates_on_optimizer_steps(monkeypatch: pytest.MonkeyPat
     run_accum(monkeypatch, 200, 10, 4, 2, lambda step: seen.append(step) or False)
     # 20 batch con / gộp 4 = 5 lần cập nhật; đo sau mỗi 2 lần cập nhật.
     assert seen == [2, 4]
+
+
+def test_selection_by_mae_keeps_the_old_order() -> None:
+    better = {"regression": {"mae": 0.58}, "ranking": {"pairwise_accuracy_macro": 0.50}}
+    worse = {"regression": {"mae": 0.59}, "ranking": {"pairwise_accuracy_macro": 0.56}}
+    assert (train.selection_score(better, train.SELECT_MAE)
+            < train.selection_score(worse, train.SELECT_MAE))
+
+
+def test_selection_by_pairwise_prefers_the_higher_accuracy() -> None:
+    # Ca 06/11/2026: mô hình sụp có MAE ngang bình thường nhưng đúng chiều thấp hẳn.
+    collapsed = {"regression": {"mae": 0.5879}, "ranking": {"pairwise_accuracy_macro": 0.168}}
+    healthy = {"regression": {"mae": 0.5880}, "ranking": {"pairwise_accuracy_macro": 0.557}}
+    metric = train.SELECT_PAIRWISE_MACRO
+    assert train.selection_score(healthy, metric) < train.selection_score(collapsed, metric)
+
+
+def test_selection_by_pairwise_skips_a_point_with_no_ranking() -> None:
+    no_queries = {"regression": {"mae": 0.5}, "ranking": {"pairwise_accuracy_macro": None}}
+    assert train.selection_score(no_queries, train.SELECT_PAIRWISE_MACRO) is None
+    assert train.selection_score({"regression": {"mae": 0.5}},
+                                 train.SELECT_PAIRWISE_MACRO) is None
+
+
+def test_config_selection_metric_is_known_and_defaults_to_mae() -> None:
+    import json
+
+    root = Path(__file__).resolve().parents[1]
+    config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    assert config["stage3"]["train"]["selection_metric"] == train.SELECT_MAE
+    assert train.SELECTION_METRICS == (train.SELECT_MAE, train.SELECT_PAIRWISE_MACRO)

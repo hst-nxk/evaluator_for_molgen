@@ -812,10 +812,29 @@ def prepare_arrays(config: Mapping[str, Any], root: Path, partition: str, caches
     return arrays, keys, table
 
 
+# Chỉ số chọn checkpoint và dừng sớm (stage3.train.selection_metric). mae: nhỏ hơn là tốt
+# (hành vi cũ). pairwise_accuracy_macro: đúng chiều macro, lớn hơn là tốt; đo 06/11/2026
+# cho thấy MAE gần như bằng nhau (0,585-0,588) cả ở lần train sụp ra hằng số.
+SELECT_MAE = "mae"
+SELECT_PAIRWISE_MACRO = "pairwise_accuracy_macro"
+SELECTION_METRICS = (SELECT_MAE, SELECT_PAIRWISE_MACRO)
+
+
+def selection_score(scores: Mapping[str, Any], selection: str) -> float | None:
+    """Điểm để so mốc đo, quy về dạng "nhỏ hơn là tốt"; None nếu chưa đo được.
+
+    Nhận: khối chỉ số của lát cắt 'all' (kết quả ``evaluate``); tên chỉ số chọn.
+    """
+    if selection == SELECT_MAE:
+        return scores["regression"]["mae"]
+    value = (scores.get("ranking") or {}).get(selection)
+    return None if value is None else -float(value)
+
+
 def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: str,
               smoke: bool, stamp: str, sharpness_mode: str | None = None,
               overrides: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Train một cấu hình; chọn checkpoint theo MAE trên validation.
+    """Train một cấu hình; chọn checkpoint theo ``selection_metric`` trên validation.
 
     Nhận: config; thư mục gốc; cấu hình ('frozen' | 'finetune' | 'no_protein'); kiểu đầu
     ra ('direct' | 'twin'); smoke; nhãn thời gian của lần chạy; ``sharpness_mode``
@@ -899,8 +918,13 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
     checkpoint_path = runs_dir / f"{configuration}_{head}_{stamp}.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
+    selection = str(settings.get("selection_metric", SELECT_MAE))
+    if selection not in SELECTION_METRICS:
+        raise ValueError(f"selection_metric phải là một trong {SELECTION_METRICS}, "
+                         f"nhận {selection!r}")
+    LOGGER.info("chọn checkpoint theo: %s", selection)
     history: list[dict[str, Any]] = []
-    best_mae = math.inf
+    best_score = math.inf
     best_point = -1
     since_best = 0
     started = time.perf_counter()
@@ -910,14 +934,14 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
 
         ``step`` bằng None là mốc cuối epoch, khác None là mốc giữa epoch.
         """
-        nonlocal best_mae, best_point, since_best
+        nonlocal best_score, best_point, since_best
         import torch
 
         measured = time.perf_counter()
         prediction = predict(model, validation_arrays, caches, protein_source, device,
                              eval_batch_size)
         scores = evaluate(validation_arrays, prediction, validation_keys, config)
-        mae = scores["all"]["regression"]["mae"]
+        score = selection_score(scores["all"], selection)
         label = f"epoch {epoch}" if step is None else f"epoch {epoch} bước {step}"
         record: dict[str, Any] = {"epoch": epoch, "step": step,
                                   "validation": scores["all"],
@@ -940,10 +964,10 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
                         "%.4g (ngưỡng epsilon %.4g)", label, penalty_state["lambda"],
                         penalty_state["output_gradient_norm"],
                         penalty_state["sharpness_estimate"], penalty.epsilon)
-        if mae is None:
+        if score is None:
             return False
-        if mae < best_mae:
-            best_mae, since_best = mae, 0
+        if score < best_score:
+            best_score, since_best = score, 0
             best_point = len(history) - 1
             state = {"model": model.state_dict(), "epoch": epoch, "step": step,
                      "configuration": configuration, "head": head,
@@ -959,7 +983,8 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
             return False
         since_best += 1
         if since_best >= patience:
-            LOGGER.info("dừng sớm: %s lần đo không cải thiện MAE validation", since_best)
+            LOGGER.info("dừng sớm: %s lần đo không cải thiện %s validation", since_best,
+                        selection)
             return True
         return False
 
@@ -1014,7 +1039,9 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         },
         "best_epoch": None if best_point < 0 else history[best_point]["epoch"],
         "best_step": None if best_point < 0 else history[best_point]["step"],
-        "best_validation_mae": None if best_point < 0 else best_mae,
+        "selection_metric": selection,
+        "best_validation_mae": None if best_point < 0 else
+        history[best_point]["validation"]["regression"]["mae"],
         "final_metrics_index": best_point if best_point >= 0 else len(history) - 1,
         "checkpoint": str(checkpoint_path) if best_point >= 0 else None,
         "history": history, "validation_metrics": final, "asymmetry": asymmetry,
