@@ -1,7 +1,9 @@
 """Sinh lệnh quét siêu tham số cho head residual, lấy mẫu theo Bảng 14 của bài gốc.
 
     python scripts/sweep_residual.py --trials 20 --seed 20261107
-    python scripts/sweep_residual.py --trials 20 --gpu 6 --shards 3 > sweep.sh
+    python scripts/sweep_residual.py --trials 20 --shards 4 --gpu 1,2,3,7 \
+                                     --out runs/sweep.sh
+    bash runs/sweep.sh
 
 Script này KHÔNG chạy train: nó chỉ in ra các lệnh `run_evaluator.py --mode train` để
 người dùng tự chạy trên server.
@@ -42,6 +44,7 @@ import json
 import math
 import random
 import sys
+from pathlib import Path
 from typing import Any
 
 # Bảng 14 chỉ quét trên validation; test không xuất hiện ở bất kỳ đâu trong quy trình.
@@ -83,6 +86,52 @@ def command(trial: dict[str, Any], encoder_dropout: float, seed: int) -> str:
     return " ".join(parts)
 
 
+def parse_gpus(raw: str | None) -> list[int]:
+    """Danh sách GPU từ chuỗi '1,2,7'; rỗng nghĩa là không đặt CUDA_VISIBLE_DEVICES."""
+    if raw is None or not raw.strip():
+        return []
+    numbers = []
+    for piece in raw.split(","):
+        piece = piece.strip()
+        if not piece.isdigit():
+            raise ValueError(f"--gpu chỉ nhận số cách nhau bằng dấu phẩy, nhận {raw!r}")
+        numbers.append(int(piece))
+    return numbers
+
+
+def build_script(trials: list[dict[str, Any]], shards: int, gpus: list[int],
+                 encoder_dropout: float, train_seed: int, sampler_seed: int) -> str:
+    """Nội dung file shell chạy cả đợt quét, mỗi chuỗi một tiến trình nền.
+
+    Ghi ra file thay vì in ra màn hình: lệnh train rất dài, dán tay qua terminal từng làm
+    MẤT dấu cách ngay chỗ ngắt dòng (07/11/2026, '--setlearning_rate'), mà lệnh hỏng kiểu
+    đó chỉ lộ ra sau khi đã chạy xong một phần.
+    """
+    lines = ["#!/usr/bin/env bash",
+             "# SINH TỰ ĐỘNG bởi scripts/sweep_residual.py — đừng sửa tay.",
+             f"# {len(trials)} điểm quét | nguồn khoảng: {SOURCE}",
+             f"# lấy mẫu ngẫu nhiên, seed bộ lấy mẫu {sampler_seed}, "
+             f"seed train {train_seed}",
+             "# chọn checkpoint và dừng sớm theo đúng chiều macro trên validation",
+             "set -u", "mkdir -p runs", ""]
+    for shard in range(shards):
+        chosen = trials[shard::shards]
+        if not chosen:
+            continue
+        body = "; ".join(command(trial, encoder_dropout, train_seed)
+                         for trial in chosen)
+        body += f"; echo XONG_SWEEP_{shard}"
+        prefix = "" if not gpus else f"CUDA_VISIBLE_DEVICES={gpus[shard % len(gpus)]} "
+        lines.append(f"# chuỗi {shard}: {len(chosen)} lần train")
+        lines.append(f"{prefix}setsid nohup bash -c '{body}' "
+                     f"> runs/sweep_{shard}.log 2>&1 &")
+        # Tên checkpoint đặt theo giây: khởi động cùng lúc thì hai chuỗi ghi đè nhau.
+        lines.append("sleep 20")
+        lines.append("")
+    lines.append('echo "đã chạy nền; theo dõi: grep -h XONG runs/sweep_*.log"')
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     """In các lệnh quét; trả về mã thoát (0 = xong)."""
     parser = argparse.ArgumentParser(description=__doc__,
@@ -95,10 +144,14 @@ def main() -> int:
                         help="seed của lần train (giữ cố định để so các điểm quét)")
     parser.add_argument("--encoder-dropout", type=float, default=0.5,
                         help="model.dropout, không thuộc Bảng 14 (mặc định 0.5)")
-    parser.add_argument("--gpu", type=int, default=None,
-                        help="chèn CUDA_VISIBLE_DEVICES=<gpu> vào đầu mỗi chuỗi lệnh")
+    parser.add_argument("--gpu", default=None, metavar="SỐ[,SỐ...]",
+                        help="GPU cho mỗi chuỗi, ví dụ --gpu 1,2,3,7; ít số hơn số chuỗi "
+                             "thì dùng xoay vòng")
     parser.add_argument("--shards", type=int, default=1,
                         help="chia các điểm quét thành mấy chuỗi chạy song song")
+    parser.add_argument("--out", type=Path, default=None, metavar="FILE.sh",
+                        help="ghi lệnh ra file shell thay vì in ra màn hình; chạy cả đợt "
+                             "bằng `bash FILE.sh`, khỏi phải copy tay")
     parser.add_argument("--json", dest="as_json", action="store_true",
                         help="in bảng điểm quét dạng JSON thay cho lệnh shell")
     args = parser.parse_args()
@@ -110,6 +163,10 @@ def main() -> int:
         parser.error("--trials phải >= 1")
     if args.shards < 1:
         parser.error("--shards phải >= 1")
+    try:
+        gpus = parse_gpus(args.gpu)
+    except ValueError as error:
+        parser.error(str(error))
     rng = random.Random(args.seed)
     trials = [sample_trial(rng) for _ in range(args.trials)]
 
@@ -121,21 +178,16 @@ def main() -> int:
                          indent=2, ensure_ascii=False))
         return 0
 
-    print(f"# {args.trials} điểm quét | nguồn khoảng: {SOURCE}")
-    print(f"# lấy mẫu ngẫu nhiên, seed bộ lấy mẫu {args.seed}, seed train "
-          f"{args.train_seed}")
-    print("# chọn checkpoint và dừng sớm theo đúng chiều macro trên validation")
-    for shard in range(args.shards):
-        chosen = trials[shard::args.shards]
-        if not chosen:
-            continue
-        lines = [command(trial, args.encoder_dropout, args.train_seed)
-                 for trial in chosen]
-        body = "; ".join(lines) + f"; echo XONG_SWEEP_{shard}"
-        prefix = "" if args.gpu is None else f"CUDA_VISIBLE_DEVICES={args.gpu} "
-        print(f"\n# chuỗi {shard}: {len(chosen)} lần train")
-        print(f"{prefix}setsid nohup bash -c \"{body}\" "
-              f"> runs/sweep_{shard}.log 2>&1 &")
+    script = build_script(trials, args.shards, gpus, args.encoder_dropout,
+                          args.train_seed, args.seed)
+    if args.out is None:
+        print(script)
+        return 0
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(script, encoding="utf-8", newline="\n")
+    print(f"đã ghi {args.shards} chuỗi vào {args.out}")
+    print(f"chạy cả đợt:   bash {args.out}")
+    print("theo dõi:      grep -h XONG runs/sweep_*.log")
     return 0
 
 

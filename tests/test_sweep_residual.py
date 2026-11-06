@@ -64,3 +64,71 @@ def test_the_command_never_touches_the_test_partition() -> None:
     assert f"--set selection_metric={sweep.SELECTION_METRIC}" in line
     for key, value in trial.items():
         assert f"--set {key}={value}" in line
+
+
+def test_gpu_list_is_handed_out_round_robin() -> None:
+    assert sweep.parse_gpus("1,2,3,7") == [1, 2, 3, 7]
+    assert sweep.parse_gpus(None) == []
+    assert sweep.parse_gpus("  ") == []
+    script = sweep.build_script(sample(6), shards=4, gpus=[1, 2],
+                                encoder_dropout=0.5, train_seed=1, sampler_seed=2)
+    prefixes = [line.split(" ")[0] for line in script.splitlines()
+                if line.startswith("CUDA_VISIBLE_DEVICES=")]
+    assert prefixes == ["CUDA_VISIBLE_DEVICES=1", "CUDA_VISIBLE_DEVICES=2",
+                        "CUDA_VISIBLE_DEVICES=1", "CUDA_VISIBLE_DEVICES=2"]
+
+
+def test_gpu_list_refuses_anything_that_is_not_a_number() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="--gpu"):
+        sweep.parse_gpus("1,gpu2")
+
+
+def test_every_trial_lands_in_exactly_one_shard() -> None:
+    trials = sample(20)
+    script = sweep.build_script(trials, shards=4, gpus=[], encoder_dropout=0.5,
+                                train_seed=20261023, sampler_seed=1)
+    assert script.count("--mode train") == len(trials)
+    for trial in trials:
+        assert script.count(f"--set model.residual_width={trial['model.residual_width']} "
+                            f"--set model.residual_hidden_factor="
+                            f"{trial['model.residual_hidden_factor']}") >= 1
+
+
+def test_the_script_never_glues_two_flags_together() -> None:
+    """Sự cố 07/11/2026: dán tay qua terminal nuốt mất dấu cách -> '--setlearning_rate'."""
+    script = sweep.build_script(sample(20), shards=4, gpus=[6], encoder_dropout=0.5,
+                                train_seed=1, sampler_seed=1)
+    assert "--setlearning_rate" not in script
+    assert "--setmodel" not in script
+    # Sau mỗi "--set" phải là đúng một dấu cách rồi mới tới tên tham số.
+    head, *rest = script.split("--set")
+    assert rest, "script phải có ít nhất một --set"
+    for piece in rest:
+        assert piece.startswith(" ") and not piece.startswith("  ")
+    assert "--set" not in head
+
+
+def test_the_script_waits_between_shards_so_checkpoints_do_not_collide() -> None:
+    # Tên checkpoint đặt theo giây; hai chuỗi khởi động cùng giây sẽ ghi đè nhau.
+    script = sweep.build_script(sample(4), shards=2, gpus=[], encoder_dropout=0.5,
+                                train_seed=1, sampler_seed=1)
+    assert script.count("sleep 20") == 2
+
+
+def test_the_generated_script_is_valid_bash() -> None:
+    import shutil
+    import subprocess
+
+    import pytest
+
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("máy không có bash")
+    script = sweep.build_script(sample(8), shards=2, gpus=[1, 2], encoder_dropout=0.5,
+                                train_seed=1, sampler_seed=1)
+    # -n: chỉ kiểm tra cú pháp, KHÔNG chạy lệnh nào.
+    done = subprocess.run([bash, "-n"], input=script, text=True, encoding="utf-8",
+                          capture_output=True, check=False)
+    assert done.returncode == 0, done.stderr
