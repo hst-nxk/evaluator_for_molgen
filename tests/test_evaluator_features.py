@@ -105,3 +105,54 @@ def test_sequence_windows_leaves_a_short_sequence_untouched() -> None:
 def test_sequence_windows_refuses_an_unknown_strategy() -> None:
     with pytest.raises(ValueError, match="long_sequence"):
         features.sequence_windows("AB", 3, "trung-binh")
+
+
+def test_mean_pooling_ignores_padding_tokens() -> None:
+    """Token padding không được kéo vector trung bình về 0."""
+    torch = pytest.importorskip("torch", reason="pool_tokens cần torch")
+
+    class Outputs:
+        last_hidden_state = torch.tensor([[[2.0, 4.0], [4.0, 8.0], [99.0, 99.0]]])
+
+    mask = torch.tensor([[1, 1, 0]])
+    pooled = features.pool_tokens(Outputs(), mask, "mean")
+    assert pooled.tolist() == [[3.0, 6.0]]
+
+
+def test_pooler_mode_uses_the_pooler_output() -> None:
+    torch = pytest.importorskip("torch", reason="pool_tokens cần torch")
+
+    class Outputs:
+        pooler_output = torch.tensor([[1.0, 2.0]])
+        last_hidden_state = torch.zeros(1, 3, 2)
+
+    mask = torch.ones(1, 3)
+    assert features.pool_tokens(Outputs(), mask, "pooler").tolist() == [[1.0, 2.0]]
+
+
+def test_pooler_mode_refuses_a_model_without_a_pooler() -> None:
+    torch = pytest.importorskip("torch", reason="pool_tokens cần torch")
+
+    class Outputs:
+        last_hidden_state = torch.zeros(1, 3, 2)
+
+    with pytest.raises(ValueError, match="pooler_output"):
+        features.pool_tokens(Outputs(), torch.ones(1, 3), "pooler")
+
+
+def test_unknown_pooling_is_refused() -> None:
+    torch = pytest.importorskip("torch", reason="pool_tokens cần torch")
+
+    class Outputs:
+        last_hidden_state = torch.zeros(1, 3, 2)
+
+    with pytest.raises(ValueError, match="pooling"):
+        features.pool_tokens(Outputs(), torch.ones(1, 3), "max")
+
+
+def test_molecule_encoder_refuses_a_model_outside_the_allowed_list() -> None:
+    """trust_remote_code TẢI VÀ CHẠY mã từ repo, nên tên model phải khai báo trước."""
+    settings = {"model": "ke-la/doc-quyen", "allowed_models": ["ibm/MoLFormer-XL-both-10pct"],
+                "trust_remote_code": True}
+    with pytest.raises(ValueError, match="allowed_models"):
+        features.load_molecule_encoder(settings, "cpu")

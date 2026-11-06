@@ -242,11 +242,45 @@ def build_protein_cache(config: Mapping[str, Any], root: Path, device: str) -> d
             "path": str(paths["protein_embeddings"])}
 
 
-def run_prepare(config: Mapping[str, Any], root: Path, skip_protein: bool) -> dict[str, Any]:
+def build_molecule_embedding_cache(config: Mapping[str, Any], root: Path,
+                                   device: str) -> dict[str, Any]:
+    """Dựng cache embedding cho SMILES phân tử (dùng khi ligand_features = embedding).
+
+    Chạy model mã hóa SMILES MỘT LẦN cho mỗi phân tử phân biệt rồi ghi ra parquet, đúng
+    cách cache ESM2 đang làm với protein. Nhờ vậy vòng train không chậm đi: nó chỉ tra
+    theo chỉ số như khi dùng fingerprint.
+    Chiều embedding được ĐO từ model đã nạp và ghi vào metadata của cache.
+    """
+    settings = config["stage3"]["molecule_encoder"]
+    paths = cache_paths(config, root)
+    source = root / config["stage3"]["inputs"]["evaluator"]
+    molecules = distinct_values(source, ("smiles_a", "smiles_b"))
+    LOGGER.info("sẽ embed %s phân tử bằng %s trên %s", f"{len(molecules):,}",
+                settings["model"], device)
+    started = time.perf_counter()
+    keys, matrix, dimension, truncated = features.embed_molecules(molecules, settings,
+                                                                  device)
+    features.write_vector_cache(paths["molecule_embeddings"], keys, matrix, {
+        "model": settings["model"], "embedding_dim": dimension,
+        "max_tokens": int(settings["max_tokens"]),
+        "pooling": str(settings.get("pooling", "pooler")),
+        "rows": len(keys), "truncated_smiles": truncated,
+    })
+    LOGGER.info("CHIỀU EMBEDDING ĐO ĐƯỢC: %s (model %s)", dimension, settings["model"])
+    return {"rows": len(keys), "embedding_dim": dimension,
+            "truncated_smiles": truncated, "model": settings["model"], "device": device,
+            "seconds": round(time.perf_counter() - started, 1),
+            "path": str(paths["molecule_embeddings"])}
+
+
+def run_prepare(config: Mapping[str, Any], root: Path, skip_protein: bool,
+                molecule_embeddings: bool = False) -> dict[str, Any]:
     """Chế độ prepare: dựng cache fingerprint, và cache embedding protein nếu có thể.
 
     skip_protein = True thì chỉ dựng fingerprint (chạy được khi chưa cài torch và
     transformers), và ghi rõ vào manifest rằng chiều embedding vẫn CHƯA ĐO.
+    molecule_embeddings = True thì dựng THÊM cache embedding phân tử; mặc định tắt vì
+    chế độ mặc định (ligand_features = fingerprint) không cần tới nó.
     """
     manifest: dict[str, Any] = {"stage": "stage3_prepare",
                                 "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -260,6 +294,10 @@ def run_prepare(config: Mapping[str, Any], root: Path, skip_protein: bool) -> di
         device = resolve_device(config["stage3"]["train"]["device"])
         manifest["protein_embeddings"] = {"built": True,
                                           **build_protein_cache(config, root, device)}
+    if molecule_embeddings:
+        device = resolve_device(config["stage3"]["train"]["device"])
+        manifest["molecule_embeddings"] = {
+            "built": True, **build_molecule_embedding_cache(config, root, device)}
     paths = cache_paths(config, root)
     paths["cache_manifest"].parent.mkdir(parents=True, exist_ok=True)
     paths["cache_manifest"].write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
@@ -275,6 +313,10 @@ class Caches:
     """Ba bảng cache đã nạp, cùng từ vựng của chúng."""
 
     def __init__(self, config: Mapping[str, Any], root: Path, need_protein: bool) -> None:
+        # Import tại chỗ: models.py import torch ở đầu file, còn train.py phải nạp được
+        # trên máy chưa cài torch (xem docstring module).
+        from . import models
+
         paths = cache_paths(config, root)
         self.molecule_keys, self.molecule_packed, molecule_meta = features.read_packed_cache(
             paths["molecule_fingerprints"])
@@ -286,6 +328,32 @@ class Caches:
         if self.ligand_bits != int(settings["bits"]):
             raise ValueError(f"cache fingerprint có {self.ligand_bits} bit nhưng config ghi "
                              f"{settings['bits']}; dựng lại cache")
+        # Nhánh phân tử: fingerprint (mặc định) hoặc embedding đã cache. `ligand_bits` là
+        # CHIỀU ĐẦU VÀO của nhánh đó, nên ở chế độ embedding nó là chiều embedding.
+        self.ligand_features = str(
+            config["stage3"]["model"].get("ligand_features", models.LIGAND_FINGERPRINT))
+        if self.ligand_features not in models.LIGAND_FEATURES:
+            raise ValueError(f"ligand_features lạ: {self.ligand_features!r}; "
+                             f"chỉ có {models.LIGAND_FEATURES}")
+        self.molecule_vectors: np.ndarray | None = None
+        if self.ligand_features == models.LIGAND_EMBEDDING:
+            path = paths["molecule_embeddings"]
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"chưa có cache embedding phân tử {path}; chạy "
+                    f"`--mode prepare --molecule-embeddings` trước")
+            embedding_keys, self.molecule_vectors, molecule_embedding_meta = (
+                features.read_vector_cache(path))
+            if not embedding_keys.equals(self.molecule_keys):
+                raise ValueError("cache embedding và cache fingerprint khác danh sách "
+                                 "phân tử; dựng lại cả hai")
+            expected = config["stage3"]["molecule_encoder"]["model"]
+            if molecule_embedding_meta.get("model") != expected:
+                raise ValueError(
+                    f"cache embedding phân tử dựng bằng "
+                    f"{molecule_embedding_meta.get('model')!r} nhưng config ghi "
+                    f"{expected!r}; dựng lại cache")
+            self.ligand_bits = int(molecule_embedding_meta["embedding_dim"])
         self.protein_keys: pa.Array | None = None
         self.protein_vectors: np.ndarray | None = None
         self.protein_dim: int | None = None
@@ -320,10 +388,15 @@ def batch_tensors(arrays: data.PairArrays, rows: np.ndarray, caches: Caches,
     """
     import torch
 
-    ligand_a = features.unpack_rows(caches.molecule_packed, arrays.molecule_a[rows],
-                                    caches.ligand_bits)
-    ligand_b = features.unpack_rows(caches.molecule_packed, arrays.molecule_b[rows],
-                                    caches.ligand_bits)
+    if caches.molecule_vectors is None:
+        ligand_a = features.unpack_rows(caches.molecule_packed, arrays.molecule_a[rows],
+                                        caches.ligand_bits)
+        ligand_b = features.unpack_rows(caches.molecule_packed, arrays.molecule_b[rows],
+                                        caches.ligand_bits)
+    else:
+        # Cùng từ vựng với cache fingerprint (Caches đã kiểm), nên dùng chung chỉ số.
+        ligand_a = caches.molecule_vectors[arrays.molecule_a[rows]]
+        ligand_b = caches.molecule_vectors[arrays.molecule_b[rows]]
     batch = {
         "ligand_a": torch.from_numpy(ligand_a).to(device),
         "ligand_b": torch.from_numpy(ligand_b).to(device),

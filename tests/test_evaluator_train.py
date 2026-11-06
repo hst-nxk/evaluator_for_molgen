@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from molopt.evaluator import train
+from molopt.evaluator import data, train
 from molopt.observations import normalize
 
 ENDPOINTS = 4
@@ -492,3 +492,87 @@ def test_config_selection_metric_is_known_and_defaults_to_mae() -> None:
     config = json.loads((root / "config.json").read_text(encoding="utf-8"))
     assert config["stage3"]["train"]["selection_metric"] == train.SELECT_MAE
     assert train.SELECTION_METRICS == (train.SELECT_MAE, train.SELECT_PAIRWISE_MACRO)
+
+
+def test_ligand_features_switch_only_allows_the_two_known_modes() -> None:
+    from molopt.evaluator import models
+
+    assert models.LIGAND_FEATURES == (models.LIGAND_FINGERPRINT, models.LIGAND_EMBEDDING)
+    assert models.LIGAND_FINGERPRINT == "fingerprint"
+
+
+def test_config_keeps_fingerprint_as_the_default_ligand_input() -> None:
+    """Đổi mặc định là mọi số đã đo trước 07/11/2026 không so được nữa."""
+    import json
+
+    root = Path(__file__).resolve().parents[1]
+    stage3 = json.loads((root / "config.json").read_text(encoding="utf-8"))["stage3"]
+    assert stage3["model"]["ligand_features"] == "fingerprint"
+    # Chiều embedding phải để trống trong config: nó được ĐO từ model lúc nạp.
+    assert stage3["molecule_encoder"]["embedding_dim"] is None
+    assert stage3["files"]["molecule_embeddings"].endswith(".parquet")
+
+
+def test_the_molecule_encoder_name_must_be_declared_in_allowed_models() -> None:
+    import json
+
+    root = Path(__file__).resolve().parents[1]
+    encoder = json.loads((root / "config.json").read_text(
+        encoding="utf-8"))["stage3"]["molecule_encoder"]
+    assert encoder["model"] in encoder["allowed_models"]
+
+
+def test_batch_uses_the_embedding_matrix_when_the_cache_is_loaded() -> None:
+    """Ở chế độ embedding, batch phải lấy thẳng vector chứ không giải nén bit."""
+    torch = pytest.importorskip("torch", reason="batch_tensors cần torch")
+
+    bits, dimension, molecules = 16, 4, 5
+    rng = np.random.default_rng(0)
+    vectors = rng.normal(size=(molecules, dimension)).astype(np.float32)
+
+    class FakeCaches:
+        molecule_packed = np.packbits(
+            rng.integers(0, 2, (molecules, bits)).astype(np.uint8), axis=1)
+        fragment_packed = np.packbits(
+            rng.integers(0, 2, (3, bits)).astype(np.uint8), axis=1)
+        ligand_bits = dimension
+        fragment_bits = bits
+        molecule_vectors = vectors
+
+    arrays = data.PairArrays(
+        molecule_a=np.array([0, 2]), molecule_b=np.array([1, 3]),
+        fragment_a=np.array([0, 1]), fragment_b=np.array([1, 2]),
+        protein=np.array([0, 0]), endpoint=np.array([0, 0]),
+        target=np.array([0.5, -0.5], dtype=np.float32), slices={})
+    rows = np.array([0, 1])
+    batch = train.batch_tensors(arrays, rows, FakeCaches(), None, "cpu", uses_edit=True)
+
+    assert batch["ligand_a"].shape == (2, dimension)
+    assert np.allclose(batch["ligand_a"].numpy(), vectors[[0, 2]])
+    assert np.allclose(batch["ligand_b"].numpy(), vectors[[1, 3]])
+    # Nhánh edit vẫn là fingerprint ở cả hai chế độ, nên vẫn ra đúng số bit.
+    assert batch["fragment_a"].shape == (2, bits)
+
+
+def test_batch_still_unpacks_bits_when_there_is_no_embedding_cache() -> None:
+    torch = pytest.importorskip("torch", reason="batch_tensors cần torch")
+
+    bits = 16
+    rng = np.random.default_rng(1)
+
+    class FakeCaches:
+        molecule_packed = np.packbits(rng.integers(0, 2, (4, bits)).astype(np.uint8), axis=1)
+        fragment_packed = np.packbits(rng.integers(0, 2, (3, bits)).astype(np.uint8), axis=1)
+        ligand_bits = bits
+        fragment_bits = bits
+        molecule_vectors = None
+
+    arrays = data.PairArrays(
+        molecule_a=np.array([0]), molecule_b=np.array([1]),
+        fragment_a=np.array([0]), fragment_b=np.array([1]),
+        protein=np.array([0]), endpoint=np.array([0]),
+        target=np.array([0.0], dtype=np.float32), slices={})
+    batch = train.batch_tensors(arrays, np.array([0]), FakeCaches(), None, "cpu",
+                                uses_edit=True)
+    assert batch["ligand_a"].shape == (1, bits)
+    assert set(np.unique(batch["ligand_a"].numpy())) <= {0.0, 1.0}

@@ -35,7 +35,18 @@ PAIR_COLUMNS = ["pair_id", "endpoint", "protein_hash", "partition", "smiles_a", 
 
 # Khóa lát cắt mà config được phép dùng; khóa lạ là lỗi cấu hình, không bị bỏ qua im lặng.
 SLICE_KEYS = ("unseen_pair", "plausible_range", "no_source_warning", "min_n_assays",
-              "min_n_documents", "min_distinct_values")
+              "min_n_documents", "min_distinct_values", "abs_delta_p_above",
+              "abs_delta_p_at_most")
+# Hai khóa lát cắt theo độ lớn |Δp|, để tách riêng ca activity cliff. Định nghĩa cliff lấy
+# từ MoleculeACE (van Tilborg, Alenicheva, Grisoni 2022, J. Chem. Inf. Model. 62(23):
+# 5938-5951, DOI 10.1021/acs.jcim.2c01073; mã nguồn benchmark/cliffs.py): một cặp là cliff
+# khi hai phân tử đủ giống nhau VÀ chênh hoạt tính hơn 10 lần. Dataset này toàn cặp MMP
+# (cùng khung, khác đúng một nhóm thế) nên điều kiện giống nhau đã thỏa theo cách dựng dữ
+# liệu — đúng nhánh mmp=True của find_cliffs. Còn lại là điều kiện hoạt tính: hơn 10 lần
+# trên thang nồng độ = |Δp| > 1. `find_cliffs` của bài dùng dấu > NGẶT, nên
+# abs_delta_p_above cũng ngặt, và abs_delta_p_at_most dùng <= để hai lát cắt phủ kín và
+# không chồng nhau.
+ABSOLUTE_DELTA_KEYS = ("abs_delta_p_above", "abs_delta_p_at_most")
 # Khóa lát cắt dạng "ít nhất N" -> cột số nguyên của dataset mà nó so.
 MINIMUM_KEYS = {"min_n_assays": "n_assays", "min_n_documents": "n_documents",
                 "min_distinct_values": "n_distinct_values"}
@@ -92,7 +103,13 @@ def slice_mask(table: pa.Table, filters: Mapping[str, Any]) -> np.ndarray:
     for key, wanted in filters.items():
         if key not in SLICE_KEYS:
             raise ValueError(f"khóa lát cắt lạ: {key!r}; cho phép {SLICE_KEYS}")
-        if key == "no_source_warning":
+        if key in ABSOLUTE_DELTA_KEYS:
+            values = np.abs(np.asarray(
+                table.column("delta_p_mean").to_numpy(zero_copy_only=False),
+                dtype=np.float64))
+            mask &= (values > float(wanted) if key == "abs_delta_p_above"
+                     else values <= float(wanted))
+        elif key == "no_source_warning":
             column = table.column("source_quality_warning")
             found = np.asarray(pc.is_null(column).to_numpy(zero_copy_only=False), dtype=bool)
             mask &= found if wanted else ~found
@@ -271,7 +288,8 @@ def iter_batches(count: int, batch_size: int, rng: np.random.Generator | None = 
 
 
 def iter_protein_batches(proteins: np.ndarray, batch_size: int,
-                         rng: np.random.Generator | None = None) -> Iterator[np.ndarray]:
+                         rng: np.random.Generator | None = None,
+                         max_proteins: int = 0) -> Iterator[np.ndarray]:
     """Chia batch sao cho MỖI BATCH CHỈ CHẠM ÍT PROTEIN; vẫn dùng hết mọi dòng một lần.
 
     Vì sao cần: ở cấu hình finetune, ESM2 nằm trong đồ thị tính toán và chạy một lượt cho
@@ -288,8 +306,14 @@ def iter_protein_batches(proteins: np.ndarray, batch_size: int,
     Đây là lý do hàm này CHỈ dùng cho finetune, còn frozen vẫn lấy mẫu ngẫu nhiên: ở
     frozen vector protein đã tính sẵn nên không có gì để tiết kiệm.
 
+    `max_proteins` > 0 thì một batch KHÔNG BAO GIỜ chứa quá bấy nhiêu protein phân biệt:
+    chạm mức đó là cắt batch sớm, dù chưa đủ `batch_size` dòng. Phần lớn batch chỉ có một
+    protein nên việc cắt rất hiếm, nhưng nó biến mức dùng bộ nhớ từ giới hạn THỐNG KÊ
+    thành giới hạn CHẮC CHẮN — cần thiết khi chia GPU với người khác, vì chỉ một batch
+    hiếm chạm nhiều protein cũng đủ làm hết bộ nhớ của cả hai bên.
+
     Nhận: `proteins` là chỉ số protein của từng dòng (PairArrays.protein); cỡ batch; rng
-    (None = không xáo trộn, để test lặp lại được).
+    (None = không xáo trộn, để test lặp lại được); trần số protein mỗi batch (0 = không chặn).
     Trả về: lần lượt từng mảng chỉ số dòng.
     """
     if batch_size < 1:
@@ -303,9 +327,36 @@ def iter_protein_batches(proteins: np.ndarray, batch_size: int,
         for group in groups:
             rng.shuffle(group)
         groups = [groups[i] for i in rng.permutation(len(groups))]
-    flat = np.concatenate(groups) if groups else np.empty(0, dtype=np.int64)
-    for start in range(0, flat.size, batch_size):
-        yield flat[start:start + batch_size]
+    if max_proteins < 1:
+        flat = np.concatenate(groups) if groups else np.empty(0, dtype=np.int64)
+        for start in range(0, flat.size, batch_size):
+            yield flat[start:start + batch_size]
+        return
+    held: list[np.ndarray] = []
+    rows = 0
+    seen = 0
+    for group in groups:
+        offset = 0
+        # Protein này đã được tính vào batch đang dựng chưa. Một protein lớn có thể trải
+        # qua nhiều batch, và ở MỖI batch nó phải được đếm lại một lần.
+        counted = False
+        while offset < group.size:
+            if not counted and seen >= max_proteins:
+                yield np.concatenate(held)
+                held, rows, seen = [], 0, 0
+            if not counted:
+                seen += 1
+                counted = True
+            take = min(batch_size - rows, group.size - offset)
+            held.append(group[offset:offset + take])
+            rows += take
+            offset += take
+            if rows >= batch_size:
+                yield np.concatenate(held)
+                held, rows, seen = [], 0, 0
+                counted = False
+    if held:
+        yield np.concatenate(held)
 
 
 def distinct_strings(table: pa.Table, columns: Sequence[str]) -> pa.Array:

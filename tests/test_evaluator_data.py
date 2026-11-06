@@ -275,3 +275,86 @@ def test_protein_batches_keep_the_short_last_batch() -> None:
 def test_protein_batches_reject_a_bad_batch_size() -> None:
     with pytest.raises(ValueError, match="batch_size"):
         list(data.iter_protein_batches(np.array([0, 1]), 0))
+
+
+def test_protein_cap_is_never_exceeded() -> None:
+    """Giới hạn CHẮC CHẮN, không phải thống kê: một batch vượt trần cũng đủ làm hết
+    bộ nhớ khi đang chia GPU với người khác."""
+    rng = np.random.default_rng(3)
+    proteins = rng.integers(0, 400, size=5000)
+    for batch in data.iter_protein_batches(proteins, 64, rng, max_proteins=4):
+        assert len(set(proteins[batch])) <= 4
+
+
+def test_protein_cap_still_uses_every_row_exactly_once() -> None:
+    rng = np.random.default_rng(4)
+    proteins = rng.integers(0, 50, size=600)
+    rows = np.concatenate(list(data.iter_protein_batches(proteins, 32, rng,
+                                                         max_proteins=3)))
+    assert sorted(rows.tolist()) == list(range(proteins.size))
+
+
+def test_protein_cap_cuts_the_batch_short_rather_than_mixing_in_one_more() -> None:
+    """3 protein x 1 dòng, batch 10, trần 2 -> batch đầu phải dừng ở 2 dòng."""
+    proteins = np.array([0, 1, 2])
+    sizes = [b.size for b in data.iter_protein_batches(proteins, 10, None, max_proteins=2)]
+    assert sizes == [2, 1]
+
+
+def test_protein_cap_does_not_split_a_big_protein_needlessly() -> None:
+    """Một protein nhiều dòng vẫn được cắt theo batch_size, không bị trần làm vụn thêm."""
+    proteins = np.zeros(100, dtype=np.int64)
+    sizes = [b.size for b in data.iter_protein_batches(proteins, 40, None, max_proteins=2)]
+    assert sizes == [40, 40, 20]
+
+
+def test_protein_cap_of_zero_means_no_cap() -> None:
+    proteins = np.arange(20)
+    capped = [b.tolist() for b in data.iter_protein_batches(proteins, 8, None, 0)]
+    plain = [b.tolist() for b in data.iter_protein_batches(proteins, 8, None)]
+    assert capped == plain
+
+
+def test_cliff_slice_follows_the_moleculeace_fold_change_rule() -> None:
+    """Cliff = chênh hoạt tính HƠN 10 lần = |Δp| > 1, dấu > ngặt như find_cliffs."""
+    table = pair_table([{"delta_p_mean": 1.5}, {"delta_p_mean": -1.5},
+                        {"delta_p_mean": 1.0}, {"delta_p_mean": -1.0},
+                        {"delta_p_mean": 0.2}])
+    mask = data.slice_mask(table, {"abs_delta_p_above": 1.0})
+    assert mask.tolist() == [True, True, False, False, False]
+
+
+def test_cliff_slice_uses_the_absolute_value_so_direction_does_not_matter() -> None:
+    # Dataset lưu cặp theo chiều khóa A < B, nên dấu của Δp là quy ước lưu trữ.
+    table = pair_table([{"delta_p_mean": 2.5}, {"delta_p_mean": -2.5}])
+    assert data.slice_mask(table, {"abs_delta_p_above": 1.0}).tolist() == [True, True]
+
+
+def test_the_two_cliff_slices_cover_every_row_exactly_once() -> None:
+    table = pair_table([{"delta_p_mean": value}
+                        for value in (-3.0, -1.0, -0.4, 0.0, 0.4, 1.0, 3.0)])
+    cliff = data.slice_mask(table, {"abs_delta_p_above": 1.0})
+    rest = data.slice_mask(table, {"abs_delta_p_at_most": 1.0})
+    assert not (cliff & rest).any(), "hai lát cắt không được chồng nhau"
+    assert (cliff | rest).all(), "hai lát cắt phải phủ kín"
+
+
+def test_cliff_slice_can_be_combined_with_another_filter() -> None:
+    table = pair_table([{"delta_p_mean": 2.0, "unseen_pair": True},
+                        {"delta_p_mean": 2.0, "unseen_pair": False},
+                        {"delta_p_mean": 0.1, "unseen_pair": True}])
+    mask = data.slice_mask(table, {"abs_delta_p_above": 1.0, "unseen_pair": True})
+    assert mask.tolist() == [True, False, False]
+
+
+def test_config_defines_both_cliff_slices_at_the_sourced_threshold() -> None:
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    metrics = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    slices = {definition["name"]: definition["filters"]
+              for definition in metrics["stage3"]["metrics"]["slices"]}
+    # Ngưỡng 1.0 đến từ MoleculeACE potency_fold=10; đổi số là lệch khỏi định nghĩa.
+    assert slices["cliff"] == {"abs_delta_p_above": 1.0}
+    assert slices["non_cliff"] == {"abs_delta_p_at_most": 1.0}

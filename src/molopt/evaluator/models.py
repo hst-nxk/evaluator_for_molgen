@@ -100,6 +100,13 @@ HEAD_BLOCKS = (HEAD_BLOCK_PLAIN, HEAD_BLOCK_RESIDUAL)
 # Chuẩn hóa trong head plain (khóa `head_norm`). `layernorm` đặt LayerNorm giữa Linear và
 # ReLU của mỗi lớp ẩn (Ba và cs. 2016, arXiv:1607.06450). Thêm sau khi --mode diagnose đo
 # được head plain của fusion=projector chết 100 % ở lớp đầu (06/11/2026).
+# Nhánh phân tử lấy gì làm đầu vào. fingerprint = Morgan bit như v1; embedding =
+# vector đã cache từ stage3.molecule_encoder. Mặc định fingerprint để kết quả cũ
+# không đổi; xem ligand_features_note trong config.json.
+LIGAND_FINGERPRINT = "fingerprint"
+LIGAND_EMBEDDING = "embedding"
+LIGAND_FEATURES = (LIGAND_FINGERPRINT, LIGAND_EMBEDDING)
+
 HEAD_NORM_NONE = "none"
 HEAD_NORM_LAYER = "layernorm"
 HEAD_NORMS = (HEAD_NORM_NONE, HEAD_NORM_LAYER)

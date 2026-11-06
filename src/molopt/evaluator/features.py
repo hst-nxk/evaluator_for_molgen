@@ -261,3 +261,103 @@ def embed_proteins(sequences: Mapping[str, str], settings: Mapping[str, Any], de
         if progress_every and (position + 1) % progress_every == 0:
             logging.info("đã embed %s/%s protein", position + 1, len(keys))
     return keys, matrix, dimension, long_sequences
+
+
+# ------------------------------------------------------- embedding phân tử (MoLFormer)
+
+
+def load_molecule_encoder(settings: Mapping[str, Any], device: str = "cpu"):
+    """Nạp tokenizer và model mã hóa SMILES; trả về (tokenizer, model, chiều ĐO ĐƯỢC).
+
+    Nhận: khối config stage3.molecule_encoder; thiết bị.
+    Trả về: (tokenizer, model, dimension).
+    Giống load_protein_encoder: chiều lấy từ model đã nạp chứ không lấy từ config, và
+    config ghi lệch thì báo lỗi. `trust_remote_code` bắt buộc với MoLFormer vì model này
+    kèm mã riêng trên HuggingFace; vì vậy tên model phải nằm trong danh sách cho phép của
+    config, không nhận tên tùy ý từ dòng lệnh.
+    """
+    from transformers import AutoModel, AutoTokenizer
+
+    name = str(settings["model"])
+    allowed = tuple(settings.get("allowed_models", ()))
+    if allowed and name not in allowed:
+        raise ValueError(f"model mã hóa phân tử {name!r} không nằm trong allowed_models "
+                         f"{allowed}; mã của model được tải và chạy nên phải khai báo "
+                         f"trước trong config")
+    trust = bool(settings.get("trust_remote_code", False))
+    tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=trust)
+    model = AutoModel.from_pretrained(name, trust_remote_code=trust,
+                                      deterministic_eval=True)
+    model.to(device)
+    dimension = int(model.config.hidden_size)
+    declared = settings.get("embedding_dim")
+    if declared is not None and int(declared) != dimension:
+        raise ValueError(f"config ghi embedding_dim = {declared} nhưng {name} có chiều "
+                         f"thật {dimension}; sửa config chứ đừng bỏ qua")
+    return tokenizer, model, dimension
+
+
+def pool_tokens(outputs: Any, mask: Any, pooling: str) -> Any:
+    """Gộp các token của một batch thành một vector mỗi phân tử.
+
+    Nhận: đầu ra model; mặt nạ attention; 'pooler' hoặc 'mean'.
+    Trả về: tensor (batch, chiều).
+    'pooler' dùng pooler_output như thẻ model MoLFormer hướng dẫn. 'mean' tự lấy trung
+    bình các token THẬT (bỏ padding) để dùng được với model không có pooler.
+    """
+    if pooling == "pooler":
+        pooled = getattr(outputs, "pooler_output", None)
+        if pooled is None:
+            raise ValueError("model không có pooler_output; đặt pooling='mean'")
+        return pooled
+    if pooling != "mean":
+        raise ValueError(f"pooling lạ: {pooling!r}; chỉ có 'pooler' hoặc 'mean'")
+    hidden = outputs.last_hidden_state
+    weights = mask.unsqueeze(-1).to(hidden.dtype)
+    return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
+
+
+def embed_molecules(smiles: Sequence[str], settings: Mapping[str, Any], device: str,
+                    progress_every: int = 20_000
+                    ) -> tuple[list[str], np.ndarray, int, int]:
+    """Embedding cho nhiều SMILES, chạy theo batch.
+
+    Nhận: danh sách SMILES; config stage3.molecule_encoder; thiết bị; nhịp ghi log.
+    Trả về: (danh sách SMILES đã sắp xếp, ma trận float32, chiều đo được, số SMILES bị
+    cắt vì chạm trần token).
+    Khác embed_proteins ở chỗ chạy theo BATCH: phân tử ngắn hơn protein hàng trăm lần nên
+    chạy từng cái một sẽ phí GPU. Thứ tự khóa được sắp xếp để cache dựng lại hai lần cho
+    cùng một file.
+    SMILES quá dài bị tokenizer cắt theo max_tokens; số lần cắt được đếm và ghi log, vì
+    cắt SMILES là mất nguyên tử chứ không phải mất phần đuôi ít quan trọng như ở protein.
+    """
+    import logging
+
+    import torch
+
+    tokenizer, model, dimension = load_molecule_encoder(settings, device)
+    model.eval()
+    keys = sorted(set(smiles))
+    matrix = np.zeros((len(keys), dimension), dtype=np.float32)
+    batch_size = int(settings["batch_size"])
+    max_tokens = int(settings["max_tokens"])
+    pooling = str(settings.get("pooling", "pooler"))
+    truncated = 0
+    with torch.no_grad():
+        for start in range(0, len(keys), batch_size):
+            chunk = keys[start:start + batch_size]
+            encoded = tokenizer(chunk, padding=True, truncation=True,
+                                max_length=max_tokens, return_tensors="pt")
+            truncated += sum(1 for row in encoded["attention_mask"]
+                             if int(row.sum()) >= max_tokens)
+            encoded = {key: value.to(device) for key, value in encoded.items()}
+            outputs = model(**encoded)
+            pooled = pool_tokens(outputs, encoded["attention_mask"], pooling)
+            matrix[start:start + len(chunk)] = pooled.to("cpu").numpy()
+            done = start + len(chunk)
+            if progress_every and done % progress_every < batch_size:
+                logging.info("đã embed %s/%s phân tử", f"{done:,}", f"{len(keys):,}")
+    if truncated:
+        logging.warning("%s SMILES chạm trần %s token và bị cắt", f"{truncated:,}",
+                        max_tokens)
+    return keys, matrix, dimension, truncated

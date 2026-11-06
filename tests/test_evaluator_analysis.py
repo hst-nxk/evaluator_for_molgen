@@ -214,6 +214,8 @@ def fake_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
         fragment_bits = FRAGMENT_BITS
         molecule_keys = pa.array([f"m{i}" for i in range(12)])
         fragment_keys = pa.array([f"f{i}" for i in range(8)])
+        # None = chế độ fingerprint (mặc định); khác None là ma trận embedding đã cache.
+        molecule_vectors = None
 
     vectors = rng.normal(size=(3, PROTEIN_DIM)).astype(np.float32)
     loaded = train.LoadedCheckpoint(

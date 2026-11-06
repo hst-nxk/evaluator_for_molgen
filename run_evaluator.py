@@ -1,6 +1,7 @@
 """CLI cho Stage 3 — evaluator baseline (dự đoán Δp của một cặp chỉnh sửa).
 
-    python run_evaluator.py --mode prepare  [--skip-protein] [--set khóa=giá_trị ...]
+    python run_evaluator.py --mode prepare  [--skip-protein] [--molecule-embeddings]
+                                           [--set khóa=giá_trị ...]
     python run_evaluator.py --mode baseline
     python run_evaluator.py --mode smoke   [--config frozen|finetune|no_protein]
                                            [--head direct|twin] [--sharpness on|off]
@@ -19,6 +20,8 @@
 # src/molopt/evaluator. Không có logic xử lý dữ liệu ở đây.
 #   prepare  : dựng cache fingerprint (RDKit) và cache embedding protein (ESM2).
 #              --skip-protein để chỉ dựng fingerprint khi chưa cài torch/transformers.
+#              --molecule-embeddings để dựng thêm cache embedding phân tử (MoLFormer),
+#              chỉ cần khi chạy --set model.ligand_features=embedding.
 #   baseline : chỉ số của hai baseline tầm thường (luôn đoán 0; trung bình theo endpoint)
 #              làm mốc dưới. Không cần torch, không cần cache: chạy được trước prepare.
 #   smoke    : train trên một mẫu nhỏ, chạy được trên CPU, chỉ xác nhận pipeline thông.
@@ -146,6 +149,9 @@ def main() -> int:
                              "bỏ nhánh edit; twin: chấm riêng từng phân tử rồi lấy hiệu")
     parser.add_argument("--skip-protein", action="store_true",
                         help="prepare: chỉ dựng cache fingerprint, bỏ qua ESM2")
+    parser.add_argument("--molecule-embeddings", action="store_true",
+                        help="prepare: dựng thêm cache embedding phân tử (MoLFormer), "
+                             "cần cho --set model.ligand_features=embedding")
     parser.add_argument("--sharpness", choices=("on", "off"), default=None,
                         help="smoke/train: bật hoặc tắt số hạng phạt chuẩn gradient đầu ra "
                              "(IGNITE, arXiv:2503.04242); không truyền thì theo config "
@@ -179,7 +185,8 @@ def main() -> int:
         logging.info("ghi đè tham số: %s", overrides)
 
     if args.mode == "prepare":
-        evaluator_train.run_prepare(config, ROOT, args.skip_protein)
+        evaluator_train.run_prepare(config, ROOT, args.skip_protein,
+                                    args.molecule_embeddings)
         return 0
     if args.mode == "baseline":
         evaluator_train.run_baselines(config, ROOT, stamp)

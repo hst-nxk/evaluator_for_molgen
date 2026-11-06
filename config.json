@@ -519,6 +519,7 @@
       "molecule_fingerprints": "molecule_fingerprints.parquet",
       "fragment_fingerprints": "fragment_fingerprints.parquet",
       "protein_embeddings": "protein_embeddings.parquet",
+      "molecule_embeddings": "molecule_embeddings.parquet",
       "cache_manifest": "cache_manifest.json"
     },
     "fingerprint": {
@@ -527,6 +528,16 @@
       "fragment_bits": 1024,
       "use_chirality": true,
       "note": "Morgan fingerprint của RDKit. bits dùng cho phân tử đầy đủ (smiles_a, smiles_b); fragment_bits cho nhóm thế (variable_a, variable_b) vì fragment nhỏ hơn nhiều nên vector ngắn hơn là đủ. use_chirality = true vì dataset giữ lập thể trong canonical SMILES và cặp MMP có thể khác nhau chỉ ở lập thể. Fingerprint được tính MỘT LẦN cho mỗi SMILES phân biệt rồi cache, không tính trong vòng train."
+    },
+    "molecule_encoder": {
+      "model": "ibm/MoLFormer-XL-both-10pct",
+      "allowed_models": ["ibm/MoLFormer-XL-both-10pct", "DeepChem/ChemBERTa-77M-MLM"],
+      "trust_remote_code": true,
+      "batch_size": 256,
+      "max_tokens": 202,
+      "pooling": "pooler",
+      "embedding_dim": null,
+      "note": "Chi dung khi stage3.model.ligand_features = embedding; mac dinh van la fingerprint nen moi ket qua cu khong doi. NGUON model: Ross J, Belgodere B, Chenthamarakshan V, Padhi I, Mroueh Y, Das P. Large-scale chemical language representations capture molecular structure and properties. Nature Machine Intelligence 2022;4:1256-1264, DOI 10.1038/s42256-022-00580-7 (ban arXiv:2106.09553); trong so tren HuggingFace ibm/MoLFormer-XL-both-10pct, giay phep Apache-2.0, pretrain bang masked language modeling tren 1,1 ti SMILES tu PubChem va ZINC. pooling=pooler va trust_remote_code=true la theo dung the model cua chinh IBM (model kem ma rieng nen AutoModel can co). allowed_models: chan khong cho --set tro toi mot repo tuy y, vi trust_remote_code se TAI VA CHAY ma tu repo do. max_tokens 202: the model ghi model khong duoc kiem tra tren phan tu lon hon khoang 200 nguyen tu, cong 2 token dac biet; CHUA CO NGUON cho con so chinh xac, va so SMILES bi cat se duoc dem va ghi log chu khong bo qua im lang. batch_size 256 va embedding_dim null: embedding_dim de null de chieu duoc DO tu model luc nap chu khong hardcode. LUU Y khi doc ket qua: Deng va cs. 2023 (Nat Commun 14:6395) do tren 62.820 model va ket luan nguyen van 'representation learning models exhibit limited performance in molecular property prediction in most datasets'; van Tilborg va cs. 2022 (J Chem Inf Model 62:5938-5951) thay descriptor thu cong thang deep learning tren ca activity cliff. Vi vay day la mot ablation co doi chung, KHONG phai mac dinh se tot hon fingerprint."
     },
     "protein_encoder": {
       "model": "facebook/esm2_t12_35M_UR50D",
@@ -554,6 +565,8 @@
       "attention_dropout": 0.1,
       "head_block": "plain",
       "head_norm": "none",
+      "ligand_features": "fingerprint",
+      "ligand_features_note": "Nhanh phan tu dung gi lam dau vao: fingerprint = Morgan 2048 bit nhu v1 (MAC DINH, giu nguyen moi ket qua da do); embedding = vector tu stage3.molecule_encoder (MoLFormer), doi bang --set model.ligand_features=embedding. Doi sang embedding thi PHAI dung cache truoc bang: python run_evaluator.py --mode prepare --molecule-embeddings. Nhanh edit (variable_a/variable_b) VAN dung fingerprint trong ca hai che do, co y: hai cot do chua nhom the co diem gan ket, con MoLFormer pretrain tren SMILES phan tu hoan chinh nen chua chac doc dung manh; tach rieng nhu vay thi ablation chi doi DUNG MOT thu la cach bieu dien phan tu. Chieu dau vao cua nhanh phan tu lay tu metadata cache chu khong hardcode.",
       "head_norm_note": "Chỉ dùng khi head_block = plain. none = MLP head như v1 (Linear, ReLU, Dropout). layernorm = Linear, LayerNorm, ReLU, Dropout ở mỗi lớp ẩn của head: chuẩn hóa tổng đầu vào ngay trước hàm kích hoạt như Ba và cs. 2016 (arXiv:1607.06450), giống khối Prediction ReLU(Norm(x)) của Gorishniy và cs. 2021 (arXiv:2106.11959). Lý do thêm: lần train 06/11/2026 fusion=projector + plain sụp, --mode diagnose đo được predictor.1 chết 100 % (512/512 nơ-ron không bao giờ bật trên 20.000 dòng validation), dự đoán hằng số 0,0024. LayerNorm trước ReLU làm đầu vào ReLU có trung bình 0 theo từng mẫu nên giảm nguy cơ cả lớp chết cùng lúc; KHÔNG bảo đảm tuyệt đối (gain/bias của LayerNorm vẫn học được). Bật bằng --set model.head_norm=layernorm.",
       "residual_width": 512,
       "residual_blocks": 2,
@@ -624,8 +637,11 @@
         {"name": "strict", "filters": {"unseen_pair": true}},
         {"name": "multi_assay", "filters": {"min_n_assays": 2}},
         {"name": "independent_agreement", "filters": {"min_n_documents": 2, "min_distinct_values": 2}},
-        {"name": "clean", "filters": {"plausible_range": true, "no_source_warning": true}}
+        {"name": "clean", "filters": {"plausible_range": true, "no_source_warning": true}},
+        {"name": "cliff", "filters": {"abs_delta_p_above": 1.0}},
+        {"name": "non_cliff", "filters": {"abs_delta_p_at_most": 1.0}}
       ],
+      "cliff_slice_note": "Hai lat cat cliff / non_cliff tach rieng ca activity cliff: cap phan tu rat giong nhau nhung hoat tinh khac han. NGUON dinh nghia: van Tilborg D, Alenicheva A, Grisoni F. Exposing the Limitations of Molecular Machine Learning with Activity Cliffs. J Chem Inf Model 2022;62(23):5938-5951, DOI 10.1021/acs.jcim.2c01073 (bo cong cu MoleculeACE, giay phep MIT). Doc truc tiep ma nguon MoleculeACE/benchmark/cliffs.py ngay 07/11/2026: find_cliffs(similarity=0.9, potency_fold=10) danh dau cliff khi cap VUA du giong nhau VUA chenh hoat tinh hon 10 lan; nhanh mmp=True thay dieu kien giong nhau bang 'la mot matched molecular pair'. Dataset nay toan cap MMP theo cach dung du lieu nen dieu kien giong nhau da thoa san, chi con dieu kien hoat tinh: hon 10 lan tren thang nong do = |delta_p| > 1. Dung dau > NGAT giong find_cliffs (luu y: ham is_cliff trong cung file dung >=, hai cho trong thu vien KHONG KHOP nhau dung tai muc 10 lan; o day theo find_cliffs vi do la ham dung de dung benchmark). non_cliff dung <= de hai lat cat phu kin va khong chong nhau. SO DO ngay 07/11/2026 tren dataset_v4: train 18,29 phan tram cliff (1.212.089/6.627.559), validation 17,91 phan tram (88.447/493.852), test 17,79 phan tram (138.331/777.634). Ly do bao cao rieng: chinh bai tren khuyen dung chi so rieng cho ca cliff, va Deng va cs. 2023 (Nat Commun 14:6395) cung ghi 'activity cliffs can significantly impact model prediction'. Doi nguong 1.0 thi KHONG con khop dinh nghia cua bai.",
       "asymmetry_note": "Đầu ra direct KHÔNG được cưỡng chế đối xứng (cưỡng chế sẽ làm thay đổi bản chất của ablation direct-vs-twin). Thay vào đó mức lệch được ĐO và ghi vào manifest: |f(A,B)+f(B,A)|/2 phải bằng 0 nếu mô hình đối xứng, và |f(A,A)| phải bằng 0 vì phép sửa không sửa gì. Cặp (A,A) không tồn tại trong dataset nên số đo thứ hai nói về ngoại suy, không nói về chất lượng khớp. asymmetry_rows là cỡ mẫu ngẫu nhiên có seed cố định; 0 nghĩa là dùng toàn bộ validation.",
       "baselines_note": "Ba baseline tầm thường làm mốc dưới: zero luôn đoán Δp = 0; endpoint_mean đoán trung bình Δp của endpoint, ước lượng CHỈ trên train; random lấy mẫu có hoàn lại từ phân bố nhãn train với seed cố định (stage3.train.seed). zero và endpoint_mean cho dự đoán không đổi trong mỗi query nên tỉ lệ đúng chiều của chúng bằng 0 theo quy ước hòa-tính-sai, KHÔNG phải 50 %; phần so sánh được của hai cái đó là MAE/RMSE/R². random cho dự đoán liên tục và độc lập với dòng đang xét nên hầu như không có hòa, và tỉ lệ đúng chiều của nó là mốc 50 % thật để so; lấy mẫu từ phân bố nhãn train chứ không từ một phân bố tự chọn như N(0,1) để không thêm tham số tùy ý.",
       "note": "Ranking CHỈ trong cùng một query = (phân tử tham chiếu, protein, endpoint). expand_both_directions = true: mỗi dòng (A, B, Δp) sinh hai hướng A->B (Δp) và B->A (−Δp), vì dataset lưu cặp theo chiều khóa A < B nên nếu chỉ nhóm theo smiles_a thì query bị cắt vụn theo thứ tự khóa chứ không theo hóa học. min_candidates = 2: query một ứng viên không xếp hạng được nên bị loại khỏi MẪU SỐ của ranking, vẫn tính regression. top_k chỉ tính trên query có ít nhất k ứng viên, và mẫu số được ghi riêng cho từng k. Mọi chỉ số ranking báo cáo CẢ macro (trung bình theo query) và micro (gộp mọi cặp ứng viên)."
