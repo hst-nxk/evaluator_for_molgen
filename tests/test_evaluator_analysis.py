@@ -240,7 +240,7 @@ def fake_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     monkeypatch.setattr(train, "layout", lambda config, root: (tmp_path, tmp_path))
     run_config = json.loads(json.dumps(config))
     run_config["stage3"]["analysis"]["feature_rows_per_partition"] = 10
-    return {"config": run_config, "root": tmp_path, "seen": seen, "rows": ROWS}
+    return {"config": run_config, "root": tmp_path, "seen": seen, "rows": ROWS, "model": model}
 
 
 def test_run_errors_writes_the_report_and_the_row_tables(fake_run: dict[str, Any]) -> None:
@@ -283,3 +283,32 @@ def test_representations_feed_the_predictor_exactly() -> None:
             scores = [model.predictor(piece).squeeze(1) for piece in pieces]
             expected = scores[1] - scores[0] if head == models.HEAD_TWIN else scores[0]
             assert torch.allclose(model(*inputs), expected)
+
+
+def test_run_diagnose_reports_layers_and_every_input(fake_run: dict[str, Any]) -> None:
+    report = train.run_diagnose(fake_run["config"], fake_run["root"], Path("x.pt"), "s")
+    assert (fake_run["root"] / "diagnose_frozen_direct_validation_s.json").is_file()
+    assert report["rows"] == 10
+    assert set(report["sensitivity"]) == {"ligand_b", "edit", "protein", "endpoint"}
+    names = {layer["layer"] for layer in report["relu_layers"]}
+    assert any(name.startswith("predictor") for name in names)
+    assert any(name.startswith("ligand_encoder") for name in names)
+    for layer in report["relu_layers"]:
+        assert 0.0 <= layer["dead_fraction"] <= 1.0
+        assert 0.0 <= layer["active_rate"] <= 1.0
+    assert fake_run["seen"] == [data.VALIDATION]
+
+
+def test_run_diagnose_sees_a_dead_head(fake_run: dict[str, Any]) -> None:
+    """Lớp ẩn cuối của head chết hết -> dự đoán hằng số, độ nhạy 0, lớp đó chết 100 %."""
+    hidden = fake_run["model"].predictor[0]
+    with torch.no_grad():
+        hidden.weight.zero_()
+        hidden.bias.fill_(-1.0)
+    report = train.run_diagnose(fake_run["config"], fake_run["root"], Path("x.pt"), "s")
+    dead = {layer["layer"]: layer["dead_fraction"] for layer in report["relu_layers"]}
+    assert dead["predictor.1"] == 1.0
+    assert report["prediction"]["distinct_1e-6"] == 1
+    assert report["prediction"]["std"] == 0.0
+    for shift in report["sensitivity"].values():
+        assert shift["mean_abs_shift"] == 0.0

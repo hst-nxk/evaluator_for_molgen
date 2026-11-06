@@ -1388,3 +1388,153 @@ def run_features(config: Mapping[str, Any], root: Path, checkpoint: Path,
                                          encoding="utf-8")
     LOGGER.info("vector cho t-SNE: %s", path)
     return manifest
+
+
+# ------------------------------------------------------------------ chẩn đoán model sụp
+
+
+# Thứ tự đối số của EvaluatorModel.forward.
+MODEL_INPUTS = ("ligand_a", "ligand_b", "fragment_a", "fragment_b", "protein", "endpoint")
+
+# Đo độ nhạy: tên -> các đầu vào được hoán vị CÙNG một thứ tự trong batch. B đi cùng nhóm
+# thế của B, để B được thay bằng một phân tử B khác có thật chứ không phải ghép lệch.
+SENSITIVITY_INPUTS = {"ligand_b": ("ligand_b", "fragment_b"),
+                      "edit": ("fragment_a", "fragment_b"),
+                      "protein": ("protein",),
+                      "endpoint": ("endpoint",)}
+
+
+def diagnose_model(model: Any, arrays: data.PairArrays, caches: Caches, protein_source: Any,
+                   device: str, batch_size: int, seed: int) -> dict[str, Any]:
+    """Model sụp ở đâu: nơ-ron ReLU chết và độ nhạy của dự đoán với từng đầu vào.
+
+    Hai phép đo, đều ở chế độ eval (dropout tắt), không tính gradient:
+        relu_layers : với mỗi lớp nn.ReLU, tỉ lệ nơ-ron KHÔNG BAO GIỜ bật (> 0) trên toàn
+                      mẫu (dead_fraction) và tỉ lệ bật trung bình (active_rate). Lớp có
+                      dead_fraction = 1 thì mọi thứ phía sau chỉ thấy hằng số. ReLU viết dạng
+                      hàm torch.relu (lớp ra của ResidualHead, nhánh protein ở concat) không
+                      có hook nên không có trong danh sách.
+        sensitivity : trung bình |f(đầu vào bị xáo) - f(gốc)| khi hoán vị một đầu vào giữa
+                      các dòng trong batch, kèm tỉ lệ so với độ lệch chuẩn nhãn. Gần 0 nghĩa
+                      là model không dùng đầu vào đó.
+    Hoán vị lấy từ np.random.default_rng(seed), nên chạy lại cho đúng số cũ.
+    """
+    import torch
+
+    if len(arrays) == 0:
+        raise ValueError("không có dòng nào để chẩn đoán")
+    model.eval()
+    if isinstance(protein_source, ProteinEncoderRuntime):
+        protein_source.train(False)
+    relus = [(name, module) for name, module in model.named_modules()
+             if isinstance(module, torch.nn.ReLU)]
+    ever: dict[str, Any] = {}
+    active = {name: 0.0 for name, _ in relus}
+    total = {name: 0 for name, _ in relus}
+    recording = [False]
+
+    def make_hook(name: str) -> Callable[..., None]:
+        def hook(_module: Any, _inputs: Any, output: Any) -> None:
+            if not recording[0]:
+                return
+            on = (output.detach() > 0).reshape(-1, output.shape[-1])
+            seen = on.any(dim=0)
+            ever[name] = seen if name not in ever else ever[name] | seen
+            active[name] += float(on.sum())
+            total[name] += int(on.numel())
+        return hook
+
+    handles = [module.register_forward_hook(make_hook(name)) for name, module in relus]
+    rng = np.random.default_rng(seed)
+    outputs = np.empty(len(arrays), dtype=np.float32)
+    shifts = {name: 0.0 for name in SENSITIVITY_INPUTS}
+    counted = {name: 0 for name in SENSITIVITY_INPUTS}
+    try:
+        with torch.no_grad():
+            for rows in data.iter_batches(len(arrays), batch_size):
+                batch = batch_tensors(arrays, rows, caches, protein_source, device,
+                                      model.uses_edit_branch)
+                recording[0] = True
+                base = model(*(batch[name] for name in MODEL_INPUTS))
+                recording[0] = False
+                outputs[rows] = base.to("cpu").numpy()
+                order = torch.from_numpy(rng.permutation(len(rows))).to(device)
+                for name, keys in SENSITIVITY_INPUTS.items():
+                    if any(batch[key] is None for key in keys):
+                        continue
+                    shuffled = dict(batch)
+                    for key in keys:
+                        shuffled[key] = batch[key].index_select(0, order)
+                    changed = model(*(shuffled[key] for key in MODEL_INPUTS))
+                    shifts[name] += float((changed - base).abs().sum())
+                    counted[name] += len(rows)
+    finally:
+        recording[0] = False
+        for handle in handles:
+            handle.remove()
+
+    layers = []
+    for name, _ in relus:
+        if total[name] == 0:
+            continue
+        units = ever[name]
+        layers.append({"layer": name, "units": int(units.numel()),
+                       "dead_fraction": float(1.0 - units.float().mean()),
+                       "active_rate": active[name] / total[name]})
+    prediction = outputs.astype(np.float64)
+    label_sd = float(np.std(arrays.target.astype(np.float64)))
+    sensitivity = {}
+    for name, amount in shifts.items():
+        if counted[name] == 0:
+            continue
+        shift = amount / counted[name]
+        sensitivity[name] = {"mean_abs_shift": shift,
+                             "relative_to_label_sd": shift / label_sd if label_sd > 0 else None}
+    return {"rows": len(arrays),
+            "prediction": {"mean": float(prediction.mean()), "std": float(prediction.std()),
+                           "min": float(prediction.min()), "max": float(prediction.max()),
+                           "distinct_1e-6": int(np.unique(np.round(prediction, 6)).size)},
+            "label_sd": label_sd, "relu_layers": layers, "sensitivity": sensitivity}
+
+
+def run_diagnose(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp: str,
+                 partition: str = data.VALIDATION) -> dict[str, Any]:
+    """Chẩn đoán một checkpoint trên một mẫu dòng của partition (validation hoặc train).
+
+    Dùng khi một lần train cho dự đoán gần như hằng số (06/11/2026: fusion=projector +
+    head plain, đúng chiều 0,168, Spearman không tính được). Mẫu lấy
+    stage3.analysis.feature_rows_per_partition dòng, seed stage3.train.seed. Ghi
+    runs_dir/diagnose_<cấu hình>_<đầu ra>_<partition>_<stamp>.json. Không đọc test.
+    """
+    loaded = load_checkpoint(config, root, checkpoint)
+    arrays, _, _ = prepare_arrays(config, root, partition, loaded.caches,
+                                  loaded.protein_vocabulary, None)
+    per_partition = int(config["stage3"]["analysis"]["feature_rows_per_partition"])
+    seed = int(config["stage3"]["train"]["seed"])
+    rng = np.random.default_rng(seed)
+    count = min(per_partition, len(arrays))
+    rows = np.sort(rng.choice(len(arrays), size=count, replace=False))
+    report = diagnose_model(loaded.model, data.take_rows(arrays, rows), loaded.caches,
+                            loaded.protein_source, loaded.device, loaded.eval_batch_size, seed)
+    summary = report["prediction"]
+    LOGGER.info("dự đoán (%s, %s dòng): trung bình %.4f | sd %.4f | [%.4f, %.4f] | "
+                "%s giá trị khác nhau | sd nhãn %.4f", partition, f"{count:,}",
+                summary["mean"], summary["std"], summary["min"], summary["max"],
+                f"{summary['distinct_1e-6']:,}", report["label_sd"])
+    for layer in report["relu_layers"]:
+        LOGGER.info("ReLU %-28s %5d nơ-ron | chết %5.1f%% | tỉ lệ bật %.3f", layer["layer"],
+                    layer["units"], 100 * layer["dead_fraction"], layer["active_rate"])
+    for name, shift in report["sensitivity"].items():
+        relative = shift["relative_to_label_sd"]
+        LOGGER.info("xáo %-9s -> dự đoán đổi trung bình %.4f (= %s lần sd nhãn)", name,
+                    shift["mean_abs_shift"], "-" if relative is None else f"{relative:.4f}")
+    _, runs_dir = layout(config, root)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    path = runs_dir / f"diagnose_{loaded.configuration}_{loaded.head}_{partition}_{stamp}.json"
+    manifest = {"stage": "stage3_diagnose", "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "checkpoint": str(checkpoint), "configuration": loaded.configuration,
+                "head": loaded.head, "partition": partition, "seed": seed,
+                "model_settings": loaded.state.get("model_settings"), **report}
+    path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    LOGGER.info("chẩn đoán: %s", path)
+    return manifest

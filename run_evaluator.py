@@ -11,6 +11,8 @@
     python run_evaluator.py --mode errors  --checkpoint runs/evaluator/<file>.pt
                                            [--partition validation|train]
     python run_evaluator.py --mode features --checkpoint runs/evaluator/<file>.pt
+    python run_evaluator.py --mode diagnose --checkpoint runs/evaluator/<file>.pt
+                                           [--partition validation|train]
 """
 # ---------------------------------------------------------------------------------------
 # File này chỉ là điểm vào: đọc config.json, bật logging, rồi gọi hàm trong
@@ -25,6 +27,8 @@
 #   errors   : nạp checkpoint rồi chia lỗi theo nhóm (việc 6, họp 02/11/2026).
 #   features : nạp checkpoint rồi xuất vector sau encoder của một mẫu train và
 #              validation, để vẽ t-SNE (việc 4).
+#   diagnose : nạp checkpoint rồi đo nơ-ron ReLU chết và độ nhạy với từng đầu vào, khi
+#              một lần train cho dự đoán gần như hằng số.
 #
 # Thứ tự chạy: baseline -> prepare -> smoke -> train -> eval.
 # Partition `test` không được dùng ở bất kỳ chế độ nào (xem molopt.evaluator.data).
@@ -47,7 +51,7 @@ from molopt.evaluator import train as evaluator_train  # noqa: E402
 
 MODEL_PREFIX = "model"
 CONFIG_PATH = ROOT / "config.json"
-MODES = ("prepare", "baseline", "smoke", "train", "eval", "errors", "features")
+MODES = ("prepare", "baseline", "smoke", "train", "eval", "errors", "features", "diagnose")
 # Partition mà --mode eval được chấm. Không có test: test chỉ chạy một lần ở cuối.
 EVAL_PARTITIONS = ("validation", "train")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
@@ -154,10 +158,11 @@ def main() -> int:
                              "--set paths.cache_dir=... (dùng cả cho prepare); dùng được "
                              "nhiều lần")
     parser.add_argument("--checkpoint", type=Path,
-                        help="eval, errors, features: file .pt cần nạp")
+                        help="eval, errors, features, diagnose: file .pt cần nạp")
     parser.add_argument("--partition", default=EVAL_PARTITIONS[0], choices=EVAL_PARTITIONS,
-                        help="eval, errors: partition được chấm; train để so với validation xem "
-                             "mô hình overfit hay chưa học được (test luôn bị chặn)")
+                        help="eval, errors, diagnose: partition được chấm; train để so với "
+                             "validation xem mô hình overfit hay chưa học được (test luôn "
+                             "bị chặn)")
     args = parser.parse_args()
 
     try:
@@ -192,6 +197,8 @@ def main() -> int:
         evaluator_train.run_errors(config, ROOT, args.checkpoint, stamp, args.partition)
     elif args.mode == "features":
         evaluator_train.run_features(config, ROOT, args.checkpoint, stamp)
+    elif args.mode == "diagnose":
+        evaluator_train.run_diagnose(config, ROOT, args.checkpoint, stamp, args.partition)
     else:
         evaluator_train.run_eval(config, ROOT, args.checkpoint, stamp, args.partition)
     return 0
