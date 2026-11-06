@@ -1071,12 +1071,14 @@ def load_checkpoint(config: Mapping[str, Any], root: Path,
             protein_source = ProteinEncoderRuntime(encoder_settings, ordered, device)
             if "protein_encoder" in state:
                 protein_source.model.load_state_dict(state["protein_encoder"])
-    # Checkpoint trước 03/11/2026 không lưu kiến trúc; khi đó chỉ có concat + plain, nên
-    # ép đúng hai giá trị đó dù config hiện tại đang đặt gì. Chiều các lớp vẫn lấy từ
-    # config: các khóa đó chưa từng đổi, và nếu đổi thì load_state_dict báo lỗi lệch chiều.
+    # Checkpoint trước 03/11/2026 không lưu kiến trúc; khi đó chỉ có concat + plain và head
+    # không chuẩn hóa, nên ép đúng các giá trị đó dù config hiện tại đang đặt gì. Chiều các
+    # lớp vẫn lấy từ config: các khóa đó chưa từng đổi, và nếu đổi thì load_state_dict báo
+    # lỗi lệch chiều. Checkpoint 03-06/11/2026 có model_settings nhưng chưa có head_norm:
+    # EvaluatorModel đọc thiếu khóa thành 'none', đúng kiến trúc lúc đó.
     model_settings = state.get("model_settings") or {
         **config["stage3"]["model"], "fusion": models.FUSION_CONCAT,
-        "head_block": models.HEAD_BLOCK_PLAIN}
+        "head_block": models.HEAD_BLOCK_PLAIN, "head_norm": models.HEAD_NORM_NONE}
     model = models.EvaluatorModel(model_settings, int(state["ligand_bits"]),
                                   int(state["fragment_bits"]), state["protein_dim"],
                                   len(config["endpoints"]), str(state["head"]), protein_mode)

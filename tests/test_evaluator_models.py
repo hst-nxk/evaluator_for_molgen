@@ -368,3 +368,54 @@ def test_architecture_settings_drop_the_notes() -> None:
     kept = models.architecture_settings(settings)
     assert "note" not in kept and "fusion_note" not in kept
     assert kept["fusion_dim"] == FUSION_SETTINGS["fusion_dim"]
+
+
+def test_head_norm_defaults_to_none_and_keeps_the_v1_parameter_names() -> None:
+    old = build(models.HEAD_DIRECT, models.PROTEIN_FROZEN)
+    new = build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
+                     fusion=models.FUSION_CONCAT, head_norm=models.HEAD_NORM_NONE)
+    assert old.head_norm == models.HEAD_NORM_NONE
+    assert list(old.state_dict()) == list(new.state_dict())
+
+
+@pytest.mark.parametrize("fusion", models.FUSIONS)
+@pytest.mark.parametrize("head", models.HEADS)
+def test_head_norm_puts_a_layernorm_before_every_relu_of_the_head(fusion: str,
+                                                                   head: str) -> None:
+    model = build_with(head, models.PROTEIN_FROZEN, fusion=fusion,
+                       head_norm=models.HEAD_NORM_LAYER)
+    layers = list(model.predictor)
+    relus = [index for index, layer in enumerate(layers) if isinstance(layer, torch.nn.ReLU)]
+    assert relus
+    for index in relus:
+        assert isinstance(layers[index - 1], torch.nn.LayerNorm)
+        assert isinstance(layers[index - 2], torch.nn.Linear)
+    output = model(**inputs())
+    assert output.shape == (BATCH,)
+    output.sum().backward()
+    assert all(parameter.grad is not None for parameter in model.predictor.parameters())
+
+
+def test_head_norm_keeps_units_alive_when_the_hidden_bias_is_pushed_negative() -> None:
+    """Đúng ca 06/11/2026: lệch âm làm lớp ẩn chết hết ở head thường, không chết khi có LN."""
+    batch = inputs()
+    outputs = {}
+    for norm in models.HEAD_NORMS:
+        model = build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
+                           fusion=models.FUSION_PROJECTOR, head_norm=norm).eval()
+        with torch.no_grad():
+            model.predictor[0].bias.fill_(-10.0)
+            outputs[norm] = model(**batch)
+    assert torch.unique(outputs[models.HEAD_NORM_NONE]).numel() == 1
+    assert torch.unique(outputs[models.HEAD_NORM_LAYER]).numel() == BATCH
+
+
+def test_model_refuses_an_unknown_head_norm() -> None:
+    with pytest.raises(ValueError, match="head_norm"):
+        build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN, head_norm="batchnorm")
+
+
+def test_head_norm_is_refused_with_the_residual_head() -> None:
+    with pytest.raises(ValueError, match="head_norm"):
+        build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
+                   head_block=models.HEAD_BLOCK_RESIDUAL, head_norm=models.HEAD_NORM_LAYER)

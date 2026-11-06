@@ -97,6 +97,13 @@ HEAD_BLOCK_PLAIN = "plain"
 HEAD_BLOCK_RESIDUAL = "residual"
 HEAD_BLOCKS = (HEAD_BLOCK_PLAIN, HEAD_BLOCK_RESIDUAL)
 
+# Chuẩn hóa trong head plain (khóa `head_norm`). `layernorm` đặt LayerNorm giữa Linear và
+# ReLU của mỗi lớp ẩn (Ba và cs. 2016, arXiv:1607.06450). Thêm sau khi --mode diagnose đo
+# được head plain của fusion=projector chết 100 % ở lớp đầu (06/11/2026).
+HEAD_NORM_NONE = "none"
+HEAD_NORM_LAYER = "layernorm"
+HEAD_NORMS = (HEAD_NORM_NONE, HEAD_NORM_LAYER)
+
 # Loại của từng token, theo đúng thứ tự ghép. A và B cùng loại `ligand` nên dùng chung
 # lớp chiếu, giống như chúng dùng chung encoder.
 KIND_LIGAND = "ligand"
@@ -111,15 +118,18 @@ CONFIGURATION_MODES = {"frozen": PROTEIN_FROZEN, "finetune": PROTEIN_FINETUNE,
 
 
 def build_mlp(in_features: int, hidden: Sequence[int], out_features: int,
-              dropout: float) -> nn.Sequential:
+              dropout: float, norm: bool = False) -> nn.Sequential:
     """MLP: các lớp ẩn có ReLU và dropout, lớp cuối tuyến tính thuần.
 
     Lớp cuối không có kích hoạt để đầu ra không bị chặn dấu — Δp có cả âm và dương.
+    ``norm`` = True thêm LayerNorm giữa Linear và ReLU của mỗi lớp ẩn (xem HEAD_NORMS).
     """
     layers: list[nn.Module] = []
     width = in_features
     for size in hidden:
         layers.append(nn.Linear(width, size))
+        if norm:
+            layers.append(nn.LayerNorm(size))
         layers.append(nn.ReLU())
         if dropout > 0.0:
             layers.append(nn.Dropout(dropout))
@@ -250,6 +260,14 @@ class EvaluatorModel(nn.Module):
         head_block = str(settings.get("head_block", HEAD_BLOCK_PLAIN))
         if head_block not in HEAD_BLOCKS:
             raise ValueError(f"head_block lạ: {head_block!r}; chỉ có {HEAD_BLOCKS}")
+        head_norm = str(settings.get("head_norm", HEAD_NORM_NONE))
+        if head_norm not in HEAD_NORMS:
+            raise ValueError(f"head_norm lạ: {head_norm!r}; chỉ có {HEAD_NORMS}")
+        if head_norm != HEAD_NORM_NONE and head_block != HEAD_BLOCK_PLAIN:
+            # Head residual đã có LayerNorm trước mọi ReLU; nhận im lặng thì một lần quét
+            # tham số tưởng đang thử head_norm mà thật ra không đổi gì.
+            raise ValueError("head_norm chỉ dùng với head_block='plain'")
+        self.head_norm = head_norm
         self.head = head
         self.protein_mode = protein_mode
         self.fusion = fusion
@@ -310,7 +328,8 @@ class EvaluatorModel(nn.Module):
                 width, int(settings["residual_width"]), int(settings["residual_blocks"]),
                 dropout)
         else:
-            self.predictor = build_mlp(width, settings["head_hidden"], 1, dropout)
+            self.predictor = build_mlp(width, settings["head_hidden"], 1, dropout,
+                                       norm=head_norm == HEAD_NORM_LAYER)
 
     @property
     def uses_edit_branch(self) -> bool:
