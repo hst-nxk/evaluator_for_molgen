@@ -147,18 +147,34 @@ def build_projector(in_features: int, width: int) -> nn.Sequential:
     return nn.Sequential(nn.Linear(in_features, width), nn.LayerNorm(width))
 
 
+def hidden_width(width: int, factor: float) -> int:
+    """Chiều lớp trong của khối dư = width * factor, làm tròn, tối thiểu 1.
+
+    `hidden factor` là tham số của Bảng 14 (Gorishniy và cs. 2021): tỉ lệ giữa lớp trong
+    của khối và chiều khối, quét trong Uniform[1, 4].
+    """
+    return max(1, int(round(width * float(factor))))
+
+
 class ResidualBlock(nn.Module):
-    """Khối dư: x + Dropout(Linear(Dropout(ReLU(Linear(LN(x)))))).
+    """Khối dư: x + Drop_r(Linear(Drop_h(ReLU(Linear(LN(x)))))).
 
     Đúng phương trình ResNetBlock của Gorishniy và cs. 2021 (arXiv:2106.11959), chỉ thay
-    BatchNorm bằng LayerNorm (xem ghi chú module).
+    BatchNorm bằng LayerNorm (xem ghi chú module). Hai dropout TÁCH RIÊNG như Bảng 14 của
+    bài: `hidden_dropout` nằm trong khối, `residual_dropout` nằm ở cuối nhánh dư. Mục F.1
+    của bài ghi rằng ở cấu hình tốt nhất, dropout trong khối thường CAO HƠN dropout nhánh
+    dư, và dropout nhánh dư nhiều khi bằng 0 — nên để chung một giá trị là tự bỏ mất một
+    chiều quét.
     """
 
-    def __init__(self, width: int, dropout: float) -> None:
+    def __init__(self, width: int, hidden_factor: float, hidden_dropout: float,
+                 residual_dropout: float) -> None:
         super().__init__()
+        inner = hidden_width(width, hidden_factor)
         self.norm = nn.LayerNorm(width)
-        self.body = nn.Sequential(nn.Linear(width, width), nn.ReLU(), nn.Dropout(dropout),
-                                  nn.Linear(width, width), nn.Dropout(dropout))
+        self.body = nn.Sequential(nn.Linear(width, inner), nn.ReLU(),
+                                  nn.Dropout(hidden_dropout),
+                                  nn.Linear(inner, width), nn.Dropout(residual_dropout))
 
     def forward(self, inputs: Tensor) -> Tensor:
         """Cùng hình dạng với đầu vào; nhánh tắt giữ nguyên tín hiệu gốc."""
@@ -172,12 +188,15 @@ class ResidualHead(nn.Module):
     (bài gốc dùng BatchNorm). Lớp ra tuyến tính thuần để Δp mang được cả hai dấu.
     """
 
-    def __init__(self, in_features: int, width: int, blocks: int, dropout: float) -> None:
+    def __init__(self, in_features: int, width: int, blocks: int, hidden_factor: float,
+                 hidden_dropout: float, residual_dropout: float) -> None:
         super().__init__()
         if blocks < 1:
             raise ValueError(f"residual_blocks phải >= 1, nhận {blocks}")
         self.input = nn.Linear(in_features, width)
-        self.blocks = nn.Sequential(*[ResidualBlock(width, dropout) for _ in range(blocks)])
+        self.blocks = nn.Sequential(*[
+            ResidualBlock(width, hidden_factor, hidden_dropout, residual_dropout)
+            for _ in range(blocks)])
         self.norm = nn.LayerNorm(width)
         self.output = nn.Linear(width, 1)
 
@@ -326,7 +345,9 @@ class EvaluatorModel(nn.Module):
         if head_block == HEAD_BLOCK_RESIDUAL:
             self.predictor: nn.Module = ResidualHead(
                 width, int(settings["residual_width"]), int(settings["residual_blocks"]),
-                dropout)
+                float(settings.get("residual_hidden_factor", 1.0)),
+                dropout_or_default(settings.get("residual_hidden_dropout"), dropout),
+                dropout_or_default(settings.get("residual_dropout"), dropout))
         else:
             self.predictor = build_mlp(width, settings["head_hidden"], 1, dropout,
                                        norm=head_norm == HEAD_NORM_LAYER)
@@ -403,6 +424,19 @@ class EvaluatorModel(nn.Module):
             score_a, score_b = (self.predictor(vector) for vector in vectors)
             return (score_b - score_a).squeeze(1)
         return self.predictor(vectors[0]).squeeze(1)
+
+
+def dropout_or_default(value: Any, fallback: float) -> float:
+    """Giá trị dropout riêng của khối dư; số âm nghĩa là "dùng model.dropout".
+
+    Config không nhận None ở --set (xem run_evaluator.apply_overrides chỉ cho số và
+    chuỗi), nên quy ước số âm làm dấu hiệu "chưa đặt riêng". Mặc định -1 giữ nguyên hành
+    vi cũ: cả hai dropout của khối dư bằng model.dropout.
+    """
+    if value is None:
+        return float(fallback)
+    number = float(value)
+    return float(fallback) if number < 0.0 else number
 
 
 def architecture_settings(settings: Mapping[str, Any]) -> dict[str, Any]:

@@ -334,7 +334,7 @@ def test_projector_brings_every_branch_to_the_shared_width() -> None:
 
 def test_residual_block_starts_from_the_identity_path() -> None:
     """Thân khối bằng 0 thì khối dư trả lại đúng đầu vào: tín hiệu luôn đi qua nhánh tắt."""
-    block = models.ResidualBlock(6, 0.0)
+    block = models.ResidualBlock(6, 1.0, 0.0, 0.0)
     for parameter in block.body.parameters():
         torch.nn.init.zeros_(parameter)
     values = torch.rand(BATCH, 6)
@@ -419,3 +419,61 @@ def test_head_norm_is_refused_with_the_residual_head() -> None:
     with pytest.raises(ValueError, match="head_norm"):
         build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
                    head_block=models.HEAD_BLOCK_RESIDUAL, head_norm=models.HEAD_NORM_LAYER)
+
+
+def test_hidden_factor_widens_only_the_inner_layer_of_a_residual_block() -> None:
+    """Bảng 14 (Gorishniy 2021): hidden factor là tỉ lệ lớp trong / chiều khối."""
+    block = models.ResidualBlock(64, hidden_factor=3.0, hidden_dropout=0.0,
+                                 residual_dropout=0.0)
+    first, second = block.body[0], block.body[3]
+    assert (first.in_features, first.out_features) == (64, 192)
+    assert (second.in_features, second.out_features) == (192, 64)
+    assert block(torch.zeros(BATCH, 64)).shape == (BATCH, 64)
+
+
+def test_hidden_factor_of_one_is_the_old_square_block() -> None:
+    block = models.ResidualBlock(64, 1.0, 0.0, 0.0)
+    assert block.body[0].out_features == 64 == block.body[3].in_features
+
+
+def test_hidden_width_never_falls_below_one() -> None:
+    assert models.hidden_width(2, 0.1) == 1
+    assert models.hidden_width(100, 2.5) == 250
+
+
+def test_the_two_residual_dropouts_are_separate_knobs() -> None:
+    """Mục F.1 của bài: dropout trong khối và dropout nhánh dư thường KHÁC nhau."""
+    block = models.ResidualBlock(32, 1.0, hidden_dropout=0.25, residual_dropout=0.0)
+    assert block.body[2].p == 0.25
+    assert block.body[4].p == 0.0
+
+
+def test_residual_dropout_defaults_back_to_the_model_dropout() -> None:
+    # -1 là quy ước "chưa đặt riêng": giữ đúng hành vi của các lần chạy trước 07/11/2026.
+    assert models.dropout_or_default(-1.0, 0.5) == 0.5
+    assert models.dropout_or_default(None, 0.5) == 0.5
+    assert models.dropout_or_default(0.0, 0.5) == 0.0
+    assert models.dropout_or_default(0.3, 0.5) == 0.3
+
+
+def test_residual_head_defaults_reproduce_the_runs_before_the_sweep() -> None:
+    """Config mặc định phải cho ĐÚNG kiến trúc cũ, nếu không mọi số đã đo thành vô nghĩa."""
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    stage3 = json.loads((root / "config.json").read_text(encoding="utf-8"))["stage3"]
+    model_settings = stage3["model"]
+    assert model_settings["residual_hidden_factor"] == 1.0
+    assert model_settings["residual_hidden_dropout"] == -1.0
+    assert model_settings["residual_dropout"] == -1.0
+
+    built = build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
+                       head_block=models.HEAD_BLOCK_RESIDUAL, residual_width=32,
+                       residual_blocks=2, dropout=0.5,
+                       residual_hidden_factor=model_settings["residual_hidden_factor"],
+                       residual_hidden_dropout=model_settings["residual_hidden_dropout"],
+                       residual_dropout=model_settings["residual_dropout"])
+    block = built.predictor.blocks[0]
+    assert block.body[0].out_features == 32
+    assert block.body[2].p == 0.5 and block.body[4].p == 0.5
