@@ -602,6 +602,20 @@
       "selection_metric_note": "Chỉ số chọn checkpoint và dừng sớm trên validation. mae = hành vi cũ (mặc định để kết quả cũ không đổi); pairwise_accuracy_macro = đúng chiều macro (lớn hơn là tốt), bật bằng --set selection_metric=pairwise_accuracy_macro. Dừng sớm theo chỉ số trên tập validation: Prechelt 1998, Early Stopping - But When? (Neural Networks: Tricks of the Trade, LNCS 1524). Việc dùng chỉ số xếp hạng thay MAE: CHƯA CÓ NGUỒN, là lựa chọn từ số đo của dự án: lần train 06/11/2026 sụp ra hằng số (đúng chiều 0,168) vẫn có MAE 0,588, ngang các lần không sụp (0,585-0,587), nên MAE không phân biệt được; mục tiêu cuối của evaluator là xếp hạng phép sửa nên chọn theo chỉ số được báo cáo. Không dùng test.",
       "eval_cadence_note": "eval_every_steps = 0 thi chi do validation o cuoi moi epoch (hanh vi cu). CHUA CO NGUON cho hai con so nay - day la lua chon ky thuat, suy ra tu so do: train co 6.627.559 dong, batch 512 nen mot epoch dai 12.944 buoc; lan train 31/10/2026 (runs/evaluator/train_v4_frozen_direct_console.txt) cho MAE validation tot nhat ngay o epoch 0 (0,6138) roi xau di (0,6241 / 0,6274), tuc diem tot nhat nam BEN TRONG epoch dau va do moi epoch mot lan se bo lo. 2000 buoc cho khoang 6 lan do moi epoch. Khi eval_every_steps > 0 thi kien nhan tinh theo SO LAN DO (early_stopping_patience_evals) chu khong theo so epoch; 5 lan do ~ 10.000 buoc ~ 0,77 epoch khong cai thien. Moi lan do chay tren TOAN BO validation (493.852 dong), khong lay mau, de khong chon checkpoint theo mot mau nhieu.",
       "grad_clip": 1.0,
+      "min_edit_rows": 1,
+      "min_edit_rows_note": "Bo khoi TRAIN cac dong ma phep sua cua dong do xuat hien it hon so lan nay. 1 = khong loc gi (hanh vi cu). CHI ap cho train, validation va test khong bao gio bi loc. Can cu: phan tich ca sai tren train ngay 07/11/2026 (runs/evaluator/errors_frozen_direct_train_20261107_081720) do MAE theo tan suat phep sua di NGUOC chieu moi nhom khac: phep sua xuat hien 1 lan co MAE 0,1440 va dung dau 0,9881 (1.676.782 dong), phep sua xuat hien tu 66 lan tro len co MAE 0,3216 va dung dau 0,8790 (1.327.275 dong). Nghia la nhanh edit dang duoc dung nhu bang tra. Nguong 2 (bo phep sua xuat hien dung 1 lan) CHUA CO NGUON tu bai bao nao, no den tu chinh phep do nay va chi dung de ABLATION, khong phai mac dinh.",
+      "min_edit_rows_control": false,
+      "min_edit_rows_control_note": "Doi chung co mau cho min_edit_rows: bo NGAU NHIEN dung cung so dong ma min_edit_rows se bo, thay vi bo theo tan suat phep sua (seed = stage3.train.seed). Vi sao bat buoc phai co: nguong 2 bo di khoang 25 % train, nen neu ket qua kem di thi khong phan biet duoc \"phep sua hiem co ich\" voi \"it du lieu hon thi kem hon\". Chi khi lan loc theo tan suat khac han lan bo ngau nhien thi moi noi duoc dieu gi ve phep sua. Khong co tac dung khi min_edit_rows = 1.",
+      "branch_learning_rate_scale": {
+        "ligand_encoder": 1.0,
+        "edit_encoder": 1.0,
+        "protein_projection": 1.0,
+        "projectors": 1.0,
+        "attention": 1.0,
+        "endpoint_embedding": 1.0,
+        "predictor": 1.0
+      },
+      "branch_learning_rate_scale_note": "He so NHAN learning_rate rieng cho tung nhanh cua EvaluatorModel. Moi nhanh deu liet ke san o 1,0 de --set cham duoc tung cai mot; nhanh nao con he so 1,0 thi KHONG duoc tach thanh nhom rieng, nen dat het 1,0 la dung y hanh vi cu (mot nhom duy nhat). Ten nhanh hop le: ligand_encoder, edit_encoder, protein_projection, projectors, attention, endpoint_embedding, predictor (train.BRANCH_MODULES). Can cu: Wang W, Tran D, Feiszli M. What Makes Training Multi-Modal Classification Networks Hard? CVPR 2020, arXiv:1905.12681 — nguyen nhan thu hai ho neu la cac mo thuc qua khop va tong quat hoa voi TOC DO KHAC NHAU, nen train chung bang mot chien luoc toi uu la duoi muc toi uu; ho giai bang Gradient Blending (dat hon nhieu). Bai bao KHONG cho con so he so nao, nen moi gia tri dat o day la tham so can quet, CHUA CO NGUON.",
       "sharpness": {
         "enabled": false,
         "lambda_init": 0.01,

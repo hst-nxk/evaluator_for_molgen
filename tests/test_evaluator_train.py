@@ -397,6 +397,24 @@ def test_override_of_the_encoder_needs_the_block_to_be_passed() -> None:
     assert settings == train_settings()
 
 
+def test_override_accepts_true_and_false_for_a_boolean_key() -> None:
+    settings = {**train_settings(), 'min_edit_rows_control': False}
+    assert run_evaluator.apply_overrides(
+        settings, ['min_edit_rows_control=true']) == {'min_edit_rows_control': True}
+    assert settings['min_edit_rows_control'] is True
+    assert run_evaluator.apply_overrides(
+        settings, ['min_edit_rows_control=off']) == {'min_edit_rows_control': False}
+    assert settings['min_edit_rows_control'] is False
+
+
+def test_override_refuses_a_word_it_cannot_read_as_a_boolean() -> None:
+    """bool("khong") là True, nên viết sai phải báo lỗi chứ không được BẬT cờ."""
+    settings = {**train_settings(), 'min_edit_rows_control': False}
+    with pytest.raises(ValueError, match='true/false'):
+        run_evaluator.apply_overrides(settings, ['min_edit_rows_control=khong'])
+    assert settings['min_edit_rows_control'] is False
+
+
 # ------------------------------------------------------------ cộng dồn gradient
 
 

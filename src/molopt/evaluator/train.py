@@ -32,7 +32,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from . import data, features, metrics, sharpness
+from . import analysis, data, features, metrics, sharpness
 
 LOGGER = logging.getLogger(__name__)
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
@@ -715,20 +715,79 @@ def run_baselines(config: Mapping[str, Any], root: Path, stamp: str) -> dict[str
 # --------------------------------------------------------------------------- train
 
 
+# Các nhánh của EvaluatorModel có thể đặt learning rate riêng (xem
+# branch_parameter_groups). Tên lấy đúng tên thuộc tính trong models.EvaluatorModel; sai
+# tên thì báo lỗi chứ không bỏ qua, vì một chữ sai sẽ lặng lẽ thành "không đổi gì".
+BRANCH_MODULES = ("ligand_encoder", "edit_encoder", "protein_projection", "projectors",
+                  "attention", "endpoint_embedding", "predictor")
+OTHER_BRANCH = "còn lại"
+
+
+def branch_parameter_groups(model: Any, base_rate: float,
+                            scales: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Chia tham số của model thành các nhóm learning rate theo từng nhánh.
+
+    Nhận: model; learning rate gốc; {tên nhánh: hệ số nhân} (rỗng = một nhóm như cũ).
+    Trả về: danh sách nhóm cho AdamW, mỗi nhóm có thêm khóa 'branch' để ghi log.
+
+    Vì sao cần: Wang W, Tran D, Feiszli M. What Makes Training Multi-Modal Classification
+    Networks Hard? CVPR 2020, arXiv:1905.12681 — nguyên nhân thứ hai họ nêu là các mô
+    thức QUÁ KHỚP VÀ TỔNG QUÁT HÓA VỚI TỐC ĐỘ KHÁC NHAU, nên train chung bằng một chiến
+    lược tối ưu là dưới mức tối ưu. Learning rate riêng từng nhánh là cách rẻ nhất để
+    thử điều đó (Gradient Blending trong cùng bài đắt hơn nhiều).
+    Hệ số NHÂN chứ không phải learning rate tuyệt đối: để các lần quét learning_rate cũ
+    vẫn còn nghĩa, và để hệ số 1,0 đúng bằng hành vi cũ.
+    """
+    unknown = sorted(set(scales) - set(BRANCH_MODULES))
+    if unknown:
+        raise ValueError(f"nhánh lạ trong branch_learning_rate_scale: {unknown}; "
+                         f"tên hợp lệ: {sorted(BRANCH_MODULES)}")
+    for name, value in scales.items():
+        if float(value) < 0:
+            raise ValueError(f"hệ số của nhánh {name!r} phải từ 0 trở lên, "
+                             f"nhận {value!r}")
+    # Hệ số 1,0 KHÔNG tách nhóm: config liệt kê sẵn mọi nhánh ở 1,0 để --set chạm được
+    # từng cái, nên nếu tách hết thì mọi lần chạy mặc định đều có 7 nhóm vô nghĩa. Bỏ
+    # 1,0 ra thì "mặc định" đúng bằng một nhóm duy nhất như trước.
+    active = {name: float(value) for name, value in scales.items()
+              if float(value) != 1.0}
+    buckets: dict[str, list[Any]] = {}
+    for name, parameter in model.named_parameters():
+        branch = name.split(".", 1)[0]
+        buckets.setdefault(branch if branch in active else OTHER_BRANCH,
+                           []).append(parameter)
+    groups = [{"params": parameters, "branch": branch,
+               "lr": base_rate * (1.0 if branch == OTHER_BRANCH
+                                  else active[branch])}
+              for branch, parameters in buckets.items()]
+    # Không được để sót tham số nào: sót thì nhánh đó im lặng không được train.
+    grouped = sum(len(group["params"]) for group in groups)
+    total = len(list(model.named_parameters()))
+    if grouped != total:
+        raise ValueError(f"chia nhóm làm mất tham số: {grouped} / {total}")
+    return groups
+
+
 def build_optimizer(model: Any, protein_source: Any, settings: Mapping[str, Any]):
     """AdamW; ESM2 (nếu được train cùng) nằm ở nhóm có learning rate riêng, nhỏ hơn.
 
-    Vì sao hai nhóm: ESM2 đã pretrain trên hàng trăm triệu chuỗi, còn phần đầu dự đoán
+    Vì sao tách ESM2: ESM2 đã pretrain trên hàng trăm triệu chuỗi, còn phần đầu dự đoán
     khởi tạo ngẫu nhiên. Dùng cùng learning rate sẽ phá trọng số pretrain trước khi phần
-    đầu kịp học.
+    đầu kịp học. Các nhánh còn lại tách theo branch_learning_rate_scale (mặc định rỗng
+    = một nhóm duy nhất, đúng hành vi cũ).
     """
     import torch
 
-    groups = [{"params": list(model.parameters()),
-               "lr": float(settings["learning_rate"])}]
+    scales = settings.get("branch_learning_rate_scale") or {}
+    groups = branch_parameter_groups(model, float(settings["learning_rate"]), scales)
     if isinstance(protein_source, ProteinEncoderRuntime):
         groups.append({"params": list(protein_source.parameters()),
+                       "branch": "protein_encoder",
                        "lr": float(settings["protein_learning_rate"])})
+    if len(groups) > 1:
+        LOGGER.info("learning rate theo nhánh: %s",
+                    " | ".join(f"{group['branch']} {group['lr']:.4g}"
+                               for group in groups))
     return torch.optim.AdamW(groups, weight_decay=float(settings["weight_decay"]))
 
 
@@ -885,6 +944,64 @@ def prepare_arrays(config: Mapping[str, Any], root: Path, partition: str, caches
     return arrays, keys, table
 
 
+def filter_rare_edits(arrays: data.PairArrays, keys: Mapping[str, np.ndarray],
+                      min_edit_rows: int, control: bool = False, seed: int = 0
+                      ) -> tuple[data.PairArrays, dict[str, np.ndarray], dict[str, Any]]:
+    """Bỏ các dòng mà phép sửa của dòng đó xuất hiện ít hơn ``min_edit_rows`` lần.
+
+    Nhận: mảng đã mã hóa của MỘT partition; các cột khóa query; số lần xuất hiện tối
+    thiểu để một phép sửa được giữ (1 = không lọc gì); ``control`` bỏ ngẫu nhiên ĐÚNG
+    cùng số dòng thay vì bỏ theo tần suất; ``seed`` cho lần bỏ ngẫu nhiên đó.
+    Trả về: (mảng đã lọc, khóa đã lọc, thống kê để ghi vào manifest).
+
+    Vì sao cần ``control``: lọc theo tần suất bỏ đi 25 % train, nên nếu kết quả kém đi
+    thì KHÔNG phân biệt được "phép sửa hiếm có ích" với "ít dữ liệu hơn thì kém hơn".
+    Đối chứng bỏ ngẫu nhiên cùng số dòng tách được hai nguyên nhân đó. Chỉ khi lần lọc
+    theo tần suất khác hẳn lần bỏ ngẫu nhiên thì mới nói được điều gì về phép sửa.
+
+    Vì sao: phân tích ca sai trên train ngày 07/11/2026 (thư mục
+    runs/evaluator/errors_frozen_direct_train_20261107_081720) cho thấy MAE theo tần suất
+    phép sửa đi NGƯỢC chiều mọi nhóm khác — phép sửa xuất hiện 1 lần có MAE 0,1440 và
+    đúng dấu 0,9881, còn phép sửa xuất hiện từ 66 lần trở lên có MAE 0,3216 và đúng dấu
+    0,8790. Phép sửa chỉ gặp một lần thì mô hình nhớ thẳng giá trị chứ không rút ra quy
+    luật nào, nên 1,68 triệu dòng loại đó có thể chỉ đang dạy mô hình ghi nhớ. Cờ này để
+    ĐO điều đó, chưa phải kết luận.
+    CHỈ áp cho train. Lọc validation sẽ đổi mẫu số và làm mọi con số cũ không so được
+    nữa, nên hàm này không bao giờ được gọi cho validation hay test.
+    """
+    rows_before = len(arrays)
+    unchanged: dict[str, Any] = {
+        "min_edit_rows": int(min_edit_rows), "rows_before": rows_before,
+        "rows_after": rows_before, "rows_dropped": 0, "edits_dropped": 0,
+        "control_random_rows": False}
+    if min_edit_rows <= 1:
+        return arrays, dict(keys), unchanged
+    codes = analysis.edit_codes(arrays.fragment_a, arrays.fragment_b)
+    frequency = analysis.code_frequency(codes)
+    keep = frequency >= int(min_edit_rows)
+    if not keep.any():
+        raise ValueError(f"min_edit_rows = {min_edit_rows} bỏ hết {rows_before} dòng; "
+                         f"phép sửa nhiều dòng nhất chỉ có {int(frequency.max())} dòng")
+    edits_dropped = int(np.unique(codes[~keep]).size)
+    if control:
+        # Giữ ĐÚNG cùng số dòng, nhưng chọn ngẫu nhiên: đối chứng cỡ mẫu.
+        chosen = np.random.default_rng(seed).permutation(rows_before)[:int(keep.sum())]
+        keep = np.zeros(rows_before, dtype=bool)
+        keep[chosen] = True
+    filtered = data.PairArrays(
+        molecule_a=arrays.molecule_a[keep], molecule_b=arrays.molecule_b[keep],
+        fragment_a=arrays.fragment_a[keep], fragment_b=arrays.fragment_b[keep],
+        protein=arrays.protein[keep], endpoint=arrays.endpoint[keep],
+        target=arrays.target[keep],
+        slices={name: mask[keep] for name, mask in arrays.slices.items()})
+    report: dict[str, Any] = {
+        "min_edit_rows": int(min_edit_rows), "rows_before": rows_before,
+        "rows_after": len(filtered), "rows_dropped": rows_before - len(filtered),
+        "edits_dropped": 0 if control else edits_dropped,
+        "control_random_rows": bool(control)}
+    return filtered, {name: column[keep] for name, column in keys.items()}, report
+
+
 # Chỉ số chọn checkpoint và dừng sớm (stage3.train.selection_metric). mae: nhỏ hơn là tốt
 # (hành vi cũ). pairwise_accuracy_macro: đúng chiều macro, lớn hơn là tốt; đo 06/11/2026
 # cho thấy MAE gần như bằng nhau (0,585-0,588) cả ở lần train sụp ra hằng số.
@@ -963,6 +1080,19 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
                                                  protein_vocabulary, limit)
     validation_arrays, validation_keys, _ = prepare_arrays(
         config, root, data.VALIDATION, caches, protein_vocabulary, limit)
+    # Lọc phép sửa hiếm CHỈ ở train; validation giữ nguyên để số liệu còn so được.
+    train_arrays, train_keys, edit_filter = filter_rare_edits(
+        train_arrays, train_keys, int(settings.get("min_edit_rows", 1) or 1),
+        bool(settings.get("min_edit_rows_control", False)), int(settings["seed"]))
+    if edit_filter["rows_dropped"]:
+        LOGGER.info("lọc train (%s): bỏ %s dòng (%.1f %%), %s phép sửa; còn %s dòng",
+                    "ĐỐI CHỨNG bỏ ngẫu nhiên cùng cỡ" if edit_filter[
+                        "control_random_rows"] else
+                    f"phép sửa dưới {edit_filter['min_edit_rows']} dòng",
+                    f"{edit_filter['rows_dropped']:,}",
+                    100.0 * edit_filter["rows_dropped"] / edit_filter["rows_before"],
+                    f"{edit_filter['edits_dropped']:,}",
+                    f"{edit_filter['rows_after']:,}")
     LOGGER.info("train %s dòng | validation %s dòng | thiết bị %s | batch %s",
                 f"{len(train_arrays):,}", f"{len(validation_arrays):,}", device, batch_size)
 
@@ -1102,6 +1232,9 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "parameters": models.count_parameters(model),
         "fingerprint_bits": {"ligand": caches.ligand_bits, "fragment": caches.fragment_bits},
         "uses_edit_branch": model.uses_edit_branch,
+        "edit_filter": edit_filter,
+        "branch_learning_rate_scale": dict(
+            settings.get("branch_learning_rate_scale") or {}),
         "sharpness_penalty": None if penalty is None else {
             "source": "IGNITE, NeurIPS 2024, arXiv:2503.04242",
             "rho": penalty.rho, "epsilon": penalty.epsilon,
@@ -1282,7 +1415,6 @@ def run_errors(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp: s
         queries.parquet: từng query — số ứng viên, số cặp đúng chiều, Spearman, top-1
     Cách chia nhóm và ngưỡng: xem ghi chú stage3.analysis trong config và module analysis.
     """
-    from . import analysis
 
     loaded = load_checkpoint(config, root, checkpoint)
     caches = loaded.caches

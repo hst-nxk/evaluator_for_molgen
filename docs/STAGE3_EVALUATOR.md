@@ -327,6 +327,94 @@ trên grid rộng hơn. Config lấy số của mục 5.1 và ghi lại mâu thu
 lượt tại điểm bị làm nhiễu), nên chậm khoảng 3 lần. VRAM đo được ở smoke: 328 MiB, gần như
 không đổi so với 314–320 MiB của vòng train thường.
 
+## 4.7 Lọc phép sửa hiếm khỏi train (`min_edit_rows`), tùy chọn
+
+**Vì sao.** Phân tích ca sai trên train ngày 07/11/2026
+(`runs/evaluator/errors_frozen_direct_train_20261107_081720`) cho một bảng đi **ngược
+chiều** mọi nhóm khác. MAE theo số dòng train dùng chung một phép sửa:
+
+| `edit_rows` | dòng | MAE | đúng dấu | Spearman |
+|---|---|---|---|---|
+| [1, 2) | 1.676.782 | 0,1440 | 0,9881 | 0,9677 |
+| [2, 5) | 2.034.961 | 0,1987 | 0,9644 | 0,9226 |
+| [5, 66) | 1.588.541 | 0,2523 | 0,9374 | 0,8666 |
+| [66, 27.770] | 1.327.275 | 0,3216 | 0,8790 | 0,7536 |
+
+Mọi nhóm khác đi đúng chiều mật độ dữ liệu — càng nhiều dòng càng tốt (`protein_rows`
+0,3045 → 0,1582; `molecule_a_rows` 0,3678 → 0,1329). Riêng phép sửa thì ngược: phép sửa
+gặp **một lần** được khớp gần như hoàn hảo, phép sửa gặp **27.000 lần** sai gấp đôi. Đó là
+dấu hiệu nhánh edit đang được dùng như **bảng tra**: gặp một lần thì nhớ thẳng giá trị,
+gặp nhiều lần thì buộc phải trung bình qua nhiều ngữ cảnh protein khác nhau. Trên
+validation, phép sửa hữu ích lại chính là loại thường gặp.
+
+**Cách dùng.** `stage3.train.min_edit_rows` (mặc định 1 = không lọc gì). Đặt 2 để bỏ các
+dòng mà phép sửa của dòng đó chỉ xuất hiện đúng một lần trong train.
+
+```
+python run_evaluator.py --mode train --set min_edit_rows=2
+```
+
+**Ba điều phải nhớ khi đọc kết quả.**
+
+1. Chỉ lọc **train**. Validation và test không bao giờ bị lọc (`filter_rare_edits` chỉ
+   được gọi cho train trong `run_train`), nên mẫu số của mọi chỉ số không đổi và số liệu
+   vẫn so trực tiếp được với các lần chạy trước.
+2. Ngưỡng 2 **chưa có nguồn** từ bài báo nào. Nó đến từ chính phép đo ở trên, nên đây là
+   một ablation, không phải mặc định mới.
+3. Lọc đi 1,68 triệu dòng là bỏ 25 % train, nên **phải chạy kèm đối chứng**:
+   `min_edit_rows_control=true` bỏ **ngẫu nhiên đúng cùng số dòng** (seed = `seed`).
+   Không có đối chứng thì "kém đi" không phân biệt được với "ít dữ liệu hơn thì kém
+   hơn". Chỉ khi hai lần chạy khác hẳn nhau thì mới nói được điều gì về phép sửa.
+
+```
+python run_evaluator.py --mode train --set min_edit_rows=2 min_edit_rows_control=true
+```
+
+Số dòng bỏ đi được ghi vào log và vào khóa `edit_filter` của manifest.
+
+## 4.8 Learning rate riêng từng nhánh (`branch_learning_rate_scale`), tùy chọn
+
+**Vì sao.** Wang W, Tran D, Feiszli M. *What Makes Training Multi-Modal Classification
+Networks Hard?* CVPR 2020, arXiv:1905.12681. Họ đo thấy mạng **đơn** mô thức tốt nhất
+**luôn** thắng mạng đa mô thức, trên mọi tổ hợp mô thức và mọi bộ chuẩn họ thử, và nêu hai
+nguyên nhân: (a) dung lượng lớn hơn nên quá khớp dễ hơn; (b) các mô thức **quá khớp và
+tổng quát hóa với tốc độ khác nhau**, nên train chung bằng một chiến lược tối ưu là dưới
+mức tối ưu. Họ giải bằng Gradient Blending (trộn theo tỉ lệ quá khớp trên tổng quát hóa).
+
+Learning rate riêng từng nhánh là cách rẻ nhất để thử nguyên nhân (b): chỉ cần thêm param
+group trong AdamW, không đổi kiến trúc, không thêm lượt forward nào.
+
+Việc này khớp với ba quan sát của dự án: bỏ nhánh protein gần như không đổi kết quả;
+train 0,868 so với validation 0,564; `projector` 0,5455 và `attention` 0,5491 đều **kém**
+`concat` 0,5586 (xem thêm Rheude T, Eils R, Wild B. *Fusion or Confusion? Multimodal
+Complexity Is Not All You Need*, arXiv:2512.22991).
+
+**Cách dùng.** `stage3.train.branch_learning_rate_scale` là **hệ số nhân** của
+`learning_rate`, theo từng nhánh. Bảy nhánh được liệt kê sẵn ở 1,0 để dòng lệnh chạm được
+từng cái một; nhánh nào còn hệ số 1,0 thì **không** tách thành nhóm riêng, nên để nguyên
+mặc định là đúng hành vi cũ (một nhóm duy nhất).
+
+```
+python run_evaluator.py --mode train --set branch_learning_rate_scale.edit_encoder=0.1
+```
+
+Tên nhánh hợp lệ (`train.BRANCH_MODULES`, lấy đúng tên thuộc tính trong
+`models.EvaluatorModel`): `ligand_encoder`, `edit_encoder`, `protein_projection`,
+`projectors`, `attention`, `endpoint_embedding`, `predictor`. Gõ sai tên thì báo lỗi ngay,
+vì một chữ sai sẽ lặng lẽ thành "không đổi gì".
+
+**Ba điều phải nhớ.**
+
+1. Hệ số **nhân**, không phải learning rate tuyệt đối: mọi lần quét `learning_rate` cũ
+   vẫn còn nghĩa.
+2. Hệ số 0 là hợp lệ và có nghĩa **đóng băng** nhánh đó: AdamW với `lr = 0` không đổi
+   tham số nào, kể cả weight decay (decoupled weight decay cũng nhân với `lr`).
+3. Bài báo **không** cho con số hệ số nào, nên mọi giá trị đặt ở đây là tham số cần quét,
+   **chưa có nguồn**.
+
+Hệ số đã dùng được ghi vào khóa `branch_learning_rate_scale` của manifest, và learning
+rate từng nhóm được ghi vào log khi có nhánh nào khác 1,0.
+
 ## 5. Ba cấu hình
 
 | cấu hình | nhánh protein | mục đích |

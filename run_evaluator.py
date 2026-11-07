@@ -74,15 +74,21 @@ def setup_logging(log_path: Path) -> None:
                                   logging.FileHandler(log_path, encoding="utf-8")])
 
 
+# Từ được nhận cho khóa true/false của --set. Không dùng bool(raw): bool("false") là
+# True, nên viết sai sẽ BẬT cờ mà người dùng vừa định tắt.
+BOOLEAN_WORDS = {"true": True, "false": False, "1": True, "0": False,
+                 "on": True, "off": False}
+
+
 def apply_overrides(settings: dict, pairs: list[str],
                     model_settings: dict | None = None,
                     blocks: dict[str, dict] | None = None) -> dict:
     """Ghi đè các tham số train từ dòng lệnh, dạng ``khóa=giá trị``.
 
-    Chỉ cho phép ghi đè khóa ĐÃ CÓ trong ``stage3.train`` và có giá trị là số hoặc
-    chuỗi: gõ sai tên khóa sẽ báo lỗi ngay thay vì âm thầm bỏ qua, nếu không cả một đợt
-    quét tham số có thể chạy xong mới phát hiện là vô nghĩa. Kiểu được suy từ giá trị
-    đang có trong config, nên không cần khai báo kiểu ở dòng lệnh.
+    Chỉ cho phép ghi đè khóa ĐÃ CÓ trong ``stage3.train`` và có giá trị là số, chuỗi
+    hay true/false: gõ sai tên khóa sẽ báo lỗi ngay thay vì âm thầm bỏ qua, nếu không cả
+    một đợt quét tham số có thể chạy xong mới phát hiện là vô nghĩa. Kiểu được suy từ giá
+    trị đang có trong config, nên không cần khai báo kiểu ở dòng lệnh.
 
     Khóa có dấu chấm thì đi vào khối con, ví dụ ``finetune_overrides.batch_size=32``.
     Khóa bắt đầu bằng ``model.`` thì đi sang ``stage3.model`` thay vì ``stage3.train``,
@@ -122,11 +128,18 @@ def apply_overrides(settings: dict, pairs: list[str],
         if not isinstance(target, dict) or leaf not in target:
             raise ValueError(f"--set: không có tham số {key!r} trong stage3.train")
         current = target[leaf]
-        if isinstance(current, bool) or not isinstance(current, (int, float, str)):
+        if not isinstance(current, (bool, int, float, str)):
             raise ValueError(f"--set: không ghi đè được {key!r} "
                              f"(kiểu {type(current).__name__})")
         value: object = raw
-        if isinstance(current, int):
+        # bool phải xét TRƯỚC int (bool là lớp con của int) và phải phân tích tường minh:
+        # bool("false") là True, nên để Python tự chuyển sẽ bật cờ mà người dùng vừa tắt.
+        if isinstance(current, bool):
+            if raw.strip().lower() not in BOOLEAN_WORDS:
+                raise ValueError(f"--set: {key!r} là true/false, nhận {raw!r}; "
+                                 f"viết một trong {sorted(BOOLEAN_WORDS)}")
+            value = BOOLEAN_WORDS[raw.strip().lower()]
+        elif isinstance(current, int):
             value = int(raw)
         elif isinstance(current, float):
             value = float(raw)
