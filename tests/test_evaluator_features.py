@@ -156,3 +156,30 @@ def test_molecule_encoder_refuses_a_model_outside_the_allowed_list() -> None:
                 "trust_remote_code": True}
     with pytest.raises(ValueError, match="allowed_models"):
         features.load_molecule_encoder(settings, "cpu")
+
+
+def test_encoder_revision_is_looked_up_per_model() -> None:
+    """Mỗi repo có lịch sử riêng, nên revision tra theo tên model, không dùng chung."""
+    settings = {"revisions": {"ibm/MoLFormer-XL-both-10pct": "compat-v4"}}
+    assert features.encoder_revision(settings, "ibm/MoLFormer-XL-both-10pct") == "compat-v4"
+    assert features.encoder_revision(settings, "DeepChem/ChemBERTa-77M-MLM") is None
+
+
+def test_encoder_revision_without_the_block_means_latest() -> None:
+    assert features.encoder_revision({}, "ibm/MoLFormer-XL-both-10pct") is None
+    assert features.encoder_revision({"revisions": None}, "bat-ky") is None
+
+
+def test_config_pins_the_molformer_revision_that_works_on_transformers_v4() -> None:
+    """Sự cố 07/11/2026: bản mới nhất cần transformers v5 -> ModuleNotFoundError.
+
+    Thẻ model của IBM ghi: dùng revision="compat-v4" cho transformers v4.
+    """
+    import json
+    from pathlib import Path
+
+    config = json.loads((Path(__file__).resolve().parents[1] / "config.json")
+                        .read_text(encoding="utf-8"))
+    encoder = config["stage3"]["molecule_encoder"]
+    assert encoder["revisions"][encoder["model"]] == "compat-v4"
+    assert "masking_utils" in encoder["revisions_note"]

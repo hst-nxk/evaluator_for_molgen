@@ -533,6 +533,10 @@
       "model": "ibm/MoLFormer-XL-both-10pct",
       "allowed_models": ["ibm/MoLFormer-XL-both-10pct", "DeepChem/ChemBERTa-77M-MLM"],
       "trust_remote_code": true,
+      "revisions": {
+        "ibm/MoLFormer-XL-both-10pct": "compat-v4"
+      },
+      "revisions_note": "Ghim ban code tai ve tu HuggingFace, theo TUNG model. Ly do: 07/11/2026 lan chay dau tien chet ngay luc nap model voi ModuleNotFoundError: No module named 'transformers.masking_utils'. Nguyen nhan: repo ibm/MoLFormer-XL-both-10pct da sua ma rieng ngay 02/07/2026 (commit a14249e5ad9e3e7c3b1bb604393e914cfcebd2c8 'Fix deprecated code') va 23/07/2026 (commit 361063d0ad524ef77cf39b08469f6be770dc550f 'Fix tokenizer'); ban moi nay viet cho transformers v5. Chinh the model cua IBM ghi: 'Tested with transformers v5.12.1. For compatibility with transformers v4, use revision=\"compat-v4\"'. Tag compat-v4 tro toi commit 7b12d946c181a37f6012b9dc3b002275de070314 (31/03/2024, ban safetensors), kiem tra qua HuggingFace API ngay 07/11/2026. Ghim thay vi nang transformers vi nhanh protein ESM2 va toan bo ket qua da do deu chay tren ban transformers hien tai; nang len v5 la doi mot bien khac, phai do lai tu dau. Khi viet paper phai ghi ro revision nay.",
       "batch_size": 256,
       "max_tokens": 202,
       "pooling": "pooler",

@@ -266,6 +266,19 @@ def embed_proteins(sequences: Mapping[str, str], settings: Mapping[str, Any], de
 # ------------------------------------------------------- embedding phân tử (MoLFormer)
 
 
+def encoder_revision(settings: Mapping[str, Any], name: str) -> str | None:
+    """Bản (commit/tag trên HuggingFace) phải nạp cho model `name`; None = bản mới nhất.
+
+    Nhận: khối config stage3.molecule_encoder; tên model.
+    Trả về: chuỗi revision hoặc None.
+    Ghim theo TỪNG model vì mỗi repo có lịch sử riêng: đặt một revision dùng chung sẽ
+    sai ngay khi đổi sang model khác trong allowed_models.
+    """
+    revisions = settings.get("revisions") or {}
+    value = revisions.get(name)
+    return None if value is None else str(value)
+
+
 def load_molecule_encoder(settings: Mapping[str, Any], device: str = "cpu"):
     """Nạp tokenizer và model mã hóa SMILES; trả về (tokenizer, model, chiều ĐO ĐƯỢC).
 
@@ -274,7 +287,8 @@ def load_molecule_encoder(settings: Mapping[str, Any], device: str = "cpu"):
     Giống load_protein_encoder: chiều lấy từ model đã nạp chứ không lấy từ config, và
     config ghi lệch thì báo lỗi. `trust_remote_code` bắt buộc với MoLFormer vì model này
     kèm mã riêng trên HuggingFace; vì vậy tên model phải nằm trong danh sách cho phép của
-    config, không nhận tên tùy ý từ dòng lệnh.
+    config, không nhận tên tùy ý từ dòng lệnh. Bản code tải về được GHIM theo config
+    (xem revisions_note): chủ repo có sửa mã riêng và bản mới cần transformers v5.
     """
     from transformers import AutoModel, AutoTokenizer
 
@@ -285,9 +299,11 @@ def load_molecule_encoder(settings: Mapping[str, Any], device: str = "cpu"):
                          f"{allowed}; mã của model được tải và chạy nên phải khai báo "
                          f"trước trong config")
     trust = bool(settings.get("trust_remote_code", False))
-    tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=trust)
+    revision = encoder_revision(settings, name)
+    tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=trust,
+                                              revision=revision)
     model = AutoModel.from_pretrained(name, trust_remote_code=trust,
-                                      deterministic_eval=True)
+                                      revision=revision, deterministic_eval=True)
     model.to(device)
     dimension = int(model.config.hidden_size)
     declared = settings.get("embedding_dim")
