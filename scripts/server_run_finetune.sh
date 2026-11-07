@@ -6,7 +6,8 @@
 #   setsid nohup bash scripts/server_run_finetune.sh 3 > /dev/null 2>&1 &
 #   tail -f runs/finetune.log
 #
-# Tham số duy nhất là SỐ GPU (bắt buộc, không tự dò).
+# Tham số đầu là SỐ GPU (bắt buộc, không tự dò). Mọi tham số sau đó được chuyển thẳng
+# cho run_evaluator.py, ví dụ: bash scripts/server_run_finetune.sh 0 --set batch_size=128
 #
 # Dừng giữa chừng:
 #   kill -- -$(cat .cache/finetune.pid)
@@ -29,22 +30,35 @@
 # trong đồ thị tính toán nên bộ nhớ tỉ lệ với số protein PHÂN BIỆT trong batch. Vậy so
 # sánh với 0,5657 của `frozen` là "mỗi bên ở thiết lập tốt nhất của nó", không phải đổi
 # đúng một biến. Phải nói rõ điều này khi báo cáo.
+#
+# TRẦN VRAM HẠ XUỐNG 7000 MiB (08/11/2026). Tám GPU của máy này đang bị người khác dùng
+# gần hết: chỗ trống lớn nhất đo được là 8.468 MiB, phần còn lại 1-6 GB. Vì vậy
+# max_proteins_per_batch hạ từ 6 xuống 3: finetune_overrides_note đo được ~1,25 GB mỗi
+# protein phân biệt, nên trần 3 protein cần ~3,8 GB thay vì ~7,5 GB. Theo chính ghi chú
+# đó thì 98 % batch chỉ có đúng một protein, nên mức trần này chỉ chạm vào phần đuôi 1-2 %
+# số batch. Khi GPU rảnh hơn thì nâng lại bằng:
+#   bash scripts/server_run_finetune.sh <gpu> \
+#        --set finetune_overrides.batch_size=256 \
+#        --set finetune_overrides.max_proteins_per_batch=6 \
+#        --set gpu_memory_limit_mib=20000
 set -u -o pipefail
 
 PROJECT_ROOT="/data/khainx/evaluator_for_molgen"
 ENV_NAME="nxk"
 LOG_NAME="finetune"
 
-if [[ $# -ne 1 || ! "$1" =~ ^[0-9]+$ ]]; then
-    echo "Cần đúng một tham số: số GPU. Ví dụ: bash $0 3" >&2
+if [[ $# -lt 1 || ! "$1" =~ ^[0-9]+$ ]]; then
+    echo "Tham số đầu phải là số GPU. Ví dụ: bash $0 0" >&2
     exit 1
 fi
 GPU_INDEX="$1"
+shift
+EXTRA=("$@")
 
 # Đầu residual đã quét được ngày 06/11; giữ nguyên để phần head không phải biến số.
-# gpu_memory_limit_mib cao hơn hẳn các lần frozen (7500) vì ESM2 nằm trong đồ thị:
-# finetune_overrides_note đo được ~1,25 GB mỗi protein phân biệt, batch xấu nhất ~16 GB.
-BEST_SET="--set gpu_memory_limit_mib=20000"
+# Trần VRAM và max_proteins_per_batch hạ xuống cho vừa GPU đang bị chiếm (xem đầu file).
+BEST_SET="--set gpu_memory_limit_mib=7000"
+BEST_SET+=" --set finetune_overrides.max_proteins_per_batch=3"
 BEST_SET+=" --set selection_metric=pairwise_accuracy_macro"
 BEST_SET+=" --set model.head_block=residual --set model.dropout=0.5"
 BEST_SET+=" --set model.residual_blocks=7 --set model.residual_width=102"
@@ -93,17 +107,22 @@ echo "##########################################################################
 echo "=== [$(date '+%F %T')] bắt đầu finetune | GPU $GPU_INDEX | PID $$ | $root"
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader || true
 echo "=== Có số đo validation mỗi 2000 bước, không cần đợi chạy xong."
+if [[ ${#EXTRA[@]} -gt 0 ]]; then
+    echo "=== tham số thêm: ${EXTRA[*]}"
+fi
 
 started=$SECONDS
 # shellcheck disable=SC2086
-python run_evaluator.py --mode train --config finetune --head direct $BEST_SET
+python run_evaluator.py --mode train --config finetune --head direct \
+        $BEST_SET "${EXTRA[@]+"${EXTRA[@]}"}"
 status=$?
 minutes=$(((SECONDS - started) / 60))
 if [[ $status -eq 0 ]]; then
     echo "=== [$(date '+%F %T')] xong sau $minutes phút"
 else
     echo "=== [$(date '+%F %T')] LỖI mã $status sau $minutes phút"
-    echo "Nếu là hết VRAM: hạ --set batch_size=128, hoặc chọn GPU trống hơn."
+    echo "Nếu là hết VRAM: thêm --set finetune_overrides.batch_size=128, hoặc"
+    echo "--set finetune_overrides.max_proteins_per_batch=2, hoặc chọn GPU trống hơn."
 fi
 echo "Đọc kết quả: python scripts/summarize_runs.py --ranking"
 echo "XONG_FINETUNE"
