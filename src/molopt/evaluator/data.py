@@ -51,6 +51,67 @@ ABSOLUTE_DELTA_KEYS = ("abs_delta_p_above", "abs_delta_p_at_most")
 MINIMUM_KEYS = {"min_n_assays": "n_assays", "min_n_documents": "n_documents",
                 "min_distinct_values": "n_distinct_values"}
 
+# Cột khóa và cột giá trị của bảng đổi partition (xem load_partition_override).
+OVERRIDE_COLUMNS = ("protein_hash", "partition")
+# Bảng đổi partition đã đọc, theo đường dẫn tuyệt đối. Có cache vì read_columns được gọi
+# lại nhiều lần trong một lần chạy (train, validation, từng lát cắt) và bảng này chỉ vài
+# nghìn dòng nhưng nằm trên đĩa; đọc lại mỗi lần là tốn vô ích.
+_OVERRIDE_CACHE: dict[Path, tuple[pa.Array, pa.Array]] = {}
+
+
+def load_partition_override(config: Mapping[str, Any], root: Path
+                            ) -> tuple[pa.Array, pa.Array] | None:
+    """Đọc bảng đổi partition nếu config khai báo; không khai báo thì trả về None.
+
+    Nhận: config, thư mục gốc. Trả về: (mảng protein_hash, mảng partition) hoặc None.
+
+    Vì sao có đường này: thí nghiệm đổi ngưỡng giống nhau của protein khi chia tập chỉ
+    đổi việc protein nào thuộc partition nào. Dataset, cặp phân tử, nhãn, cache
+    fingerprint và cache embedding đều không đổi (cache đánh khóa theo phân tử và theo
+    protein, không theo partition), nên dựng lại dataset chỉ để đổi một cột là vừa tốn
+    vừa tạo thêm một phiên bản dữ liệu phải quản lý.
+    """
+    setting = str(config["stage3"]["inputs"].get("partition_override") or "").strip()
+    if not setting:
+        return None
+    path = (root / setting).resolve()
+    cached = _OVERRIDE_CACHE.get(path)
+    if cached is not None:
+        return cached
+    if not path.is_file():
+        raise FileNotFoundError(f"chưa có bảng đổi partition {path}; dựng bằng "
+                                f"scripts/build_identity_split.py build")
+    table = pq.read_table(path, columns=list(OVERRIDE_COLUMNS))
+    keys = table.column("protein_hash").combine_chunks()
+    values = table.column("partition").combine_chunks()
+    if isinstance(keys, pa.ChunkedArray):
+        keys = keys.chunk(0) if keys.num_chunks == 1 else pa.concat_arrays(keys.chunks)
+    if isinstance(values, pa.ChunkedArray):
+        values = values.chunk(0) if values.num_chunks == 1 else pa.concat_arrays(values.chunks)
+    if len(set(keys.to_pylist())) != len(keys):
+        raise ValueError(f"{path} có protein_hash trùng; mỗi protein chỉ được một partition")
+    _OVERRIDE_CACHE[path] = (keys, values)
+    return keys, values
+
+
+def apply_partition_override(table: pa.Table, override: tuple[pa.Array, pa.Array]
+                             ) -> pa.Table:
+    """Thay cột 'partition' của bảng bằng partition tra từ 'protein_hash'.
+
+    Protein không có trong bảng đổi là LỖI chứ không bị bỏ qua: thiếu một protein nghĩa
+    là bảng đổi dựng từ lần export khác, và khi đó một phần dữ liệu sẽ chia theo cách cũ
+    còn phần kia theo cách mới — kết quả sai mà không báo gì.
+    """
+    keys, values = override
+    position = pc.index_in(table.column("protein_hash"), value_set=keys)
+    missing = pc.sum(pc.is_null(position)).as_py() or 0
+    if missing:
+        unknown = pc.filter(table.column("protein_hash"), pc.is_null(position))
+        raise ValueError(f"{missing} dòng có protein không nằm trong bảng đổi partition, "
+                         f"ví dụ {unknown.to_pylist()[:3]}")
+    replaced = pc.take(values, position)
+    return table.set_column(table.schema.get_field_index("partition"), "partition", replaced)
+
 
 @dataclass(frozen=True)
 class PairArrays:
@@ -136,19 +197,29 @@ def read_columns(config: Mapping[str, Any], root: Path, partition: str,
     `limit` lấy các dòng ĐẦU TIÊN sau khi lọc partition, không lấy mẫu ngẫu nhiên: dataset
     được ghi theo thứ tự (endpoint, bucket protein) nên phần đầu vẫn đủ nhiều protein và
     nhiều cặp để kiểm tra pipeline, mà kết quả cố định giữa các lần chạy smoke.
+
+    Đây là CHỖ DUY NHẤT trong Stage 3 lọc theo partition, nên bảng đổi partition của
+    config cũng chỉ cần áp ở đây là mọi đường đọc (train, eval, errors, features) đều
+    theo cùng một cách chia.
     """
     check_partition(partition, allow_test)
     path = root / config["stage3"]["inputs"]["evaluator"]
     if not path.is_file():
         raise FileNotFoundError(f"chưa có {path}; chạy Stage 2b --mode export trước")
+    override = load_partition_override(config, root)
     wanted = list(columns)
     if "partition" not in wanted:
         wanted.append("partition")
+    extra_key = override is not None and "protein_hash" not in wanted
+    if extra_key:
+        wanted.append("protein_hash")
     handle = pq.ParquetFile(path)
     chunks: list[pa.Table] = []
     rows = 0
     for batch in handle.iter_batches(batch_size=200_000, columns=wanted):
         table = pa.Table.from_batches([batch])
+        if override is not None:
+            table = apply_partition_override(table, override)
         table = table.filter(pc.equal(table.column("partition"), partition))
         if not table.num_rows:
             continue
@@ -160,7 +231,10 @@ def read_columns(config: Mapping[str, Any], root: Path, partition: str,
             break
     if not chunks:
         raise ValueError(f"partition {partition!r} không có dòng nào trong {path}")
-    return pa.concat_tables(chunks)
+    result = pa.concat_tables(chunks)
+    if extra_key:
+        result = result.drop_columns(["protein_hash"])
+    return result
 
 
 def read_partition(config: Mapping[str, Any], root: Path, partition: str,

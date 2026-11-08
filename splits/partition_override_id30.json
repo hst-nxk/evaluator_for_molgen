@@ -1,0 +1,71 @@
+{
+  "identity": 0.3,
+  "clusters_file": "runs/dataset/mmseqs_id30/p30_cluster.tsv",
+  "clusters_sha256": "ce8a6e5dd08ba9708f58f5dacffa37e723baec728e8c717d92c6cb1d64c18e46",
+  "proteins": 5428,
+  "clusters": 1510,
+  "pairs": 8011271,
+  "seed": 20261021,
+  "target_ratios": {
+    "train": 0.8375,
+    "validation": 0.0625,
+    "test": 0.1
+  },
+  "clusters_single_partition": {
+    "passed": true,
+    "clusters_in_multiple_partitions": 0,
+    "examples": []
+  },
+  "proteins_single_partition": {
+    "passed": true,
+    "proteins_in_multiple_partitions": 0,
+    "proteins_with_multiple_rows": 0
+  },
+  "pair_totals": {
+    "passed": true,
+    "dataset_pairs": 8011271,
+    "pairs_by_partition": {
+      "validation": 500704,
+      "train": 6709440,
+      "test": 801127
+    },
+    "proteins_missing_from_split": 0,
+    "proteins_not_in_dataset": 0,
+    "proteins_with_wrong_pair_count": 0
+  },
+  "ratios": {
+    "train": {
+      "target": 0.8375,
+      "actual": 0.8375000670929744,
+      "deviation": 6.709297439844164e-08
+    },
+    "validation": {
+      "target": 0.0625,
+      "actual": 0.062499945389439454,
+      "deviation": -5.461056054589797e-08
+    },
+    "test": {
+      "target": 0.1,
+      "actual": 0.09999998751758617,
+      "deviation": -1.2482413838665884e-08
+    }
+  },
+  "compare_with_dataset": {
+    "proteins_total": 5428,
+    "proteins_moved": 2759,
+    "pairs_moved": 1695651,
+    "pairs_total": 8011271,
+    "identical": false,
+    "old_to_new": {
+      "test -> test": 398,
+      "test -> train": 736,
+      "test -> validation": 301,
+      "train -> test": 444,
+      "train -> train": 1934,
+      "train -> validation": 348,
+      "validation -> test": 337,
+      "validation -> train": 593,
+      "validation -> validation": 337
+    }
+  }
+}

@@ -509,7 +509,9 @@
   "stage3": {
     "inputs": {
       "evaluator": "data/dataset_v4/evaluator_training.parquet",
-      "proteins": "data/dataset_v4/full/proteins.parquet"
+      "proteins": "data/dataset_v4/full/proteins.parquet",
+      "partition_override": "",
+      "partition_override_note": "Rỗng = dùng cột partition có sẵn trong dataset. Đặt đường dẫn một bảng parquet hai cột (protein_hash, partition) thì mọi đường đọc dữ liệu của Stage 3 sẽ thay cột partition theo bảng đó. Dùng cho thí nghiệm đổi ngưỡng giống nhau của protein khi chia tập (30 %, 50 %, 80 %) mà KHÔNG dựng lại dataset: cách chia chỉ phụ thuộc protein, nên chỉ cột partition đổi, còn cache fingerprint và cache embedding vẫn dùng lại được vì chúng đánh khoá theo phân tử và theo protein. Bảng dựng bằng scripts/build_identity_split.py."
     },
     "paths": {
       "cache_dir": "work/evaluator_cache_v4",

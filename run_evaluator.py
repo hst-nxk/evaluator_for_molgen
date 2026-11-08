@@ -101,6 +101,10 @@ def apply_overrides(settings: dict, pairs: list[str],
     Đổi cả ``paths.cache_dir`` là bắt buộc trên thực tế: cache embedding chỉ có một file,
     và ``train.Caches`` từ chối cache dựng bằng model khác config, nên dùng chung thư mục
     thì lần dựng mới đè mất cache của model đang dùng.
+    Khối ``inputs`` dùng cho thí nghiệm đổi cách chia tập:
+    ``inputs.partition_override=work/splits/partition_override_id30.parquet``. Ở đây
+    KHÔNG cần đổi ``paths.cache_dir``: cache đánh khóa theo phân tử và theo protein chứ
+    không theo partition, nên cùng một cache dùng được cho mọi ngưỡng.
     Trả về: dict khóa -> giá trị mới, để ghi vào manifest của lần chạy.
     """
     routes: dict[str, dict | None] = {MODEL_PREFIX: model_settings, **(blocks or {})}
@@ -187,7 +191,8 @@ def main() -> int:
     try:
         overrides = apply_overrides(settings, args.overrides, config["stage3"]["model"],
                                     {"protein_encoder": config["stage3"]["protein_encoder"],
-                                     "paths": config["stage3"]["paths"]})
+                                     "paths": config["stage3"]["paths"],
+                                     "inputs": config["stage3"]["inputs"]})
     except ValueError as error:
         parser.error(str(error))
 
