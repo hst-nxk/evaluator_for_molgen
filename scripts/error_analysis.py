@@ -144,18 +144,24 @@ def run_gap(args: argparse.Namespace) -> int:
         raise ValueError("cần ít nhất một trong --train hoặc --validation")
     keys = ("rows", "mse", "mae", "rmse", "r2", "spearman", "sign_accuracy",
             "sign_pairs_counted", "truth_sd", "prediction_sd", "spread_ratio")
+    # Hiệu của hai SỐ ĐẾM không có nghĩa gì (train nhiều dòng hơn validation là chuyện
+    # đương nhiên của cách chia tập), nên cột chênh để trống ở các dòng này thay vì in ra
+    # một con số mà người đọc phải tự bỏ qua.
+    count_keys = {"rows", "sign_pairs_counted"}
     labels = list(blocks)
     width = max(len(key) for key in keys) + 2
     print(f"{'chỉ số':<{width}}" + "".join(f"{label:>16}" for label in labels)
-          + ("        chênh" if len(labels) == 2 else ""))
-    print("-" * (width + 16 * len(labels) + (13 if len(labels) == 2 else 0)))
+          + (f"{'chênh':>16}" if len(labels) == 2 else ""))
+    print("-" * (width + 16 * len(labels) + (16 if len(labels) == 2 else 0)))
     for key in keys:
         line = f"{key:<{width}}" + "".join(f"{show(blocks[label].get(key)):>16}"
                                            for label in labels)
         if len(labels) == 2:
             first, second = (blocks[labels[0]].get(key), blocks[labels[1]].get(key))
-            if isinstance(first, (int, float)) and isinstance(second, (int, float)):
-                line += f"{show(float(second) - float(first)):>13}"
+            if key in count_keys:
+                line += f"{'—':>16}"
+            elif isinstance(first, (int, float)) and isinstance(second, (int, float)):
+                line += f"{show(float(second) - float(first)):>16}"
         print(line)
     print()
     print("Đọc bảng này: nếu MAE/MSE của hai partition GẦN nhau mà đúng chiều chênh nhiều,")
