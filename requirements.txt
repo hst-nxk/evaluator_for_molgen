@@ -6,7 +6,12 @@ chembl_structure_pipeline==1.2.4
 pyarrow==25.0.1
 pytest==8.4.2
 numpy==2.2.6
-# matplotlib: chỉ dùng cho hình của run_audit.py (backend Agg, chạy được trên server).
+# pandas: import ở CẤP MODULE trong src/molopt/dataset/pipeline.py và curation.py, nên
+# Stage 2b không chạy được khi thiếu nó. Thiếu khai báo này từ đầu (phát hiện 10/11/2026);
+# phiên bản ghi theo bản đang cài trên máy này (pip show, 10/11/2026).
+pandas==2.3.3
+# matplotlib: hình của run_audit.py và của scripts/error_analysis.py hist
+# (backend Agg, chạy được trên server không có màn hình).
 matplotlib==3.9.2
 
 # Stage 3 (evaluator).

@@ -14,8 +14,23 @@ Vì vậy khóa gom là THAM SỐ dòng lệnh chứ không chôn cứng trong c
 đều kèm khóa đã dùng.
 
 Mặc định dùng (protein_hash, smiles_a, endpoint): một query là "cho protein này, phân tử
-mốc này, loại điểm này, hãy xếp hạng các phân tử thay thế". Đây là đúng đơn vị mà các chỉ
-số xếp hạng (đúng chiều, top-1, top-3) đang chấm trên, xem metrics.py.
+mốc này, loại điểm này, hãy xếp hạng các phân tử thay thế".
+
+SỬA 10/11/2026 — ĐÍNH CHÍNH. Trước đây docstring này ghi rằng khóa mặc định "là đúng đơn
+vị mà các chỉ số xếp hạng đang chấm trên". **Câu đó sai.** `train.evaluate` gom query SAU
+khi gọi `metrics.expand_directions`, và hàm đó nhân đôi dữ liệu theo hai chiều, nên cột
+phân tử tham chiếu lấy từ **cả hai phía** của cặp. Số query mà chỉ số xếp hạng thật sự
+chấm trên, đo ngày 10/11/2026 trên `data/dataset_v4`:
+
+| khóa | train | validation |
+|---|---:|---:|
+| `(protein_hash, smiles_a, endpoint)` — mặc định ở đây | 636.118 | 88.781 |
+| cả hai phía — **đơn vị metric thật chấm** | **783.736** | **113.835** |
+
+Con số đưa vào paper phải là 783.736 / 113.835. Khóa mặc định của script này vẫn giữ
+nguyên vì nó là con số đã dùng trong mọi báo cáo trước, nhưng phải gọi đúng tên nó: đó là
+số phân tử mốc PHÍA A, không phải số query được chấm. Và 669.035 của Tùng (07/11/2026)
+không khớp khóa nào trong hai khóa trên, nên vẫn cần cậu ấy đưa khóa gom của mình.
 """
 from __future__ import annotations
 

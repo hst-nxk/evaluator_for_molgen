@@ -38,6 +38,13 @@ LOGGER = logging.getLogger(__name__)
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
 BYTES_PER_MIB = 1024 * 1024
 
+# Mốc cho sai số hai chiều lớn nhất |f(A,B) + f(B,A)| / 2, anh Tiến đặt ở dòng 141 biên
+# bản 09/11/2026 ("ít nhất sai số giữa hai chiều chỉ ở mức cực nhỏ cỡ 1e-8, 1e-9"). Lấy
+# đầu rộng hơn trong hai số. Mốc này KHÔNG đạt được bằng cách train: kiến trúc nào đạt
+# được nó thì đạt do cấu tạo, nên cờ `meets_target` trong báo cáo thực chất là một phép
+# kiểm tra chéo của cột `antisymmetric_by_construction`.
+ASYMMETRY_TARGET = 1e-8
+
 
 # --------------------------------------------------------------------------- tiện ích
 
@@ -475,12 +482,144 @@ class ProteinEncoderRuntime:
         return pooled.index_select(0, index)
 
 
+# ------------------------------------------------------------------ chuẩn hóa nhãn
+
+
+# Cách chuẩn hóa nhãn (stage3.train.label_normalization). Việc 14 họp 09/11/2026: Cô Lê
+# yêu cầu chuẩn hóa nhãn, anh Tiến chốt mọi tham số CHỈ tính trên train rồi áp sang
+# validation và test (dòng 219 biên bản).
+LABEL_NONE = "none"
+LABEL_SCALE = "scale"
+LABEL_ZSCORE = "zscore"
+LABEL_MINMAX = "minmax"
+LABEL_NORMALIZATIONS = (LABEL_NONE, LABEL_SCALE, LABEL_ZSCORE, LABEL_MINMAX)
+
+
+@dataclass(frozen=True)
+class LabelScaler:
+    """Phép biến đổi nhãn affine z = (y − shift) / scale, tham số ước lượng CHỈ trên train.
+
+    Mô hình học trên z, còn MỌI chỉ số báo cáo đều quy về đơn vị gốc của Δp (``inverse``
+    được áp ngay trong ``predict``). Nhờ vậy mọi con số cũ vẫn so được, và MAE 0,5879 của
+    baseline "luôn đoán 0" vẫn là cùng một mốc.
+
+    ĐIỀU PHẢI BIẾT TRƯỚC KHI CHỌN (phát hiện khi dựng code này, chưa có trong biên bản):
+    chuẩn hóa về [0, 1] KHÔNG tương thích với tính phản đối xứng. Phép biến đổi có
+    ``shift`` khác 0 làm ảnh của −y không còn là −(ảnh của y):
+        z(−y) = (−y − shift)/scale ≠ −(y − shift)/scale = −z(y)   khi shift ≠ 0
+    Nên nếu đã yêu cầu f(A, B) = −f(B, A) (Task 4) thì chỉ được dùng ``scale`` (chia cho
+    độ lệch chuẩn của train, KHÔNG trừ trung bình). ``zscore`` và ``minmax`` chỉ dùng được
+    ở các kiến trúc không đòi tính chất đó, và không dùng cùng augment đảo chiều.
+    """
+
+    name: str
+    shift: float
+    scale: float
+
+    @property
+    def preserves_antisymmetry(self) -> bool:
+        """True khi z(−y) = −z(y), tức khi không có phép dịch."""
+        return self.shift == 0.0
+
+    @property
+    def active(self) -> bool:
+        """True khi phép biến đổi khác phép đồng nhất."""
+        return self.shift != 0.0 or self.scale != 1.0
+
+    def forward(self, values: np.ndarray) -> np.ndarray:
+        """Nhãn gốc -> nhãn đã chuẩn hóa (không gian mà mô hình học)."""
+        if not self.active:
+            return values
+        return ((values.astype(np.float64) - self.shift) / self.scale).astype(values.dtype)
+
+    def inverse(self, values: np.ndarray) -> np.ndarray:
+        """Dự đoán của mô hình -> đơn vị gốc của Δp."""
+        if not self.active:
+            return values
+        return (values.astype(np.float64) * self.scale + self.shift).astype(values.dtype)
+
+    def state(self) -> dict[str, Any]:
+        """Dạng ghi vào checkpoint và manifest."""
+        return {"name": self.name, "shift": self.shift, "scale": self.scale,
+                "preserves_antisymmetry": self.preserves_antisymmetry}
+
+    @classmethod
+    def identity(cls) -> LabelScaler:
+        """Phép đồng nhất — hành vi của mọi lần chạy trước ngày 10/11/2026."""
+        return cls(LABEL_NONE, 0.0, 1.0)
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, Any] | None) -> LabelScaler:
+        """Dựng lại từ checkpoint; checkpoint cũ không có khóa này thì là phép đồng nhất."""
+        if not state:
+            return cls.identity()
+        return cls(str(state["name"]), float(state["shift"]), float(state["scale"]))
+
+
+def fit_label_scaler(name: str, train_target: np.ndarray) -> LabelScaler:
+    """Ước lượng tham số chuẩn hóa nhãn TRÊN TRAIN; không bao giờ nhận validation/test.
+
+    Nhận: tên cách chuẩn hóa (xem LABEL_NORMALIZATIONS); nhãn của partition train.
+    Trả về: LabelScaler.
+    """
+    if name not in LABEL_NORMALIZATIONS:
+        raise ValueError(f"label_normalization lạ: {name!r}; chỉ có {LABEL_NORMALIZATIONS}")
+    if name == LABEL_NONE:
+        return LabelScaler.identity()
+    values = np.asarray(train_target, dtype=np.float64)
+    if values.size == 0:
+        raise ValueError("không có nhãn train nào để ước lượng tham số chuẩn hóa")
+    if name == LABEL_SCALE:
+        shift, scale = 0.0, float(values.std())
+    elif name == LABEL_ZSCORE:
+        shift, scale = float(values.mean()), float(values.std())
+    else:
+        low, high = float(values.min()), float(values.max())
+        shift, scale = low, high - low
+    if not scale > 0.0:
+        raise ValueError(f"label_normalization={name!r} cho hệ số chia {scale}; nhãn train "
+                         f"không có biến thiên")
+    return LabelScaler(name, shift, scale)
+
+
+def check_label_scaler(scaler: LabelScaler, augment: bool, antisymmetric: bool) -> None:
+    """Chặn các tổ hợp mâu thuẫn về mặt toán học thay vì để chúng chạy âm thầm.
+
+    Phép dịch khác 0 phá tính phản đối xứng của NHÃN (xem LabelScaler), nên:
+        - cùng augment đảo chiều: tập nhãn sau augment đối xứng quanh 0, mà phép dịch đẩy
+          nó lệch đi, nên hai nửa dữ liệu không còn cùng một thang;
+        - cùng kiến trúc phản đối xứng: đầu ra của mô hình luôn thỏa f(A,B) = −f(B,A),
+          nên nó KHÔNG BAO GIỜ khớp được nhãn đã bị dịch. Mô hình sẽ hội tụ về một thứ
+          chắc chắn sai mà không có cảnh báo nào.
+    """
+    if scaler.preserves_antisymmetry:
+        return
+    if augment:
+        raise ValueError(
+            f"label_normalization={scaler.name!r} có phép dịch (shift "
+            f"{scaler.shift:.6g}) nên không dùng cùng augment_reverse: nhãn −Δp không "
+            f"còn ánh xạ thành −z. Dùng label_normalization='scale' (chia cho độ lệch "
+            f"chuẩn train, không trừ trung bình).")
+    if antisymmetric:
+        raise ValueError(
+            f"label_normalization={scaler.name!r} có phép dịch (shift "
+            f"{scaler.shift:.6g}) nên kiến trúc phản đối xứng không khớp được nhãn: đầu "
+            f"ra luôn thỏa f(A,B) = −f(B,A) còn nhãn đã bị dịch thì không. Dùng "
+            f"label_normalization='scale'.")
+
+
 # --------------------------------------------------------------------------- đánh giá
 
 
 def predict(model: Any, arrays: data.PairArrays, caches: Caches, protein_source: Any,
-            device: str, batch_size: int) -> np.ndarray:
-    """Dự đoán trên toàn bộ một partition, theo từng batch, không tính gradient."""
+            device: str, batch_size: int,
+            scaler: LabelScaler | None = None) -> np.ndarray:
+    """Dự đoán trên toàn bộ một partition, theo từng batch, không tính gradient.
+
+    Kết quả LUÔN ở đơn vị gốc của Δp: nếu nhãn được chuẩn hóa khi train thì ``scaler``
+    được áp ngược ngay ở đây, nên mọi hàm chấm điểm phía sau không cần biết gì về chuyện
+    chuẩn hóa.
+    """
     import torch
 
     model.eval()
@@ -494,7 +633,7 @@ def predict(model: Any, arrays: data.PairArrays, caches: Caches, protein_source:
             prediction = model(batch["ligand_a"], batch["ligand_b"], batch["fragment_a"],
                                batch["fragment_b"], batch["protein"], batch["endpoint"])
             outputs[rows] = prediction.detach().to("cpu").numpy()
-    return outputs
+    return outputs if scaler is None else scaler.inverse(outputs)
 
 
 def evaluate(arrays: data.PairArrays, prediction: np.ndarray, keys: Mapping[str, np.ndarray],
@@ -542,15 +681,19 @@ def evaluate(arrays: data.PairArrays, prediction: np.ndarray, keys: Mapping[str,
 
 
 def asymmetry_report(model: Any, arrays: data.PairArrays, caches: Caches, protein_source: Any,
-                     device: str, config: Mapping[str, Any],
-                     eval_batch_size: int) -> dict[str, Any] | None:
+                     device: str, config: Mapping[str, Any], eval_batch_size: int,
+                     scaler: LabelScaler | None = None) -> dict[str, Any] | None:
     """Đo mức bất đối xứng của mô hình đã train, trên một mẫu dòng validation.
 
-    Dự án CHỌN KHÔNG cưỡng chế đối xứng cho đầu ra `direct` (cưỡng chế sẽ làm thay đổi
-    bản chất của ablation direct-vs-twin), nên thay vào đó đo mức lệch và ghi vào báo cáo:
-        f(A,B) + f(B,A) phải bằng 0 nếu mô hình đối xứng
+    Phép đo chạy MÔ HÌNH TRÊN ĐẦU VÀO ĐÃ ĐẢO (`data.swap_sides` rồi forward lại), không
+    phải đổi dấu đầu ra đã lưu — đây là điểm khác giữa hàm này và
+    `metrics.expand_directions` của các chỉ số ranking, và là lý do chỉ con số ở đây trả
+    lời được yêu cầu của anh Tiến ở dòng 141 biên bản 09/11/2026 (sai số hai chiều phải
+    xuống cỡ 1e-8, 1e-9):
+        f(A,B) + f(B,A) phải bằng 0 nếu mô hình phản đối xứng
         f(A,A)          phải bằng 0 vì "phép sửa" không sửa gì
-    `twin` cho đúng 0 ở cả hai do kiến trúc, nên số đo này cũng là một phép kiểm tra chéo.
+    `twin` và `antisymmetric` cho đúng 0 ở cả hai do kiến trúc, nên số đo này cũng là một
+    phép kiểm tra chéo của kiến trúc.
     Chạy trên mẫu ngẫu nhiên có seed cố định (metrics.asymmetry_rows) vì đây là số liệu
     chẩn đoán: ba lượt forward trên toàn bộ validation đắt gấp ba một lượt đánh giá.
     """
@@ -569,14 +712,24 @@ def asymmetry_report(model: Any, arrays: data.PairArrays, caches: Caches, protei
         rows = np.arange(len(arrays), dtype=np.int64)
     sample = data.take_rows(arrays, rows)
     batch_size = eval_batch_size
-    forward = predict(model, sample, caches, protein_source, device, batch_size)
+    forward = predict(model, sample, caches, protein_source, device, batch_size, scaler)
     backward = predict(model, data.swap_sides(sample), caches, protein_source, device,
-                       batch_size)
+                       batch_size, scaler)
     identity = predict(model, data.identity_sides(sample), caches, protein_source, device,
-                       batch_size)
+                       batch_size, scaler)
     spread = float(np.std(sample.target.astype(np.float64)))
-    return metrics.asymmetry_metrics(forward.astype(np.float64), backward.astype(np.float64),
-                                     identity.astype(np.float64), spread)
+    report = metrics.asymmetry_metrics(forward.astype(np.float64),
+                                       backward.astype(np.float64),
+                                       identity.astype(np.float64), spread)
+    # Mốc anh Tiến đặt ở dòng 141 biên bản 09/11/2026. Ghi cả mốc vào báo cáo để người đọc
+    # không phải tra lại biên bản mới biết con số kia đạt hay chưa.
+    report["antisymmetry_target"] = ASYMMETRY_TARGET
+    report["antisymmetric_by_construction"] = bool(
+        getattr(model, "antisymmetric_by_construction", False))
+    worst = report.get("antisymmetry_max")
+    report["meets_target"] = None if worst is None else bool(
+        float(worst) <= ASYMMETRY_TARGET)
+    return report
 
 
 # ------------------------------------------------------------------ baseline tầm thường
@@ -719,7 +872,7 @@ def run_baselines(config: Mapping[str, Any], root: Path, stamp: str) -> dict[str
 # branch_parameter_groups). Tên lấy đúng tên thuộc tính trong models.EvaluatorModel; sai
 # tên thì báo lỗi chứ không bỏ qua, vì một chữ sai sẽ lặng lẽ thành "không đổi gì".
 BRANCH_MODULES = ("ligand_encoder", "edit_encoder", "protein_projection", "projectors",
-                  "attention", "endpoint_embedding", "predictor")
+                  "attention", "endpoint_embedding", "predictor", "odd_branch", "gate")
 OTHER_BRANCH = "còn lại"
 
 
@@ -1093,13 +1246,49 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
                     100.0 * edit_filter["rows_dropped"] / edit_filter["rows_before"],
                     f"{edit_filter['edits_dropped']:,}",
                     f"{edit_filter['rows_after']:,}")
-    LOGGER.info("train %s dòng | validation %s dòng | thiết bị %s | batch %s",
-                f"{len(train_arrays):,}", f"{len(validation_arrays):,}", device, batch_size)
 
     model = models.EvaluatorModel(config["stage3"]["model"], caches.ligand_bits,
                                   caches.fragment_bits, protein_dim,
                                   len(config["endpoints"]), head, protein_mode)
     model.to(device)
+
+    # Chuẩn hóa nhãn: tham số ước lượng trên train SAU khi lọc subset và lọc phép sửa
+    # (đó mới đúng là tập mô hình nhìn thấy), nhưng TRƯỚC khi augment đảo chiều — augment
+    # làm tập nhãn đối xứng quanh 0 nên trung bình và min/max của nó không còn là thống kê
+    # của dữ liệu thật.
+    scaler = fit_label_scaler(str(settings.get("label_normalization", LABEL_NONE)),
+                              train_arrays.target)
+    augment = bool(settings.get("augment_reverse", False))
+    check_label_scaler(scaler, augment, model.antisymmetric_by_construction)
+    if scaler.active:
+        LOGGER.info("chuẩn hóa nhãn %s (CHỈ tính trên train): z = (y − %.6f) / %.6f | "
+                    "giữ phản đối xứng: %s | mọi chỉ số báo cáo vẫn ở đơn vị Δp gốc",
+                    scaler.name, scaler.shift, scaler.scale,
+                    "có" if scaler.preserves_antisymmetry else "KHÔNG")
+
+    # Augment đảo chiều CHỈ trên train (việc 2 họp 09/11/2026); validation giữ nguyên để
+    # mẫu số không đổi và mọi con số cũ còn so được.
+    if augment:
+        before = len(train_arrays)
+        train_arrays, train_keys = data.augment_reverse(train_arrays, train_keys)
+        LOGGER.info("augment đảo chiều: %s dòng -> %s dòng (thêm (B, A) với nhãn −Δp)",
+                    f"{before:,}", f"{len(train_arrays):,}")
+        if model.antisymmetric_by_construction:
+            LOGGER.warning("kiến trúc %r đã phản đối xứng do cấu tạo, nên augment đảo "
+                           "chiều KHÔNG thêm thông tin nào: mỗi dòng mới là hệ quả toán "
+                           "học của dòng cũ. Chỉ bật cùng nhau khi muốn đo chi phí của "
+                           "việc train trên dữ liệu gấp đôi.", head)
+    train_arrays_fit = (train_arrays if not scaler.active else
+                        data.PairArrays(
+                            molecule_a=train_arrays.molecule_a,
+                            molecule_b=train_arrays.molecule_b,
+                            fragment_a=train_arrays.fragment_a,
+                            fragment_b=train_arrays.fragment_b,
+                            protein=train_arrays.protein, endpoint=train_arrays.endpoint,
+                            target=scaler.forward(train_arrays.target),
+                            slices=train_arrays.slices))
+    LOGGER.info("train %s dòng | validation %s dòng | thiết bị %s | batch %s",
+                f"{len(train_arrays):,}", f"{len(validation_arrays):,}", device, batch_size)
     optimizer = build_optimizer(model, protein_source, settings)
     criterion = loss_function(settings)
     rng = np.random.default_rng(int(settings["seed"]))
@@ -1142,7 +1331,7 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
 
         measured = time.perf_counter()
         prediction = predict(model, validation_arrays, caches, protein_source, device,
-                             eval_batch_size)
+                             eval_batch_size, scaler)
         scores = evaluate(validation_arrays, prediction, validation_keys, config)
         score = selection_score(scores["all"], selection)
         label = f"epoch {epoch}" if step is None else f"epoch {epoch} bước {step}"
@@ -1177,6 +1366,7 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
                      "protein_mode": protein_mode, "protein_dim": protein_dim,
                      "ligand_bits": caches.ligand_bits,
                      "fragment_bits": caches.fragment_bits,
+                     "label_scaler": scaler.state(),
                      "model_settings": models.architecture_settings(
                          config["stage3"]["model"])}
             if isinstance(protein_source, ProteinEncoderRuntime):
@@ -1193,7 +1383,7 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
 
     for epoch in range(epochs):
         loss, stopped, steps = train_one_epoch(
-            model, train_arrays, caches, protein_source, device, optimizer, criterion,
+            model, train_arrays_fit, caches, protein_source, device, optimizer, criterion,
             batch_size, float(settings["grad_clip"]), rng, penalty, eval_every,
             lambda step, current=epoch: consider(current, step, None),
             group_by_protein, accumulate_steps)
@@ -1207,10 +1397,10 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         load_best_checkpoint(checkpoint_path, model, protein_source, device)
     final = evaluate(validation_arrays, predict(model, validation_arrays, caches,
                                                 protein_source, device,
-                                                eval_batch_size),
+                                                eval_batch_size, scaler),
                      validation_keys, config)
     asymmetry = asymmetry_report(model, validation_arrays, caches, protein_source, device,
-                                 config, eval_batch_size)
+                                 config, eval_batch_size, scaler)
     if asymmetry is not None:
         for line in metrics.format_asymmetry("bất đối xứng (validation)", asymmetry):
             LOGGER.info("%s", line)
@@ -1227,6 +1417,12 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "learning_rate": float(settings["learning_rate"]),
         "weight_decay": float(settings["weight_decay"]),
         "loss": str(settings["loss"]), "huber_delta": float(settings["huber_delta"]),
+        "label_scaler": scaler.state(),
+        "augment_reverse": augment,
+        "antisymmetric_by_construction": model.antisymmetric_by_construction,
+        "train_subset": str(config["stage3"]["inputs"].get("train_subset") or ""),
+        "partition_override": str(
+            config["stage3"]["inputs"].get("partition_override") or ""),
         "rows": {"train": len(train_arrays), "validation": len(validation_arrays)},
         "protein_embedding_dim": protein_dim,
         "parameters": models.count_parameters(model),
@@ -1275,6 +1471,10 @@ class LoadedCheckpoint:
     head: str
     device: str
     eval_batch_size: int
+    # Phép chuẩn hóa nhãn của chính lần train đã sinh checkpoint này. Phải lấy từ
+    # checkpoint, KHÔNG lấy từ config hiện tại: config có thể đã đổi, và khi đó dự đoán
+    # sẽ bị quy đổi sai thang mà không có lỗi nào báo ra.
+    scaler: LabelScaler = LabelScaler(LABEL_NONE, 0.0, 1.0)
 
 
 def load_checkpoint(config: Mapping[str, Any], root: Path,
@@ -1318,12 +1518,17 @@ def load_checkpoint(config: Mapping[str, Any], root: Path,
     model.load_state_dict(state["model"])
     model.to(device)
     _, eval_batch_size = effective_batch_sizes(settings, protein_mode, False)
+    scaler = LabelScaler.from_state(state.get("label_scaler"))
+    if scaler.active:
+        LOGGER.info("checkpoint này train trên nhãn đã chuẩn hóa (%s: z = (y − %.6f) / "
+                    "%.6f); dự đoán được quy về đơn vị Δp gốc trước khi chấm",
+                    scaler.name, scaler.shift, scaler.scale)
     return LoadedCheckpoint(state=state, model=model, caches=caches,
                             protein_source=protein_source,
                             protein_vocabulary=protein_vocabulary, protein_mode=protein_mode,
                             configuration=str(state["configuration"]),
                             head=str(state["head"]), device=device,
-                            eval_batch_size=eval_batch_size)
+                            eval_batch_size=eval_batch_size, scaler=scaler)
 
 
 def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
@@ -1341,7 +1546,8 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
     eval_batch_size = loaded.eval_batch_size
     arrays, keys, _ = prepare_arrays(config, root, partition, caches,
                                      protein_vocabulary, None)
-    prediction = predict(model, arrays, caches, protein_source, device, eval_batch_size)
+    prediction = predict(model, arrays, caches, protein_source, device, eval_batch_size,
+                         loaded.scaler)
     scores = evaluate(arrays, prediction, keys, config)
     for name, block in scores.items():
         if name == "by_endpoint" or not isinstance(block, dict):
@@ -1350,7 +1556,7 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
                                            block.get("ranking"), block.get("change_classes")):
             LOGGER.info("%s", line)
     asymmetry = asymmetry_report(model, arrays, caches, protein_source, device, config,
-                                 eval_batch_size)
+                                 eval_batch_size, loaded.scaler)
     if asymmetry is not None:
         for line in metrics.format_asymmetry(f"bất đối xứng ({partition})", asymmetry):
             LOGGER.info("%s", line)
@@ -1360,6 +1566,7 @@ def run_eval(config: Mapping[str, Any], root: Path, checkpoint: Path,
                 "checkpoint": str(checkpoint), "configuration": configuration,
                 "head": str(state["head"]), "protein_mode": protein_mode, "device": device,
                 "partition": partition, "rows": len(arrays),
+                "label_scaler": loaded.scaler.state(),
                 f"{partition}_metrics": scores, "asymmetry": asymmetry}
     suffix = "" if partition == data.VALIDATION else f"_{partition}"
     path = runs_dir / f"eval_{configuration}_{state['head']}{suffix}_{stamp}.json"
@@ -1424,7 +1631,7 @@ def run_errors(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp: s
     if not extra.column("pair_id").equals(table.column("pair_id")):
         raise ValueError("hai lần đọc partition cho thứ tự dòng khác nhau; không khớp được")
     prediction = predict(loaded.model, arrays, caches, loaded.protein_source, loaded.device,
-                         loaded.eval_batch_size)
+                         loaded.eval_batch_size, loaded.scaler)
     truth = arrays.target.astype(np.float64)
     predicted = prediction.astype(np.float64)
     metric_settings = config["stage3"]["metrics"]
@@ -1510,6 +1717,12 @@ def run_errors(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp: s
         "pair_id": table.column("pair_id"),
         "endpoint": table.column("endpoint"),
         "protein_hash": table.column("protein_hash"),
+        # smiles_a/smiles_b và unseen_pair ghi thẳng vào đây (thêm 10/11/2026) để các
+        # script phân tích của Task 1 không phải join lại 7,9 triệu dòng dataset: phép đo
+        # "cùng cặp (A, B), khác Context P" cần đúng ba cột này.
+        "smiles_a": table.column("smiles_a"),
+        "smiles_b": table.column("smiles_b"),
+        "unseen_pair": table.column("unseen_pair"),
         "delta_p": pa.array(truth),
         "prediction": pa.array(predicted),
         "error": pa.array(predicted - truth),
@@ -1532,6 +1745,7 @@ def run_errors(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp: s
         "stage": "stage3_errors", "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "checkpoint": str(checkpoint), "configuration": loaded.configuration,
         "head": loaded.head, "partition": partition, "rows": len(arrays),
+        "label_scaler": loaded.scaler.state(),
         "direction_tolerance": tolerance, "settings": dict(settings),
         "spread": spread, "queries_overall": overall[0] if overall else None,
         "by_row": row_tables, "by_query": query_tables,
@@ -1547,8 +1761,13 @@ def run_errors(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp: s
 
 
 def represent(model: Any, arrays: data.PairArrays, caches: Caches, protein_source: Any,
-              device: str, batch_size: int) -> tuple[np.ndarray, np.ndarray]:
-    """(vector trước đầu dự đoán, Δp dự đoán) cho mọi dòng; ở twin vector là [A, B] nối lại."""
+              device: str, batch_size: int, scaler: LabelScaler | None = None
+              ) -> tuple[np.ndarray, np.ndarray]:
+    """(vector trước đầu dự đoán, Δp dự đoán) cho mọi dòng; ở twin vector là [A, B] nối lại.
+
+    Δp trả về đã ở đơn vị gốc nếu truyền ``scaler``; vector thì giữ nguyên không gian của
+    mô hình, vì nó chỉ dùng để vẽ t-SNE nên thang đo tuyệt đối không có nghĩa.
+    """
     import torch
 
     model.eval()
@@ -1567,7 +1786,7 @@ def represent(model: Any, arrays: data.PairArrays, caches: Caches, protein_sourc
             outputs[rows] = model(*inputs).to("cpu").numpy()
     if not vectors:
         raise ValueError("không có dòng nào để lấy vector")
-    return np.concatenate(vectors), outputs
+    return np.concatenate(vectors), (outputs if scaler is None else scaler.inverse(outputs))
 
 
 def run_features(config: Mapping[str, Any], root: Path, checkpoint: Path,
@@ -1594,7 +1813,7 @@ def run_features(config: Mapping[str, Any], root: Path, checkpoint: Path,
         sample = data.take_rows(arrays, rows)
         vectors, prediction = represent(loaded.model, sample, loaded.caches,
                                         loaded.protein_source, loaded.device,
-                                        loaded.eval_batch_size)
+                                        loaded.eval_batch_size, loaded.scaler)
         width = int(vectors.shape[1])
         picked = pa.array(rows)
         parts.append(pa.table({
@@ -1639,7 +1858,8 @@ SENSITIVITY_INPUTS = {"ligand_b": ("ligand_b", "fragment_b"),
 
 
 def diagnose_model(model: Any, arrays: data.PairArrays, caches: Caches, protein_source: Any,
-                   device: str, batch_size: int, seed: int) -> dict[str, Any]:
+                   device: str, batch_size: int, seed: int,
+                   scaler: LabelScaler | None = None) -> dict[str, Any]:
     """Model sụp ở đâu: nơ-ron ReLU chết và độ nhạy của dự đoán với từng đầu vào.
 
     Hai phép đo, đều ở chế độ eval (dropout tắt), không tính gradient:
@@ -1715,13 +1935,17 @@ def diagnose_model(model: Any, arrays: data.PairArrays, caches: Caches, protein_
         layers.append({"layer": name, "units": int(units.numel()),
                        "dead_fraction": float(1.0 - units.float().mean()),
                        "active_rate": active[name] / total[name]})
-    prediction = outputs.astype(np.float64)
+    # Quy về đơn vị Δp gốc trước khi so với độ lệch chuẩn nhãn: nếu không thì tỉ lệ
+    # "mean_abs_shift / label_sd" lấy tử số ở thang chuẩn hóa và mẫu số ở thang gốc.
+    factor = 1.0 if scaler is None else float(scaler.scale)
+    prediction = outputs.astype(np.float64) if scaler is None else scaler.inverse(
+        outputs).astype(np.float64)
     label_sd = float(np.std(arrays.target.astype(np.float64)))
     sensitivity = {}
     for name, amount in shifts.items():
         if counted[name] == 0:
             continue
-        shift = amount / counted[name]
+        shift = amount * factor / counted[name]
         sensitivity[name] = {"mean_abs_shift": shift,
                              "relative_to_label_sd": shift / label_sd if label_sd > 0 else None}
     return {"rows": len(arrays),
@@ -1749,7 +1973,8 @@ def run_diagnose(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp:
     count = min(per_partition, len(arrays))
     rows = np.sort(rng.choice(len(arrays), size=count, replace=False))
     report = diagnose_model(loaded.model, data.take_rows(arrays, rows), loaded.caches,
-                            loaded.protein_source, loaded.device, loaded.eval_batch_size, seed)
+                            loaded.protein_source, loaded.device, loaded.eval_batch_size,
+                            seed, loaded.scaler)
     summary = report["prediction"]
     LOGGER.info("dự đoán (%s, %s dòng): trung bình %.4f | sd %.4f | [%.4f, %.4f] | "
                 "%s giá trị khác nhau | sd nhãn %.4f", partition, f"{count:,}",

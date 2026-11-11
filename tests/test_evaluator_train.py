@@ -415,6 +415,65 @@ def test_override_refuses_a_word_it_cannot_read_as_a_boolean() -> None:
     assert settings['min_edit_rows_control'] is False
 
 
+# ------------------------------------------------------------ ghi đè list số (11/11/2026)
+# Vì sao cần: các khóa chiều ẩn đều là list, và thí nghiệm "một lớp Linear không bias trên
+# vector hiệu" chính là antisymmetric_hidden rỗng. Không có đường này thì thí nghiệm đó chỉ
+# chạy được bằng cách sửa tay config.json, mà sửa tay thì mọi lần chạy trong cùng một
+# script đều đổi theo — tức không tách được nó khỏi lần chạy bên cạnh.
+
+
+def test_override_sets_a_list_of_hidden_sizes() -> None:
+    model = {'antisymmetric_hidden': [256, 128], 'head_hidden': [8]}
+    applied = run_evaluator.apply_overrides(
+        train_settings(), ['model.antisymmetric_hidden=[64, 32]'], model)
+    assert applied == {'model.antisymmetric_hidden': [64, 32]}
+    assert model['antisymmetric_hidden'] == [64, 32]
+
+
+def test_override_sets_an_empty_list() -> None:
+    """[] là chính thí nghiệm cần: bỏ hết lớp ẩn, còn một lớp Linear không bias."""
+    model = {'antisymmetric_hidden': [256, 128]}
+    assert run_evaluator.apply_overrides(
+        train_settings(), ['model.antisymmetric_hidden=[]'], model) == {
+            'model.antisymmetric_hidden': []}
+    assert model['antisymmetric_hidden'] == []
+
+
+def test_override_keeps_whole_numbers_as_int() -> None:
+    """nn.Linear cần int; 128.0 sẽ báo lỗi ở tận lúc dựng model."""
+    model = {'antisymmetric_hidden': [256]}
+    run_evaluator.apply_overrides(train_settings(), ['model.antisymmetric_hidden=[128]'],
+                                  model)
+    assert model['antisymmetric_hidden'] == [128]
+    assert all(isinstance(size, int) for size in model['antisymmetric_hidden'])
+
+
+def test_override_refuses_a_list_value_without_brackets() -> None:
+    model = {'antisymmetric_hidden': [256, 128]}
+    with pytest.raises(ValueError, match='ngoặc vuông'):
+        run_evaluator.apply_overrides(train_settings(),
+                                      ['model.antisymmetric_hidden=256'], model)
+    assert model['antisymmetric_hidden'] == [256, 128]
+
+
+@pytest.mark.parametrize('raw', ('[1,,2]', '[abc]', '[1, x]'))
+def test_override_refuses_a_list_element_that_is_not_a_number(raw: str) -> None:
+    model = {'antisymmetric_hidden': [256]}
+    with pytest.raises(ValueError, match='antisymmetric_hidden'):
+        run_evaluator.apply_overrides(train_settings(),
+                                      [f'model.antisymmetric_hidden={raw}'], model)
+    assert model['antisymmetric_hidden'] == [256]
+
+
+def test_override_refuses_a_list_of_names() -> None:
+    """`heads` và `configurations` là danh sách tên: ghi đè chúng làm manifest nói sai."""
+    settings = train_settings()
+    settings['heads'] = ['direct', 'twin']
+    with pytest.raises(ValueError, match='list số'):
+        run_evaluator.apply_overrides(settings, ['heads=[1]'])
+    assert settings['heads'] == ['direct', 'twin']
+
+
 # ------------------------------------------------------------ cộng dồn gradient
 
 
@@ -594,3 +653,105 @@ def test_batch_still_unpacks_bits_when_there_is_no_embedding_cache() -> None:
                                 uses_edit=True)
     assert batch["ligand_a"].shape == (1, bits)
     assert set(np.unique(batch["ligand_a"].numpy())) <= {0.0, 1.0}
+
+
+# ------------------------------------------ chuẩn hóa nhãn (việc 14, họp 09/11/2026)
+# Anh Tiến chốt ở dòng 219 biên bản: mọi tham số chuẩn hóa CHỈ tính trên train rồi áp công
+# thức sang validation và test. Các test dưới đây ghim điều đó, và ghim thêm một điều
+# không có trong biên bản: chuẩn hóa về [0, 1] không tương thích với tính phản đối xứng.
+
+TRAIN_LABELS = np.array([-2.0, -0.5, 0.0, 1.0, 3.5], dtype=np.float32)
+
+
+def test_label_normalization_none_is_the_identity() -> None:
+    scaler = train.fit_label_scaler(train.LABEL_NONE, TRAIN_LABELS)
+    assert scaler.active is False
+    assert scaler.forward(TRAIN_LABELS) is TRAIN_LABELS
+    assert scaler.inverse(TRAIN_LABELS) is TRAIN_LABELS
+    assert scaler.preserves_antisymmetry is True
+
+
+@pytest.mark.parametrize("name", (train.LABEL_SCALE, train.LABEL_ZSCORE,
+                                  train.LABEL_MINMAX))
+def test_every_label_normalization_round_trips(name: str) -> None:
+    """inverse(forward(y)) phải trả về đúng y: nếu không thì mọi MAE báo cáo đều sai thang."""
+    scaler = train.fit_label_scaler(name, TRAIN_LABELS)
+    back = scaler.inverse(scaler.forward(TRAIN_LABELS))
+    assert np.allclose(back, TRAIN_LABELS, atol=1e-5)
+
+
+def test_scale_normalization_divides_by_the_train_standard_deviation() -> None:
+    scaler = train.fit_label_scaler(train.LABEL_SCALE, TRAIN_LABELS)
+    assert scaler.shift == 0.0
+    assert scaler.scale == pytest.approx(float(TRAIN_LABELS.astype(np.float64).std()))
+    # Không trừ trung bình nên phép biến đổi là hàm LẺ: đây là lý do nó dùng được cùng
+    # augment đảo chiều và cùng kiến trúc phản đối xứng.
+    assert scaler.preserves_antisymmetry is True
+    assert scaler.forward(-TRAIN_LABELS) == pytest.approx(-scaler.forward(TRAIN_LABELS))
+
+
+def test_zscore_and_minmax_do_not_preserve_antisymmetry() -> None:
+    for name in (train.LABEL_ZSCORE, train.LABEL_MINMAX):
+        scaler = train.fit_label_scaler(name, TRAIN_LABELS)
+        assert scaler.shift != 0.0
+        assert scaler.preserves_antisymmetry is False
+        assert not np.allclose(scaler.forward(-TRAIN_LABELS),
+                               -scaler.forward(TRAIN_LABELS))
+
+
+def test_minmax_puts_the_train_labels_exactly_in_the_unit_interval() -> None:
+    scaler = train.fit_label_scaler(train.LABEL_MINMAX, TRAIN_LABELS)
+    values = scaler.forward(TRAIN_LABELS)
+    assert values.min() == pytest.approx(0.0)
+    assert values.max() == pytest.approx(1.0)
+
+
+def test_label_normalization_refuses_an_unknown_name() -> None:
+    with pytest.raises(ValueError, match="label_normalization"):
+        train.fit_label_scaler("standardise", TRAIN_LABELS)
+
+
+def test_label_normalization_refuses_labels_with_no_spread() -> None:
+    with pytest.raises(ValueError, match="biến thiên"):
+        train.fit_label_scaler(train.LABEL_ZSCORE, np.full(5, 1.5, dtype=np.float32))
+
+
+def test_a_shifting_normalization_is_refused_with_reverse_augmentation() -> None:
+    scaler = train.fit_label_scaler(train.LABEL_MINMAX, TRAIN_LABELS)
+    with pytest.raises(ValueError, match="augment_reverse"):
+        train.check_label_scaler(scaler, augment=True, antisymmetric=False)
+
+
+def test_a_shifting_normalization_is_refused_with_an_antisymmetric_head() -> None:
+    scaler = train.fit_label_scaler(train.LABEL_ZSCORE, TRAIN_LABELS)
+    with pytest.raises(ValueError, match="phản đối xứng"):
+        train.check_label_scaler(scaler, augment=False, antisymmetric=True)
+
+
+def test_scale_normalization_is_allowed_everywhere() -> None:
+    scaler = train.fit_label_scaler(train.LABEL_SCALE, TRAIN_LABELS)
+    train.check_label_scaler(scaler, augment=True, antisymmetric=True)
+
+
+def test_the_label_scaler_survives_a_checkpoint_round_trip() -> None:
+    """Checkpoint phải mang theo thang đo của chính nó, nếu không eval quy đổi sai thang."""
+    scaler = train.fit_label_scaler(train.LABEL_SCALE, TRAIN_LABELS)
+    restored = train.LabelScaler.from_state(scaler.state())
+    assert restored == scaler
+
+
+def test_an_old_checkpoint_without_a_scaler_reads_as_the_identity() -> None:
+    # Mọi checkpoint train trước ngày 10/11/2026 không có khóa này.
+    assert train.LabelScaler.from_state(None).active is False
+    assert train.LabelScaler.from_state({}).active is False
+
+
+def test_the_config_default_keeps_every_earlier_number_comparable() -> None:
+    """Mặc định phải là 'none' và augment phải TẮT, nếu không mọi số đã đo thành vô nghĩa."""
+    import json
+
+    root = Path(__file__).resolve().parents[1]
+    stage3 = json.loads((root / "config.json").read_text(encoding="utf-8"))["stage3"]
+    assert stage3["train"]["label_normalization"] == train.LABEL_NONE
+    assert stage3["train"]["augment_reverse"] is False
+    assert stage3["inputs"]["train_subset"] == ""

@@ -182,6 +182,10 @@ def fake_partition(rng: np.random.Generator) -> tuple[data.PairArrays, dict[str,
         "pair_id": pa.array([f"p{i}" for i in range(ROWS)]),
         "endpoint": pa.array(["Ki"] * ROWS),
         "protein_hash": pa.array([f"h{i}" for i in arrays.protein]),
+        # Hai cột SMILES: rows.parquet ghi chúng từ 10/11/2026 để script phân tích "cùng
+        # cặp (A, B), khác Context P" không phải join lại dataset.
+        "smiles_a": pa.array([f"m{i}" for i in molecule_a]),
+        "smiles_b": pa.array([f"m{i}" for i in molecule_b]),
         "n_assays": pa.array(rng.integers(1, 4, ROWS)),
         "n_documents": pa.array(rng.integers(1, 3, ROWS)),
         "n_distinct_values": pa.array(rng.integers(1, 3, ROWS)),
@@ -270,11 +274,19 @@ def test_run_features_samples_train_and_validation_only(fake_run: dict[str, Any]
 
 
 def test_representations_feed_the_predictor_exactly() -> None:
-    """Vector xuất cho t-SNE đúng là đầu vào của MLP cuối: đưa qua predictor ra lại Δp."""
+    """Vector xuất cho t-SNE đúng là đầu vào của MLP cuối: đưa qua predictor ra lại Δp.
+
+    Head `antisymmetric` không có khối predictor (nó có nhánh lẻ và cổng riêng), nên lời
+    hứa này không áp cho nó; test riêng ở dưới kiểm vector của nó theo cách khác.
+    """
     torch.manual_seed(0)
     settings = {"ligand_hidden": [16], "ligand_out": 8, "edit_hidden": [8], "edit_out": 4,
-                "protein_out": 4, "endpoint_dim": 3, "head_hidden": [8], "dropout": 0.0}
+                "protein_out": 4, "endpoint_dim": 3, "head_hidden": [8], "dropout": 0.0,
+                "antisymmetric_hidden": [8], "antisymmetric_gate_hidden": [8],
+                "antisymmetric_gate_dim": 5}
     for head in models.HEADS:
+        if head == models.HEAD_ANTISYMMETRIC:
+            continue
         model = models.EvaluatorModel(settings, LIGAND_BITS, FRAGMENT_BITS, PROTEIN_DIM, 4,
                                       head, models.PROTEIN_FROZEN).eval()
         inputs = (torch.rand(5, LIGAND_BITS), torch.rand(5, LIGAND_BITS),
@@ -285,6 +297,29 @@ def test_representations_feed_the_predictor_exactly() -> None:
             scores = [model.predictor(piece).squeeze(1) for piece in pieces]
             expected = scores[1] - scores[0] if head == models.HEAD_TWIN else scores[0]
             assert torch.allclose(model(*inputs), expected)
+
+
+def test_antisymmetric_representations_are_the_odd_branch_and_the_gate() -> None:
+    """Vector xuất cho t-SNE của head antisymmetric là [nhánh lẻ, cổng] nối lại.
+
+    Tích vô hướng của hai nửa đó phải trả về đúng Δp, nên vector này vẫn là "mọi thứ ngay
+    trước phép tính cuối", đúng lời hứa của run_features.
+    """
+    torch.manual_seed(0)
+    settings = {"ligand_hidden": [16], "ligand_out": 8, "edit_hidden": [8], "edit_out": 4,
+                "protein_out": 4, "endpoint_dim": 3, "head_hidden": [8], "dropout": 0.0,
+                "antisymmetric_hidden": [8], "antisymmetric_gate_hidden": [8],
+                "antisymmetric_gate_dim": 5}
+    model = models.EvaluatorModel(settings, LIGAND_BITS, FRAGMENT_BITS, PROTEIN_DIM, 4,
+                                  models.HEAD_ANTISYMMETRIC, models.PROTEIN_FROZEN).eval()
+    inputs = (torch.rand(5, LIGAND_BITS), torch.rand(5, LIGAND_BITS),
+              torch.rand(5, FRAGMENT_BITS), torch.rand(5, FRAGMENT_BITS),
+              torch.rand(5, PROTEIN_DIM), torch.zeros(5, dtype=torch.long))
+    with torch.no_grad():
+        vector = model.representations(*inputs)[0]
+        assert vector.shape == (5, 2 * settings["antisymmetric_gate_dim"])
+        odd, gate = vector[:, :5], vector[:, 5:]
+        assert torch.allclose(model(*inputs), (odd * gate).sum(dim=1), atol=1e-6)
 
 
 def test_run_diagnose_reports_layers_and_every_input(fake_run: dict[str, Any]) -> None:

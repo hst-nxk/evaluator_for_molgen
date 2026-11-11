@@ -474,6 +474,14 @@ phân tử, và đổi chỗ A với B thì Δp đổi dấu. Hai đầu ra `dir
 
 ### 6.1 Đo mức bất đối xứng, không cưỡng chế
 
+> **CẬP NHẬT 10/11/2026 — lựa chọn ở mục này KHÔNG còn là lựa chọn duy nhất.** Ở họp
+> 09/11/2026 anh Tiến yêu cầu kiến trúc phải **tự thỏa** `f(A,B,P) = −f(B,A,P)` ngay từ
+> thiết kế, với mốc sai số hai chiều `1e-8` (dòng 141 biên bản). Mục này vẫn đúng cho hai
+> đầu ra joint (`direct`, `direct_no_edit`): ở đó dự án vẫn chỉ ĐO. Nhưng từ nay có thêm
+> **hai đầu ra phản đối xứng đúng theo cấu tạo**, xem mục 6.3:
+> `twin` (có thể bật `twin_edit`) và `antisymmetric`. Với hai đầu ra đó, con số trong bảng
+> dưới đây phải bằng 0 — nếu khác 0 thì là **lỗi code**, không phải tính chất của mô hình.
+
 Cưỡng chế đối xứng (ví dụ lấy `f(A,B) − f(B,A)`) sẽ làm thay đổi chính thứ mà ablation ở
 trên muốn đo, nên lựa chọn là giữ nguyên kiến trúc và **đo** mức lệch, rồi ghi vào phần
 giới hạn của báo cáo. `--mode train` và `--mode eval` đều tính, trên một mẫu ngẫu nhiên có
@@ -551,6 +559,43 @@ tính chất đó, nên 0,0000 nghĩa là `swap_sides`, `identity_sides` và `as
 tính đúng. Và nhánh edit **làm mức bất đối xứng tăng gấp đôi** (2,3 % → 4,9 %), hợp lý vì
 nó là đầu vào phụ thuộc chiều mạnh nhất. Hai con số này đo trên một mô hình đang học thuộc
 20.000 dòng nên là **tạm thời**; số dùng cho paper phải lấy từ `--mode train` đầy đủ.
+
+### 6.3 Hai đầu ra phản đối xứng đúng theo cấu tạo (thêm 10/11/2026)
+
+Yêu cầu: `f(A,B,P) = −f(B,A,P)` phải đúng **với mọi bộ trọng số**, chưa cần train. Hai
+đường đạt được điều đó, cả hai đều có trong `src/molopt/evaluator/models.py`:
+
+| đầu ra | công thức | học được tương tác trong cặp |
+|---|---|---|
+| `twin` (+ `twin_edit`) | `s(B, F_B, P) − s(A, F_A, P)` | không — `s` chỉ thấy một phân tử |
+| `antisymmetric` | `⟨g(P, e), h(d)⟩`, `d = [enc(A) − enc(B), enc(F_A) − enc(F_B)]` | có — `h` phi tuyến trên hiệu |
+
+`h` là **MLP lẻ**: mọi `Linear` không bias, kích hoạt `tanh`, **không** dropout và
+**không** LayerNorm. Ba điều kiện, bỏ một cái là mất tính chất:
+
+- có bias thì `W(−x) + b ≠ −(Wx + b)`;
+- `ReLU` không lẻ — đúng chỗ anh Tiến phản biện ở dòng 123 biên bản;
+- LayerNorm trừ trung bình và cộng tham số dịch, hai phép đó phá tính lẻ.
+
+Ngữ cảnh `P` vào bằng phép **nhân** (cổng `g`), không bằng phép cộng: cộng `P` vào trong
+`h` sẽ phá tính lẻ, còn nhân thì không vì `g` không phụ thuộc `d`. Nhờ vậy `P` vẫn đổi
+được **cả độ lớn và dấu** của dự đoán — đúng chỗ ablation 07/11/2026 thấy mô hình đang
+phớt lờ `P`. Đây là điểm khác so với "mô hình tuyến tính không bias trên vector hiệu" mà
+anh Tiến nói ở dòng 135: ở đó `P` chỉ cộng thêm một số hạng không đổi dấu nên **buộc phải
+bỏ** nhánh `P` đi.
+
+**Một giới hạn phải ghi vào paper.** Tính chất đúng **tuyệt đối ở chế độ eval**, tức ở mọi
+con số được báo cáo (`asymmetry_report` chạy qua `predict`, luôn ở chế độ eval). Trong lúc
+**train** với `dropout > 0` nó chỉ đúng theo kỳ vọng: encoder dùng chung được gọi hai lần
+trong một lượt forward và mỗi lần lấy một mặt nạ dropout độc lập, nên
+`enc_{m1}(A) − enc_{m2}(B) ≠ −(enc_{m1}(B) − enc_{m2}(A))`. Đặt `model.dropout = 0` thì
+đúng tuyệt đối ở cả hai chế độ. Ghim bằng
+`test_dropout_breaks_antisymmetry_during_training_but_not_at_eval`.
+
+Ô thứ tư của bảng ablation ở mục 6 (twin **có** nhánh edit) bật bằng `model.twin_edit`.
+Trước 09/11/2026 `models.py` ghi rằng ô đó "không tồn tại được" vì một phép sửa là thuộc
+tính của **cặp**. Lập luận đó **sai**, và anh Tiến đã chỉ ra ở dòng 163: `F_A` là phần bị
+cắt khỏi `A` nên nó thuộc về `A`, `F_B` là phần lắp vào tạo `B` nên nó thuộc về `B`.
 
 ## 7. Chiều embedding ESM2 = 480, đã đo
 

@@ -23,8 +23,36 @@ Ba đầu ra tồn tại để ablation tách được hai yếu tố khác nhau
     direct vs direct_no_edit -> tác dụng riêng của NHÁNH EDIT
     direct_no_edit vs twin   -> tác dụng riêng của việc tính Δ THẲNG thay vì lấy hiệu
 
-Ô thứ tư (twin có nhánh edit) không tồn tại được: một phép sửa là thuộc tính của CẶP,
-không phải của một phân tử, nên hàm chấm điểm một phân tử không có chỗ đặt nó.
+PHẢN ĐỐI XỨNG (họp 09/11/2026). Yêu cầu là f(A, B, P) = −f(B, A, P) phải đúng do CẤU TẠO,
+với mọi bộ trọng số, chưa cần train. Hai đầu ra đạt được điều đó:
+
+    twin          : Δp = s(B) − s(A). Đổi chỗ A và B thì hai số hạng đổi chỗ -> đổi dấu.
+    antisymmetric : Δp = <g(P, e), h(d)> với d = [enc(A) − enc(B), enc(F_A) − enc(F_B)]
+                    và h là hàm LẺ (h(−d) = −h(d)). Đổi chỗ A và B thì d -> −d, nên
+                    h(d) -> −h(d) còn g(P, e) không đổi -> đầu ra đổi dấu.
+
+Vì sao `antisymmetric` cần tồn tại khi đã có `twin`: ở twin, hàm chấm điểm nhận MỘT phân
+tử, nên nó không thể biểu diễn tương tác giữa A và B (ví dụ "nhóm thế này tốt chỉ khi
+khung kia có mặt"). Ở `antisymmetric`, h là hàm phi tuyến của HIỆU hai biểu diễn, nên
+tương tác trong cặp vẫn học được mà tính chất toán học không mất. Đây là đường anh Long
+đề xuất (bỏ bias, dùng hàm kích hoạt lẻ), cộng thêm một điểm: ngữ cảnh P vào bằng phép
+NHÂN (cổng g), không bằng phép cộng. Cộng P vào trong h sẽ phá tính lẻ; nhân thì không,
+vì g không phụ thuộc d. Nhờ vậy P vẫn được phép ảnh hưởng đến cả ĐỘ LỚN và DẤU của dự
+đoán — đúng chỗ mà ablation ngày 07/11/2026 thấy mô hình đang phớt lờ P.
+
+MỘT GIỚI HẠN PHẢI GHI VÀO PAPER. Tính chất trên đúng TUYỆT ĐỐI ở chế độ eval, tức ở mọi
+con số được báo cáo. Trong lúc TRAIN với dropout > 0 thì nó chỉ đúng theo kỳ vọng: encoder
+dùng chung được gọi hai lần trong một lượt forward (một lần cho A, một lần cho B) và mỗi
+lần lấy một mặt nạ dropout độc lập, nên enc_{m1}(A) − enc_{m2}(B) không đúng bằng
+−(enc_{m1}(B) − enc_{m2}(A)). Đặt dropout = 0 thì đúng tuyệt đối ở cả hai chế độ. Xem
+test_dropout_breaks_antisymmetry_during_training_but_not_at_eval.
+
+Ô thứ tư của bảng trên (twin CÓ nhánh edit) bật bằng khóa `twin_edit`. Trước đây module
+này ghi rằng ô đó "không tồn tại được" vì một phép sửa là thuộc tính của cặp — lập luận
+đó SAI, và anh Tiến đã chỉ ra ở họp 09/11/2026: F_A là phần bị cắt khỏi A nên nó thuộc về
+A, F_B là phần lắp vào tạo B nên nó thuộc về B. Vậy s(A) nhận [enc(A), enc(F_A)] và s(B)
+nhận [enc(B), enc(F_B)], hiệu hai bên vẫn đổi dấu khi đổi chỗ cặp. Đúng công thức
+g(v_A, v_{F_A}, v_P) − g(v_B, v_{F_B}, v_P) của Task 4.
 
 Cách ghép các nhánh (khóa `fusion` trong stage3.model, việc giao ở họp 02/11/2026):
 
@@ -78,10 +106,15 @@ from torch import Tensor, nn
 HEAD_DIRECT = "direct"
 HEAD_DIRECT_NO_EDIT = "direct_no_edit"
 HEAD_TWIN = "twin"
-HEADS = (HEAD_DIRECT, HEAD_DIRECT_NO_EDIT, HEAD_TWIN)
+HEAD_ANTISYMMETRIC = "antisymmetric"
+HEADS = (HEAD_DIRECT, HEAD_DIRECT_NO_EDIT, HEAD_TWIN, HEAD_ANTISYMMETRIC)
 
 # Hai đầu ra "joint" nhìn thấy cả A và B cùng lúc trong một MLP; `twin` thì không.
 JOINT_HEADS = (HEAD_DIRECT, HEAD_DIRECT_NO_EDIT)
+
+# Hai đầu ra phản đối xứng ĐÚNG THEO CẤU TẠO: f(A, B, P) = −f(B, A, P) với mọi bộ trọng
+# số, không cần train và không cần augment. Xem ghi chú module, mục "Phản đối xứng".
+ANTISYMMETRIC_HEADS = (HEAD_TWIN, HEAD_ANTISYMMETRIC)
 
 PROTEIN_FROZEN = "frozen"
 PROTEIN_FINETUNE = "finetune"
@@ -95,7 +128,14 @@ FUSIONS = (FUSION_CONCAT, FUSION_PROJECTOR, FUSION_ATTENTION)
 
 HEAD_BLOCK_PLAIN = "plain"
 HEAD_BLOCK_RESIDUAL = "residual"
-HEAD_BLOCKS = (HEAD_BLOCK_PLAIN, HEAD_BLOCK_RESIDUAL)
+# `linear` là baseline anh Tiến giao ở họp 09/11/2026 (Task 3): bỏ HẾT phần phi tuyến —
+# không encoder, không MLP ghép — chỉ còn MỘT lớp Linear đặt ngay sau các vector đặc trưng
+# thô (fingerprint phân tử, fingerprint nhóm thế, embedding protein, embedding endpoint).
+# Ridge = chính head này với weight_decay > 0: AdamW dùng weight decay tách rời
+# (Loshchilov & Hutter 2019, ICLR, arXiv:1711.05101), nên với một lớp Linear duy nhất nó
+# đúng là số hạng phạt L2 của hồi quy Ridge.
+HEAD_BLOCK_LINEAR = "linear"
+HEAD_BLOCKS = (HEAD_BLOCK_PLAIN, HEAD_BLOCK_RESIDUAL, HEAD_BLOCK_LINEAR)
 
 # Chuẩn hóa trong head plain (khóa `head_norm`). `layernorm` đặt LayerNorm giữa Linear và
 # ReLU của mỗi lớp ẩn (Ba và cs. 2016, arXiv:1607.06450). Thêm sau khi --mode diagnose đo
@@ -142,6 +182,36 @@ def build_mlp(in_features: int, hidden: Sequence[int], out_features: int,
             layers.append(nn.Dropout(dropout))
         width = size
     layers.append(nn.Linear(width, out_features))
+    return nn.Sequential(*layers)
+
+
+def build_odd_mlp(in_features: int, hidden: Sequence[int], out_features: int
+                  ) -> nn.Sequential:
+    """MLP LẺ: h(−x) = −h(x) đúng từng bit, với mọi bộ trọng số.
+
+    Hai điều kiện, cả hai đều bắt buộc, bỏ một cái là mất tính chất:
+        1. Mọi lớp Linear KHÔNG CÓ BIAS. Có bias thì W(−x) + b ≠ −(Wx + b).
+        2. Hàm kích hoạt phải LẺ. tanh lẻ; ReLU thì không (ReLU(−x) = 0 với x > 0, đúng
+           chỗ anh Tiến phản biện ở dòng 123 biên bản 09/11/2026).
+    Hợp của các hàm lẻ là hàm lẻ, nên xếp mấy lớp cũng giữ tính chất.
+
+    KHÔNG có dropout và KHÔNG có LayerNorm ở đây, cũng là điều kiện:
+        - dropout ở chế độ train nhân một mặt nạ ngẫu nhiên, mà hai lượt forward khác nhau
+          lấy mặt nạ khác nhau, nên f(A,B) + f(B,A) = 0 chỉ còn đúng theo kỳ vọng. Ở chế
+          độ eval dropout là phép đồng nhất nên không sao, nhưng để lại thì tính chất chỉ
+          đúng lúc eval — đúng kiểu bẫy mà anh Tiến cảnh báo.
+        - LayerNorm chia cho độ lệch chuẩn (lẻ thì được) nhưng còn TRỪ trung bình và cộng
+          tham số dịch, hai phép đó phá tính lẻ.
+    Chống quá khớp cho nhánh này đặt ở encoder phía trước (encoder vẫn được phép có bias,
+    ReLU và dropout: tính chất chỉ cần đúng SAU phép lấy hiệu — xem ghi chú module).
+    """
+    layers: list[nn.Module] = []
+    width = in_features
+    for size in hidden:
+        layers.append(nn.Linear(width, size, bias=False))
+        layers.append(nn.Tanh())
+        width = size
+    layers.append(nn.Linear(width, out_features, bias=False))
     return nn.Sequential(*layers)
 
 
@@ -293,29 +363,53 @@ class EvaluatorModel(nn.Module):
             # Head residual đã có LayerNorm trước mọi ReLU; nhận im lặng thì một lần quét
             # tham số tưởng đang thử head_norm mà thật ra không đổi gì.
             raise ValueError("head_norm chỉ dùng với head_block='plain'")
+        twin_edit = bool(settings.get("twin_edit", False))
+        if head_block == HEAD_BLOCK_LINEAR:
+            # Baseline tuyến tính phải là tuyến tính TỪ ĐẦU ĐẾN CUỐI mới nói được điều gì:
+            # giữ lại lớp chiếu của projector/attention thì nó không còn là baseline nữa.
+            if fusion != FUSION_CONCAT:
+                raise ValueError("head_block='linear' chỉ dùng với fusion='concat'; "
+                                 "projector và attention đều thêm lớp chiếu phi tuyến")
+            if head == HEAD_ANTISYMMETRIC:
+                raise ValueError("head='antisymmetric' đã có đường tuyến tính riêng: đặt "
+                                 "antisymmetric_hidden=[] (một lớp Linear không bias trên "
+                                 "vector hiệu); head_block='linear' ở đây là trùng nút")
+        if head == HEAD_ANTISYMMETRIC and fusion != FUSION_CONCAT:
+            raise ValueError("head='antisymmetric' tự dựng vector hiệu nên không đi qua "
+                             "tầng ghép; chỉ dùng với fusion='concat'")
+        if twin_edit and head != HEAD_TWIN:
+            raise ValueError(f"twin_edit chỉ có nghĩa với head='twin', nhận {head!r}")
         self.head_norm = head_norm
         self.head = head
         self.protein_mode = protein_mode
         self.fusion = fusion
         self.head_block = head_block
+        self.twin_edit = twin_edit
         dropout = float(settings["dropout"])
-        ligand_out = int(settings["ligand_out"])
-        edit_out = int(settings["edit_out"])
+        # Head `linear` bỏ hẳn encoder: vector đặc trưng THÔ đi thẳng vào lớp Linear duy
+        # nhất, nên "chiều ra của nhánh" đúng bằng chiều đầu vào của nhánh.
+        raw = head_block == HEAD_BLOCK_LINEAR
+        ligand_out = ligand_bits if raw else int(settings["ligand_out"])
+        edit_out = fragment_bits if raw else int(settings["edit_out"])
 
-        self.ligand_encoder = build_mlp(ligand_bits, settings["ligand_hidden"], ligand_out,
-                                        dropout)
-        # Chỉ `direct` có nhánh edit. `direct_no_edit` tồn tại để tách tác dụng của nhánh
-        # đó khỏi tác dụng của việc tính Δ thẳng (xem bảng trong ghi chú module).
-        if head == HEAD_DIRECT:
-            self.edit_encoder = build_mlp(fragment_bits, settings["edit_hidden"], edit_out,
-                                          dropout)
-        else:
-            self.edit_encoder = None
+        self.ligand_encoder: nn.Module = (
+            nn.Identity() if raw
+            else build_mlp(ligand_bits, settings["ligand_hidden"], ligand_out, dropout))
+        # Nhánh edit có ở: `direct`, `antisymmetric`, và `twin` khi bật twin_edit (ô thứ tư
+        # của bảng trong ghi chú module). `direct_no_edit` tồn tại để tách tác dụng của
+        # nhánh đó khỏi tác dụng của việc tính Δ thẳng.
+        self.edit_encoder: nn.Module | None = None
+        if head == HEAD_DIRECT or head == HEAD_ANTISYMMETRIC or twin_edit:
+            self.edit_encoder = (
+                nn.Identity() if raw
+                else build_mlp(fragment_bits, settings["edit_hidden"], edit_out, dropout))
 
         # Thứ tự token cũng là thứ tự ghép của bản v1, nên `concat` cho đúng kết quả cũ.
-        kinds = [KIND_LIGAND] if head == HEAD_TWIN else [KIND_LIGAND, KIND_LIGAND]
+        # `twin` chấm từng phân tử nên mỗi lượt chỉ có MỘT ligand và MỘT edit.
+        single = head in (HEAD_TWIN, HEAD_ANTISYMMETRIC)
+        kinds = [KIND_LIGAND] if single else [KIND_LIGAND, KIND_LIGAND]
         if self.edit_encoder is not None:
-            kinds += [KIND_EDIT, KIND_EDIT]
+            kinds += [KIND_EDIT] if single else [KIND_EDIT, KIND_EDIT]
         if protein_mode != PROTEIN_NONE:
             kinds.append(KIND_PROTEIN)
         kinds.append(KIND_ENDPOINT)
@@ -325,10 +419,16 @@ class EvaluatorModel(nn.Module):
         self.projectors: nn.ModuleDict | None = None
         self.attention: AttentionFusion | None = None
         if fusion == FUSION_CONCAT:
-            protein_out = int(settings["protein_out"])
             endpoint_dim = int(settings["endpoint_dim"])
             self.endpoint_embedding = nn.Embedding(endpoint_count, endpoint_dim)
-            if protein_mode != PROTEIN_NONE:
+            # Head `linear` và head `antisymmetric` KHÔNG chiếu nhánh protein: lớp chiếu
+            # của bản v1 có ReLU (xem context_pieces), mà ReLU vừa phá tính tuyến tính của
+            # baseline vừa triệt tiêu nửa âm của vector protein. Hai head đó nhận thẳng
+            # vector protein, nên chiều của nhánh là protein_dim.
+            plain_protein = raw or head == HEAD_ANTISYMMETRIC
+            protein_out = int(protein_dim or 0) if plain_protein else int(
+                settings["protein_out"])
+            if protein_mode != PROTEIN_NONE and not plain_protein:
                 self.protein_projection = build_mlp(int(protein_dim), [], protein_out, 0.0)
             sizes = {KIND_LIGAND: ligand_out, KIND_EDIT: edit_out,
                      KIND_PROTEIN: protein_out, KIND_ENDPOINT: endpoint_dim}
@@ -349,12 +449,36 @@ class EvaluatorModel(nn.Module):
                     int(settings["attention_layers"]),
                     float(settings["attention_dropout"]))
 
-        if head_block == HEAD_BLOCK_RESIDUAL:
-            self.predictor: nn.Module = ResidualHead(
+        # Head `antisymmetric` không dùng `predictor`: nó có hai nhánh riêng, một nhánh LẺ
+        # trên vector hiệu và một cổng phụ thuộc ngữ cảnh (xem ghi chú module).
+        self.odd_branch: nn.Module | None = None
+        self.gate: nn.Module | None = None
+        self.predictor: nn.Module | None = None
+        if head == HEAD_ANTISYMMETRIC:
+            gate_dim = int(settings["antisymmetric_gate_dim"])
+            if gate_dim < 1:
+                raise ValueError(f"antisymmetric_gate_dim phải >= 1, nhận {gate_dim}")
+            difference_dim = ligand_out + (edit_out if self.edit_encoder is not None else 0)
+            self.odd_branch = build_odd_mlp(difference_dim,
+                                            settings["antisymmetric_hidden"], gate_dim)
+            context_dim = endpoint_dim + (0 if protein_mode == PROTEIN_NONE
+                                          else int(protein_dim or 0))
+            # Cổng được phép phi tuyến tùy ý (bias, ReLU, dropout): nó KHÔNG phụ thuộc
+            # vector hiệu, nên nó không ảnh hưởng tới tính lẻ của nhánh kia.
+            self.gate = build_mlp(context_dim, settings["antisymmetric_gate_hidden"],
+                                  gate_dim, dropout)
+        elif head_block == HEAD_BLOCK_RESIDUAL:
+            self.predictor = ResidualHead(
                 width, int(settings["residual_width"]), int(settings["residual_blocks"]),
                 float(settings.get("residual_hidden_factor", 1.0)),
                 dropout_or_default(settings.get("residual_hidden_dropout"), dropout),
                 dropout_or_default(settings.get("residual_dropout"), dropout))
+        elif head_block == HEAD_BLOCK_LINEAR:
+            # MỘT lớp Linear, không kích hoạt, không dropout. bias mặc định TẮT để head này
+            # cũng là mô hình mà anh Tiến nói ở dòng 135 biên bản ("Linear Model không
+            # bias"); bật lại bằng model.linear_bias=true nếu muốn hồi quy có chặn.
+            self.predictor = nn.Linear(width, 1, bias=bool(settings.get("linear_bias",
+                                                                        False)))
         else:
             self.predictor = build_mlp(width, settings["head_hidden"], 1, dropout,
                                        norm=head_norm == HEAD_NORM_LAYER)
@@ -363,6 +487,16 @@ class EvaluatorModel(nn.Module):
     def uses_edit_branch(self) -> bool:
         """True khi kiến trúc thực sự dùng variable_a/variable_b."""
         return self.edit_encoder is not None
+
+    @property
+    def antisymmetric_by_construction(self) -> bool:
+        """True khi f(A, B, P) = −f(B, A, P) đúng do cấu tạo, với mọi bộ trọng số.
+
+        Ghi vào manifest để phân biệt "sai số hai chiều nhỏ vì kiến trúc đảm bảo" với "sai
+        số hai chiều nhỏ vì train trên dữ liệu đã augment" — hai chuyện khác nhau, và chỉ
+        chuyện thứ nhất là điều anh Tiến yêu cầu ở họp 09/11/2026.
+        """
+        return self.head in ANTISYMMETRIC_HEADS
 
     def project(self, kind: str, vector: Tensor) -> Tensor:
         """Đưa vector của một nhánh về không gian chung; ở `concat` thì giữ nguyên."""
@@ -404,16 +538,51 @@ class EvaluatorModel(nn.Module):
         context = self.context_pieces(protein, endpoint)
         hidden_a = self.project(KIND_LIGAND, self.ligand_encoder(ligand_a))
         hidden_b = self.project(KIND_LIGAND, self.ligand_encoder(ligand_b))
+        edit_a, edit_b = self.edit_vectors(fragment_a, fragment_b)
+        if self.head == HEAD_ANTISYMMETRIC:
+            odd, gate = self.antisymmetric_parts(hidden_a, hidden_b, edit_a, edit_b, context)
+            return [torch.cat([odd, gate], dim=1)]
         if self.head == HEAD_TWIN:
-            return [self.combine([hidden_a, *context]), self.combine([hidden_b, *context])]
+            side_a = [hidden_a] + ([] if edit_a is None else [edit_a]) + list(context)
+            side_b = [hidden_b] + ([] if edit_b is None else [edit_b]) + list(context)
+            return [self.combine(side_a), self.combine(side_b)]
         pieces = [hidden_a, hidden_b]
-        if self.edit_encoder is not None:
-            if fragment_a is None or fragment_b is None:
-                raise ValueError("kiểu direct cần fingerprint của variable_a và variable_b")
-            pieces.append(self.project(KIND_EDIT, self.edit_encoder(fragment_a)))
-            pieces.append(self.project(KIND_EDIT, self.edit_encoder(fragment_b)))
+        if edit_a is not None and edit_b is not None:
+            pieces.append(edit_a)
+            pieces.append(edit_b)
         pieces.extend(context)
         return [self.combine(pieces)]
+
+    def edit_vectors(self, fragment_a: Tensor | None, fragment_b: Tensor | None
+                     ) -> tuple[Tensor | None, Tensor | None]:
+        """Hai vector nhánh edit đã mã hóa, hoặc (None, None) khi kiến trúc không có nhánh.
+
+        Cùng MỘT bộ trọng số cho F_A và F_B, như ligand encoder dùng chung cho A và B: nhờ
+        vậy ở twin và antisymmetric, đổi chỗ cặp chỉ đổi chỗ hai vector, không đổi giá trị.
+        """
+        if self.edit_encoder is None:
+            return None, None
+        if fragment_a is None or fragment_b is None:
+            raise ValueError(f"kiến trúc {self.head!r} cần fingerprint của variable_a và "
+                             f"variable_b")
+        return (self.project(KIND_EDIT, self.edit_encoder(fragment_a)),
+                self.project(KIND_EDIT, self.edit_encoder(fragment_b)))
+
+    def antisymmetric_parts(self, hidden_a: Tensor, hidden_b: Tensor, edit_a: Tensor | None,
+                            edit_b: Tensor | None, context: Sequence[Tensor]
+                            ) -> tuple[Tensor, Tensor]:
+        """(nhánh lẻ trên vector hiệu, cổng theo ngữ cảnh) của head `antisymmetric`.
+
+        Vector hiệu lấy TRƯỚC khi đi vào nhánh lẻ: d = [enc(A) − enc(B), enc(F_A) − enc(F_B)].
+        Đổi chỗ (A, B) kèm (F_A, F_B) làm d đổi dấu, nhánh lẻ đổi dấu theo, cổng không đổi.
+        """
+        if self.odd_branch is None or self.gate is None:
+            raise ValueError("head này không có nhánh phản đối xứng")
+        pieces = [hidden_a - hidden_b]
+        if edit_a is not None and edit_b is not None:
+            pieces.append(edit_a - edit_b)
+        return self.odd_branch(torch.cat(pieces, dim=1)), self.gate(
+            torch.cat(list(context), dim=1))
 
     def forward(self, ligand_a: Tensor, ligand_b: Tensor, fragment_a: Tensor | None,
                 fragment_b: Tensor | None, protein: Tensor | None,
@@ -425,8 +594,20 @@ class EvaluatorModel(nn.Module):
         protein             : vector protein, hoặc None khi protein_mode='none'
         endpoint            : mã endpoint, kiểu long
         """
+        if self.head == HEAD_ANTISYMMETRIC:
+            context = self.context_pieces(protein, endpoint)
+            edit_a, edit_b = self.edit_vectors(fragment_a, fragment_b)
+            odd, gate = self.antisymmetric_parts(
+                self.project(KIND_LIGAND, self.ligand_encoder(ligand_a)),
+                self.project(KIND_LIGAND, self.ligand_encoder(ligand_b)),
+                edit_a, edit_b, context)
+            # Tích vô hướng: cổng nhân theo từng chiều rồi cộng lại. Phép nhân giữ tính lẻ
+            # của `odd` vì `gate` không phụ thuộc vector hiệu.
+            return (odd * gate).sum(dim=1)
         vectors = self.representations(ligand_a, ligand_b, fragment_a, fragment_b, protein,
                                        endpoint)
+        if self.predictor is None:
+            raise ValueError(f"head {self.head!r} không có đầu dự đoán")
         if self.head == HEAD_TWIN:
             score_a, score_b = (self.predictor(vector) for vector in vectors)
             return (score_b - score_a).squeeze(1)

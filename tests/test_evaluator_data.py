@@ -217,6 +217,64 @@ def test_identity_sides_sets_b_to_a_and_the_label_to_zero() -> None:
     assert identity.target.tolist() == [0.0, 0.0]
 
 
+# ------------------------------------------- augment đảo chiều (Task 2, họp 09/11/2026)
+
+
+def probe_keys(arrays: data.PairArrays) -> dict[str, np.ndarray]:
+    """Cột khóa query khớp với probe_arrays."""
+    return {"molecule_a": arrays.molecule_a, "molecule_b": arrays.molecule_b,
+            "protein": arrays.protein, "endpoint": arrays.endpoint}
+
+
+def test_concat_arrays_joins_rows_and_keeps_the_slice_masks() -> None:
+    arrays = probe_arrays()
+    joined = data.concat_arrays(arrays, data.swap_sides(arrays))
+    assert len(joined) == 2 * len(arrays)
+    assert joined.target.tolist() == [1.5, -0.5, -1.5, 0.5]
+    assert joined.slices["strict"].tolist() == [True, False, True, False]
+
+
+def test_concat_arrays_refuses_mismatched_slices() -> None:
+    arrays = probe_arrays()
+    other = data.PairArrays(
+        molecule_a=arrays.molecule_a, molecule_b=arrays.molecule_b,
+        fragment_a=arrays.fragment_a, fragment_b=arrays.fragment_b,
+        protein=arrays.protein, endpoint=arrays.endpoint, target=arrays.target,
+        slices={"all": arrays.slices["all"]})
+    with pytest.raises(ValueError, match="lát cắt"):
+        data.concat_arrays(arrays, other)
+
+
+def test_augment_reverse_doubles_the_rows_and_negates_the_added_labels() -> None:
+    arrays = probe_arrays()
+    doubled, keys = data.augment_reverse(arrays, probe_keys(arrays))
+    assert len(doubled) == 4
+    # Nửa đầu giữ nguyên dữ liệu gốc: mọi con số cũ vẫn tái lập được.
+    assert doubled.target.tolist()[:2] == arrays.target.tolist()
+    assert doubled.target.tolist()[2:] == [-1.5, 0.5]
+    assert doubled.molecule_a.tolist()[2:] == arrays.molecule_b.tolist()
+    assert doubled.fragment_a.tolist()[2:] == arrays.fragment_b.tolist()
+
+
+def test_augment_reverse_swaps_the_query_keys_the_same_way() -> None:
+    # Nếu khóa query không đổi chỗ theo, dòng augment sẽ bị gom vào query của chiều xuôi
+    # và mọi chỉ số ranking theo query thành vô nghĩa.
+    arrays = probe_arrays()
+    _, keys = data.augment_reverse(arrays, probe_keys(arrays))
+    assert keys["molecule_a"].tolist() == (arrays.molecule_a.tolist()
+                                           + arrays.molecule_b.tolist())
+    assert keys["molecule_b"].tolist() == (arrays.molecule_b.tolist()
+                                           + arrays.molecule_a.tolist())
+    assert keys["protein"].tolist() == arrays.protein.tolist() * 2
+    assert keys["endpoint"].tolist() == arrays.endpoint.tolist() * 2
+
+
+def test_augment_reverse_keeps_the_label_distribution_symmetric() -> None:
+    """Tổng nhãn sau augment đúng bằng 0: đó là dấu hiệu dễ kiểm nhất của phép đảo chiều."""
+    doubled, _ = data.augment_reverse(probe_arrays(), probe_keys(probe_arrays()))
+    assert float(doubled.target.sum()) == pytest.approx(0.0)
+
+
 
 # ------------------------------------------------- gom batch theo protein (finetune)
 

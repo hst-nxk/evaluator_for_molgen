@@ -6,7 +6,9 @@
     python scripts/build_identity_split.py verify --identity 0.5 \\
             --clusters runs/dataset/mmseqs_v4b/p50_cluster.tsv
 
-Script CHỈ ĐỌC thư mục dữ liệu; mọi thứ nó ghi đều nằm trong work/splits.
+Script CHỈ ĐỌC thư mục dữ liệu; mọi thứ nó ghi đều nằm trong splits/ (xem
+OUTPUT_DIR). Thư mục đó ĐƯỢC git theo dõi, nên bảng sang server bằng `git pull`;
+khác với scripts/build_train_subset.py ghi vào work/splits/ và phải scp.
 
 VÌ SAO CÓ FILE NÀY. Kết quả tuần 03-08/11/2026 loại được bảy nguyên nhân của trần 0,566
 và còn đúng một nguyên nhân: mô hình không tổng quát hóa sang HỌ PROTEIN chưa thấy. Phép
@@ -294,7 +296,7 @@ def main() -> int:
     builder = subparsers.add_parser("build", help="dựng bảng đổi partition")
     builder.add_argument("--identity", type=float, required=True)
     builder.add_argument("--clusters", required=True, help="file *_cluster.tsv của MMseqs2")
-    builder.add_argument("--out", default="", help="mặc định work/splits/...")
+    builder.add_argument("--out", default="", help="mặc định splits/...")
     builder.set_defaults(handler=run_build)
 
     checker = subparsers.add_parser("verify", help="so bảng dựng lại với cách chia đang dùng")

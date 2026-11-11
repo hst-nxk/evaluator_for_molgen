@@ -53,6 +53,10 @@ MINIMUM_KEYS = {"min_n_assays": "n_assays", "min_n_documents": "n_documents",
 
 # Cột khóa và cột giá trị của bảng đổi partition (xem load_partition_override).
 OVERRIDE_COLUMNS = ("protein_hash", "partition")
+# Cột khóa của bảng subset train (xem load_train_subset). Một cột duy nhất: pair_id.
+SUBSET_COLUMN = "pair_id"
+# Bảng subset đã đọc, theo đường dẫn tuyệt đối; cùng lý do có cache như _OVERRIDE_CACHE.
+_SUBSET_CACHE: dict[Path, pa.Array] = {}
 # Bảng đổi partition đã đọc, theo đường dẫn tuyệt đối. Có cache vì read_columns được gọi
 # lại nhiều lần trong một lần chạy (train, validation, từng lát cắt) và bảng này chỉ vài
 # nghìn dòng nhưng nằm trên đĩa; đọc lại mỗi lần là tốn vô ích.
@@ -111,6 +115,43 @@ def apply_partition_override(table: pa.Table, override: tuple[pa.Array, pa.Array
                          f"ví dụ {unknown.to_pylist()[:3]}")
     replaced = pc.take(values, position)
     return table.set_column(table.schema.get_field_index("partition"), "partition", replaced)
+
+
+def load_train_subset(config: Mapping[str, Any], root: Path) -> pa.Array | None:
+    """Đọc bảng pair_id của subset train nếu config khai báo; không khai báo thì None.
+
+    Nhận: config, thư mục gốc. Trả về: mảng pair_id được giữ, hoặc None.
+
+    Vì sao có đường này (họp 09/11/2026, Task 2): anh Tiến yêu cầu train thử trên một
+    subset nhỏ (~100.000 dòng từ 200 nhóm Context P nhiều dữ liệu nhất) thay vì 6,6 triệu
+    dòng, để một vòng thí nghiệm mất 30 phút chứ không mất 2-3 tiếng. Giống bảng đổi
+    partition, subset KHÔNG dựng lại dataset: nó chỉ là danh sách dòng được giữ, và hai
+    cache (fingerprint, embedding) vẫn dùng chung vì chúng đánh khóa theo phân tử và theo
+    protein, không theo dòng.
+
+    CHỈ áp cho partition train. Validation phải giữ nguyên để mọi con số cũ còn so được —
+    đúng như anh Tiến chốt ở dòng 99 biên bản ("tập Validation hiện tại thì cứ giữ nguyên").
+    """
+    setting = str(config["stage3"]["inputs"].get("train_subset") or "").strip()
+    if not setting:
+        return None
+    path = (root / setting).resolve()
+    cached = _SUBSET_CACHE.get(path)
+    if cached is not None:
+        return cached
+    if not path.is_file():
+        raise FileNotFoundError(f"chưa có bảng subset train {path}; dựng bằng "
+                                f"scripts/build_train_subset.py")
+    table = pq.read_table(path, columns=[SUBSET_COLUMN])
+    keys = table.column(SUBSET_COLUMN).combine_chunks()
+    if isinstance(keys, pa.ChunkedArray):
+        keys = keys.chunk(0) if keys.num_chunks == 1 else pa.concat_arrays(keys.chunks)
+    if not len(keys):
+        raise ValueError(f"{path} rỗng; subset phải có ít nhất một dòng")
+    if len(set(keys.to_pylist())) != len(keys):
+        raise ValueError(f"{path} có pair_id trùng; mỗi dòng chỉ được xuất hiện một lần")
+    _SUBSET_CACHE[path] = keys
+    return keys
 
 
 @dataclass(frozen=True)
@@ -198,21 +239,26 @@ def read_columns(config: Mapping[str, Any], root: Path, partition: str,
     được ghi theo thứ tự (endpoint, bucket protein) nên phần đầu vẫn đủ nhiều protein và
     nhiều cặp để kiểm tra pipeline, mà kết quả cố định giữa các lần chạy smoke.
 
-    Đây là CHỖ DUY NHẤT trong Stage 3 lọc theo partition, nên bảng đổi partition của
-    config cũng chỉ cần áp ở đây là mọi đường đọc (train, eval, errors, features) đều
-    theo cùng một cách chia.
+    Đây là CHỖ DUY NHẤT trong Stage 3 lọc theo partition, nên bảng đổi partition và bảng
+    subset train của config cũng chỉ cần áp ở đây là mọi đường đọc (train, eval, errors,
+    features) đều theo cùng một cách chia và cùng một subset.
     """
     check_partition(partition, allow_test)
     path = root / config["stage3"]["inputs"]["evaluator"]
     if not path.is_file():
         raise FileNotFoundError(f"chưa có {path}; chạy Stage 2b --mode export trước")
     override = load_partition_override(config, root)
+    # Subset CHỈ áp cho train (xem load_train_subset): đọc validation hay test thì bỏ qua.
+    subset = load_train_subset(config, root) if partition == TRAIN else None
     wanted = list(columns)
     if "partition" not in wanted:
         wanted.append("partition")
-    extra_key = override is not None and "protein_hash" not in wanted
-    if extra_key:
-        wanted.append("protein_hash")
+    extra: list[str] = []
+    if override is not None and "protein_hash" not in wanted:
+        extra.append("protein_hash")
+    if subset is not None and SUBSET_COLUMN not in wanted:
+        extra.append(SUBSET_COLUMN)
+    wanted.extend(extra)
     handle = pq.ParquetFile(path)
     chunks: list[pa.Table] = []
     rows = 0
@@ -221,6 +267,8 @@ def read_columns(config: Mapping[str, Any], root: Path, partition: str,
         if override is not None:
             table = apply_partition_override(table, override)
         table = table.filter(pc.equal(table.column("partition"), partition))
+        if subset is not None and table.num_rows:
+            table = table.filter(pc.is_in(table.column(SUBSET_COLUMN), value_set=subset))
         if not table.num_rows:
             continue
         if limit is not None and rows + table.num_rows > limit:
@@ -230,10 +278,16 @@ def read_columns(config: Mapping[str, Any], root: Path, partition: str,
         if limit is not None and rows >= limit:
             break
     if not chunks:
-        raise ValueError(f"partition {partition!r} không có dòng nào trong {path}")
+        raise ValueError(f"partition {partition!r} không có dòng nào trong {path}"
+                         + ("; bảng subset train có thể dựng từ lần export khác"
+                            if subset is not None else ""))
     result = pa.concat_tables(chunks)
-    if extra_key:
-        result = result.drop_columns(["protein_hash"])
+    if extra:
+        result = result.drop_columns(extra)
+    if subset is not None and rows != len(subset) and limit is None:
+        raise ValueError(f"bảng subset train có {len(subset):,} pair_id nhưng chỉ khớp "
+                         f"{rows:,} dòng của partition train; subset dựng từ lần export "
+                         f"khác, hoặc đang dùng chung với partition_override khác lúc dựng")
     return result
 
 
@@ -317,10 +371,20 @@ def take_rows(arrays: PairArrays, rows: np.ndarray) -> PairArrays:
 def swap_sides(arrays: PairArrays) -> PairArrays:
     """Cùng dữ liệu nhưng đổi chỗ hai phía A và B; nhãn đổi dấu.
 
-    Dùng để ĐO mức bất đối xứng của đầu ra `direct`: nếu mô hình đối xứng hoàn toàn thì
-    f(A, B) = −f(B, A). Kiến trúc `twin` đối xứng do xây dựng, `direct` thì không, và dự
-    án chọn đo mức lệch thay vì cưỡng chế nó (xem docs/STAGE3_EVALUATOR.md).
-    Đây là đầu vào NHÂN TẠO cho mục đích chẩn đoán, không bao giờ dùng để train.
+    HAI công dụng, cả hai đều hợp lệ:
+
+    1. ĐO mức bất đối xứng của đầu ra `direct`: nếu mô hình đối xứng hoàn toàn thì
+       f(A, B) = −f(B, A). `twin` và `antisymmetric` đối xứng do xây dựng, `direct` thì
+       không (xem docs/STAGE3_EVALUATOR.md).
+    2. AUGMENT dữ liệu train (họp 09/11/2026, Task 2), bật bằng
+       stage3.train.augment_reverse. Trước ngày 09/11/2026 docstring này ghi "không bao
+       giờ dùng để train", và điều đó đã sai: cặp (B, A) với nhãn −Δp không phải dữ liệu
+       bịa, nó là cùng một phép đo đọc theo chiều ngược. Dataset chỉ lưu một chiều vì
+       Stage 2b chốt hướng theo chỉ số dòng (xem molopt.dataset.mmp), tức hướng lưu là
+       TÙY Ý so với dấu nhãn — nên chiều ngược là thông tin đã có, chỉ chưa được viết ra.
+
+    CHỈ augment train. Augment validation sẽ nhân đôi mẫu số và làm mọi con số cũ không
+    so được nữa.
     """
     return PairArrays(
         molecule_a=arrays.molecule_b, molecule_b=arrays.molecule_a,
@@ -328,6 +392,44 @@ def swap_sides(arrays: PairArrays) -> PairArrays:
         protein=arrays.protein, endpoint=arrays.endpoint,
         target=-arrays.target, slices=arrays.slices,
     )
+
+
+def concat_arrays(first: PairArrays, second: PairArrays) -> PairArrays:
+    """Nối hai PairArrays thành một; các lát cắt phải cùng tên."""
+    if set(first.slices) != set(second.slices):
+        raise ValueError(f"hai mảng có lát cắt khác nhau: {sorted(first.slices)} và "
+                         f"{sorted(second.slices)}")
+    return PairArrays(
+        molecule_a=np.concatenate([first.molecule_a, second.molecule_a]),
+        molecule_b=np.concatenate([first.molecule_b, second.molecule_b]),
+        fragment_a=np.concatenate([first.fragment_a, second.fragment_a]),
+        fragment_b=np.concatenate([first.fragment_b, second.fragment_b]),
+        protein=np.concatenate([first.protein, second.protein]),
+        endpoint=np.concatenate([first.endpoint, second.endpoint]),
+        target=np.concatenate([first.target, second.target]),
+        slices={name: np.concatenate([mask, second.slices[name]])
+                for name, mask in first.slices.items()},
+    )
+
+
+def augment_reverse(arrays: PairArrays, keys: Mapping[str, np.ndarray]
+                    ) -> tuple[PairArrays, dict[str, np.ndarray]]:
+    """Thêm chiều ngược (B, A, F_B, F_A, P) -> −Δp vào sau dữ liệu gốc.
+
+    Nhận: mảng của partition TRAIN; các cột khóa query của chính partition đó.
+    Trả về: (mảng đã nhân đôi, khóa đã nhân đôi) — số dòng gấp đúng hai lần.
+
+    Khóa query phải đổi chỗ A và B theo cùng cách, nếu không các chỉ số ranking sẽ gom
+    dòng augment vào query của chiều xuôi và mọi con số theo query thành vô nghĩa.
+    """
+    doubled = concat_arrays(arrays, swap_sides(arrays))
+    swapped = {
+        "molecule_a": np.concatenate([keys["molecule_a"], keys["molecule_b"]]),
+        "molecule_b": np.concatenate([keys["molecule_b"], keys["molecule_a"]]),
+        "protein": np.concatenate([keys["protein"]] * 2),
+        "endpoint": np.concatenate([keys["endpoint"]] * 2),
+    }
+    return doubled, swapped
 
 
 def identity_sides(arrays: PairArrays) -> PairArrays:

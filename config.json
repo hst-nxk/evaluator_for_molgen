@@ -510,6 +510,8 @@
     "inputs": {
       "evaluator": "data/dataset_v4/evaluator_training.parquet",
       "proteins": "data/dataset_v4/full/proteins.parquet",
+      "train_subset": "",
+      "train_subset_note": "Rỗng = train trên toàn bộ partition train. Đặt đường dẫn một bảng parquet có cột pair_id thì partition TRAIN chỉ còn các dòng có pair_id trong bảng đó; validation và test KHÔNG bị ảnh hưởng. Dùng cho việc 2 họp 09/11/2026: anh Tiến yêu cầu debug trên ~100.000 dòng từ 200 nhóm Context P nhiều dữ liệu nhất để một vòng thí nghiệm mất 30 phút thay vì 2-3 tiếng, và chốt giữ nguyên tập validation hiện tại (dòng 99 biên bản). Không dựng lại dataset: cache fingerprint và cache embedding đánh khoá theo phân tử và theo protein nên dùng chung được. Bảng dựng bằng scripts/build_train_subset.py.",
       "partition_override": "",
       "partition_override_note": "Rỗng = dùng cột partition có sẵn trong dataset. Đặt đường dẫn một bảng parquet hai cột (protein_hash, partition) thì mọi đường đọc dữ liệu của Stage 3 sẽ thay cột partition theo bảng đó. Dùng cho thí nghiệm đổi ngưỡng giống nhau của protein khi chia tập (30 %, 50 %, 80 %) mà KHÔNG dựng lại dataset: cách chia chỉ phụ thuộc protein, nên chỉ cột partition đổi, còn cache fingerprint và cache embedding vẫn dùng lại được vì chúng đánh khoá theo phân tử và theo protein. Bảng dựng bằng scripts/build_identity_split.py."
     },
@@ -570,7 +572,16 @@
       "attention_layers": 2,
       "attention_dropout": 0.1,
       "head_block": "plain",
+      "head_block_note": "plain = MLP thường như v1 | residual = ResNet cho dữ liệu dạng vector (Gorishniy và cs. 2021, arXiv:2106.11959) | linear = MỘT lớp Linear duy nhất đặt ngay sau các vector đặc trưng THÔ, bỏ hết encoder và MLP ghép. head_block=linear là baseline Task 3 của họp 09/11/2026 (dòng 173, 246 biên bản); Ridge = chính nó với weight_decay > 0. Chỉ dùng được với fusion=concat.",
       "head_norm": "none",
+      "twin_edit": false,
+      "twin_edit_note": "Chỉ có nghĩa với head=twin. true thì nhánh edit được cấp cho twin và F_A đi cùng A, F_B đi cùng B: Δp = s(B, F_B, P) − s(A, F_A, P). Đúng công thức Task 4 họp 09/11/2026 (dòng 163, 248 biên bản). Trước đó models.py ghi rằng ô này 'không tồn tại được' vì phép sửa là thuộc tính của cặp — lập luận đó sai, F_A là phần bị cắt khỏi A nên nó thuộc về A. Hiệu hai nhánh vẫn đổi dấu khi đổi chỗ cặp, nên tính phản đối xứng không mất.",
+      "linear_bias": false,
+      "linear_bias_note": "Chỉ có nghĩa với head_block=linear. false (mặc định) = lớp Linear không có bias, đúng mô hình anh Tiến nói ở dòng 135 biên bản 09/11/2026. true = có chặn, tức hồi quy tuyến tính thông thường.",
+      "antisymmetric_hidden": [256, 128],
+      "antisymmetric_gate_hidden": [128],
+      "antisymmetric_gate_dim": 64,
+      "antisymmetric_note": "Chỉ có nghĩa với head=antisymmetric. Kiến trúc: Δp = <g(P, e), h(d)> với d = [enc(A) − enc(B), enc(F_A) − enc(F_B)]. h là MLP LẺ (mọi Linear không bias, kích hoạt tanh, không dropout, không LayerNorm) nên h(−d) = −h(d); g là MLP thường trên [protein, endpoint] nên nó được phép phi tuyến tuỳ ý. Đổi chỗ (A, B) làm d đổi dấu, h đổi dấu theo, g không đổi, nên đầu ra đổi dấu — phản đối xứng ĐÚNG THEO CẤU TẠO, không cần train và không cần augment. antisymmetric_hidden là các lớp ẩn của h (đặt [] thì h là một lớp Linear không bias duy nhất, tức mô hình tuyến tính trên vector hiệu mà anh Tiến nói ở dòng 135); antisymmetric_gate_hidden là các lớp ẩn của g; antisymmetric_gate_dim là số chiều của tích vô hướng cuối. Ngữ cảnh P vào bằng phép NHÂN chứ không phải phép cộng, vì cộng P vào trong h sẽ phá tính lẻ — nhờ vậy P vẫn ảnh hưởng được tới cả độ lớn và dấu, đúng chỗ ablation 07/11/2026 thấy mô hình đang phớt lờ P. MỌI CON SỐ KÍCH THƯỚC Ở ĐÂY CHƯA CÓ NGUỒN.",
       "ligand_features": "fingerprint",
       "ligand_features_note": "Nhanh phan tu dung gi lam dau vao: fingerprint = Morgan 2048 bit nhu v1 (MAC DINH, giu nguyen moi ket qua da do); embedding = vector tu stage3.molecule_encoder (MoLFormer), doi bang --set model.ligand_features=embedding. Doi sang embedding thi PHAI dung cache truoc bang: python run_evaluator.py --mode prepare --molecule-embeddings. Nhanh edit (variable_a/variable_b) VAN dung fingerprint trong ca hai che do, co y: hai cot do chua nhom the co diem gan ket, con MoLFormer pretrain tren SMILES phan tu hoan chinh nen chua chac doc dung manh; tach rieng nhu vay thi ablation chi doi DUNG MOT thu la cach bieu dien phan tu. Chieu dau vao cua nhanh phan tu lay tu metadata cache chu khong hardcode.",
       "head_norm_note": "Chỉ dùng khi head_block = plain. none = MLP head như v1 (Linear, ReLU, Dropout). layernorm = Linear, LayerNorm, ReLU, Dropout ở mỗi lớp ẩn của head: chuẩn hóa tổng đầu vào ngay trước hàm kích hoạt như Ba và cs. 2016 (arXiv:1607.06450), giống khối Prediction ReLU(Norm(x)) của Gorishniy và cs. 2021 (arXiv:2106.11959). Lý do thêm: lần train 06/11/2026 fusion=projector + plain sụp, --mode diagnose đo được predictor.1 chết 100 % (512/512 nơ-ron không bao giờ bật trên 20.000 dòng validation), dự đoán hằng số 0,0024. LayerNorm trước ReLU làm đầu vào ReLU có trung bình 0 theo từng mẫu nên giảm nguy cơ cả lớp chết cùng lúc; KHÔNG bảo đảm tuyệt đối (gain/bias của LayerNorm vẫn học được). Bật bằng --set model.head_norm=layernorm.",
@@ -587,7 +598,8 @@
     "train": {
       "configurations": ["frozen", "finetune", "no_protein"],
       "head": "direct",
-      "heads": ["direct", "direct_no_edit", "twin"],
+      "heads": ["direct", "direct_no_edit", "twin", "antisymmetric"],
+      "heads_note": "direct = dự đoán Δp thẳng từ cả A và B (mặc định, mọi kết quả cũ) | direct_no_edit = như direct nhưng bỏ nhánh edit | twin = chấm riêng từng phân tử rồi lấy hiệu, phản đối xứng do cấu tạo; bật model.twin_edit để F_A đi cùng A và F_B đi cùng B | antisymmetric = hàm lẻ trên vector hiệu, nhân với cổng theo ngữ cảnh; phản đối xứng do cấu tạo và vẫn học được tương tác trong cặp. Hai head sau là Task 4 họp 09/11/2026.",
       "batch_size": 512,
       "learning_rate": 0.001,
       "protein_learning_rate": 0.00001,
@@ -595,6 +607,11 @@
       "epochs": 10,
       "loss": "huber",
       "huber_delta": 1.0,
+      "loss_note": "huber hoặc mse. MẶC ĐỊNH LÀ HUBER, và mọi lần chạy từ 31/10/2026 đến 09/11/2026 đều là huber vì không script server nào ghi đè khoá này. Ở họp 09/11/2026 (dòng 65, 69 biên bản) nhóm đã ghi nhận nhầm là MSE, nên bảng chẩn đoán của việc 7 phải nói rõ objective thật. Vì sao chuyện này quan trọng chứ không chỉ là tên gọi: huber_delta = 1.0 nghĩa là hàm bình phương khi |sai số| <= 1 và TUYẾN TÍNH khi vượt 1, mà 18,29 % dòng train có |Δp| > 1 (lát cliff), nên objective đang hạ trọng số đúng các ca activity cliff. Chạy --set loss=mse để đo chênh lệch.",
+      "label_normalization": "none",
+      "label_normalization_note": "none (mặc định, giữ nguyên mọi kết quả cũ) | scale (chia cho độ lệch chuẩn của train, KHÔNG trừ trung bình) | zscore (trừ trung bình rồi chia độ lệch chuẩn) | minmax (đưa về [0, 1]). Mọi tham số CHỈ tính trên partition train rồi áp công thức sang validation (anh Tiến chốt ở dòng 219 biên bản 09/11/2026), và mọi chỉ số báo cáo vẫn ở đơn vị Δp gốc nên so được với số cũ. CẢNH BÁO quan trọng, phát hiện khi dựng code ngày 10/11/2026: zscore và minmax có phép DỊCH khác 0 nên chúng phá tính phản đối xứng của nhãn — ảnh của −y không còn là −(ảnh của y). Vì vậy chúng KHÔNG dùng được cùng augment_reverse, cũng không dùng được với head twin hay antisymmetric; code báo lỗi thay vì chạy âm thầm. Muốn vừa chuẩn hoá vừa giữ phản đối xứng thì dùng scale.",
+      "augment_reverse": false,
+      "augment_reverse_note": "true thì mỗi dòng train (A, B, F_A, F_B, P) -> Δp được thêm một dòng đảo chiều (B, A, F_B, F_A, P) -> −Δp, nên partition train gấp đôi số dòng. CHỈ áp cho train; validation giữ nguyên để mẫu số không đổi. Đây là việc 2 họp 09/11/2026 (dòng 103, 113, 243 biên bản). Chiều ngược không phải dữ liệu bịa: Stage 2b chốt hướng lưu cặp theo chỉ số dòng (xem molopt.dataset.mmp) nên hướng lưu là tuỳ ý so với dấu nhãn, tức chiều ngược là thông tin đã có mà chưa được viết ra. Lưu ý khi đọc kết quả: với head twin và antisymmetric, augment KHÔNG thêm thông tin nào vì kiến thức đó đã nằm trong kiến trúc.",
       "early_stopping_patience": 2,
       "accumulate_steps": 1,
       "accumulate_steps_note": "Gop bao nhieu batch con lai roi moi cap nhat tham so mot lan. 1 = cap nhat moi batch (mac dinh, giong truoc gio). Chi co y nghia o cau hinh finetune, noi vong train gom batch theo protein: khi do 98,5 phan tram batch chi chua DUNG MOT protein, nen gradient cua mot buoc rat lech so voi lay mau ngau nhien (do duoc 54,1 protein moi batch). Cong don vai batch roi moi buoc thi huong di lai tron nhieu protein, ma bo nho van thap vi moi luc chi giu mot batch con trong do thi. CHUA CO NGUON cho gia tri cu the; dot chay 01/11/2026 quet 1 va 8 de do xem co anh huong that khong. Luu y: so buoc moi epoch chia cho accumulate_steps, nen eval_every_steps phai chia theo neu muon giu nguyen nhip do.",
@@ -615,7 +632,9 @@
         "projectors": 1.0,
         "attention": 1.0,
         "endpoint_embedding": 1.0,
-        "predictor": 1.0
+        "predictor": 1.0,
+        "odd_branch": 1.0,
+        "gate": 1.0
       },
       "branch_learning_rate_scale_note": "He so NHAN learning_rate rieng cho tung nhanh cua EvaluatorModel. Moi nhanh deu liet ke san o 1,0 de --set cham duoc tung cai mot; nhanh nao con he so 1,0 thi KHONG duoc tach thanh nhom rieng, nen dat het 1,0 la dung y hanh vi cu (mot nhom duy nhat). Ten nhanh hop le: ligand_encoder, edit_encoder, protein_projection, projectors, attention, endpoint_embedding, predictor (train.BRANCH_MODULES). Can cu: Wang W, Tran D, Feiszli M. What Makes Training Multi-Modal Classification Networks Hard? CVPR 2020, arXiv:1905.12681 — nguyen nhan thu hai ho neu la cac mo thuc qua khop va tong quat hoa voi TOC DO KHAC NHAU, nen train chung bang mot chien luoc toi uu la duoi muc toi uu; ho giai bang Gradient Blending (dat hon nhieu). Bai bao KHONG cho con so he so nao, nen moi gia tri dat o day la tham so can quet, CHUA CO NGUON.",
       "sharpness": {

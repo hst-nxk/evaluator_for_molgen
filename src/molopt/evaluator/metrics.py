@@ -360,18 +360,37 @@ def asymmetry_metrics(forward: np.ndarray, backward: np.ndarray, identity: np.nd
 
 
 def format_asymmetry(label: str, scores: Mapping[str, float | None]) -> list[str]:
-    """Một dòng log cho số đo bất đối xứng; None in thành '-'."""
+    """Hai dòng log cho số đo bất đối xứng; None in thành '-'.
+
+    Dòng thứ hai in giá trị LỚN NHẤT theo ký hiệu khoa học và đối chiếu với mốc 1e-8 của
+    anh Tiến (họp 09/11/2026, dòng 141). Phải dùng ký hiệu khoa học: ở kiến trúc phản đối
+    xứng đúng theo cấu tạo, con số này cỡ 1e-8 trở xuống, mà `%.4f` sẽ in thành 0,0000 —
+    tức không phân biệt được "đạt mốc" với "bằng 0 vì model đoán hằng số".
+    """
 
     def show(value: object) -> str:
         if value is None:
             return "-"
         return f"{value:.4f}" if isinstance(value, float) else f"{value:,}"
 
-    return [f"{label}: n = {show(scores.get('n'))}"
-            f" | |f(A,B)+f(B,A)|/2 trung bình {show(scores.get('antisymmetry_mean_abs'))}"
-            f" (= {show(scores.get('antisymmetry_over_label_spread'))} lần sd nhãn)"
-            f" | |f(A,A)| trung bình {show(scores.get('identity_mean_abs'))}"
-            f" (= {show(scores.get('identity_over_label_spread'))} lần sd nhãn)"]
+    def exact(value: object) -> str:
+        return "-" if value is None else f"{float(value):.3e}"
+
+    target = scores.get("antisymmetry_target")
+    meets = scores.get("meets_target")
+    verdict = "-" if meets is None else ("ĐẠT" if meets else "CHƯA ĐẠT")
+    lines = [f"{label}: n = {show(scores.get('n'))}"
+             f" | |f(A,B)+f(B,A)|/2 trung bình {show(scores.get('antisymmetry_mean_abs'))}"
+             f" (= {show(scores.get('antisymmetry_over_label_spread'))} lần sd nhãn)"
+             f" | |f(A,A)| trung bình {show(scores.get('identity_mean_abs'))}"
+             f" (= {show(scores.get('identity_over_label_spread'))} lần sd nhãn)"]
+    if target is not None:
+        lines.append(
+            f"{label}: lớn nhất |f(A,B)+f(B,A)|/2 = "
+            f"{exact(scores.get('antisymmetry_max'))} so với mốc {exact(target)} -> "
+            f"{verdict} | phản đối xứng do cấu tạo: "
+            f"{'có' if scores.get('antisymmetric_by_construction') else 'không'}")
+    return lines
 
 
 def format_metrics(label: str, regression: Mapping[str, float | None],
