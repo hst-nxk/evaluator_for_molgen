@@ -1162,11 +1162,43 @@ SELECT_MAE = "mae"
 SELECT_PAIRWISE_MACRO = "pairwise_accuracy_macro"
 SELECTION_METRICS = (SELECT_MAE, SELECT_PAIRWISE_MACRO)
 
+# Lát cắt validation dùng để chọn checkpoint (stage3.train.selection_slice). Mặc định
+# 'all' để mọi số đo trước 12/11/2026 vẫn tái tạo được.
+SELECTION_SLICE_DEFAULT = "all"
+
+
+def resolve_selection_slice(train_settings: Mapping[str, Any],
+                            metrics_settings: Mapping[str, Any],
+                            slice_rows: Mapping[str, int] | None = None) -> str:
+    """Tên lát cắt dùng để chọn checkpoint và dừng sớm; mặc định ``'all'``.
+
+    Nhận: ``stage3.train``; ``stage3.metrics``; (tuỳ chọn) số dòng validation của từng
+    lát, để chặn lát rỗng NGAY TRƯỚC khi train thay vì sau vài giờ GPU.
+
+    VÌ SAO có tham số này. Lát 'all' của validation có 14,05 % dòng mà cặp (A, B) đã xuất
+    hiện trong train, và mô hình tra lại được nhãn train của chính cặp đó: đo 11/11/2026
+    trên 66.628 dòng trùng cặp, tương quan dự đoán với nhãn TRAIN là 0,8045 (MAE 0,2896)
+    còn với nhãn THẬT của validation chỉ 0,4477 (MAE 0,4615). Chọn checkpoint theo lát
+    'all' tức là chọn checkpoint học thuộc giỏi nhất. Đo 12/11/2026 cho thấy hai lát còn
+    ĐẢO thứ tự xếp hạng giữa Morgan và MoLFormer (−0,0047 trên 'all' thành +0,0151 trên
+    'strict'), nên đây không phải chênh lệch một hằng số.
+    """
+    name = str(train_settings.get("selection_slice", SELECTION_SLICE_DEFAULT))
+    known = [str(item["name"]) for item in metrics_settings["slices"]]
+    if name not in known:
+        raise ValueError(f"selection_slice phải là một lát cắt đã khai báo trong "
+                         f"stage3.metrics.slices ({known}), nhận {name!r}")
+    if slice_rows is not None and not int(slice_rows.get(name, 0)):
+        raise ValueError(f"lát cắt {name!r} không có dòng validation nào nên không chọn "
+                         f"được checkpoint theo nó; kiểm lại stage3.metrics.slices")
+    return name
+
 
 def selection_score(scores: Mapping[str, Any], selection: str) -> float | None:
     """Điểm để so mốc đo, quy về dạng "nhỏ hơn là tốt"; None nếu chưa đo được.
 
-    Nhận: khối chỉ số của lát cắt 'all' (kết quả ``evaluate``); tên chỉ số chọn.
+    Nhận: khối chỉ số của lát cắt được chọn (``stage3.train.selection_slice``, mặc định
+    'all'; kết quả ``evaluate``); tên chỉ số chọn.
     """
     if selection == SELECT_MAE:
         return scores["regression"]["mae"]
@@ -1314,7 +1346,17 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
     if selection not in SELECTION_METRICS:
         raise ValueError(f"selection_metric phải là một trong {SELECTION_METRICS}, "
                          f"nhận {selection!r}")
-    LOGGER.info("chọn checkpoint theo: %s", selection)
+    slice_rows = {name: int(np.count_nonzero(mask))
+                  for name, mask in validation_arrays.slices.items()}
+    selection_slice = resolve_selection_slice(settings, config["stage3"]["metrics"],
+                                              slice_rows)
+    if selection_slice == SELECTION_SLICE_DEFAULT:
+        LOGGER.info("chọn checkpoint theo: %s (lát %s)", selection, selection_slice)
+    else:
+        LOGGER.info("chọn checkpoint theo: %s trên lát %s (%s/%s dòng validation); các "
+                    "số của lát 'all' trong manifest KHÔNG phải số được tối ưu",
+                    selection, selection_slice, f"{slice_rows[selection_slice]:,}",
+                    f"{len(validation_arrays):,}")
     history: list[dict[str, Any]] = []
     best_score = math.inf
     best_point = -1
@@ -1333,11 +1375,15 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         prediction = predict(model, validation_arrays, caches, protein_source, device,
                              eval_batch_size, scaler)
         scores = evaluate(validation_arrays, prediction, validation_keys, config)
-        score = selection_score(scores["all"], selection)
+        score = selection_score(scores[selection_slice], selection)
         label = f"epoch {epoch}" if step is None else f"epoch {epoch} bước {step}"
         record: dict[str, Any] = {"epoch": epoch, "step": step,
                                   "validation": scores["all"],
                                   "seconds": round(time.perf_counter() - measured, 1)}
+        if selection_slice != SELECTION_SLICE_DEFAULT:
+            # Khoá "validation" vẫn là lát 'all' để manifest cũ và mới so được với nhau;
+            # lát thực sự dùng để chọn ghi riêng vào "validation_selection".
+            record["validation_selection"] = scores[selection_slice]
         if train_loss is not None:
             record["train_loss"] = train_loss
         if penalty is not None:
@@ -1348,6 +1394,13 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
                                            scores["all"].get("ranking"),
                                            scores["all"].get("change_classes")):
             LOGGER.info("%s", line)
+        if selection_slice != SELECTION_SLICE_DEFAULT:
+            chosen = scores[selection_slice]
+            for line in metrics.format_metrics(f"{label} lát {selection_slice}",
+                                               chosen["regression"],
+                                               chosen.get("ranking"),
+                                               chosen.get("change_classes")):
+                LOGGER.info("%s", line)
         if train_loss is not None:
             LOGGER.info("%s: train loss %.4f", label, train_loss)
         if penalty is not None:
@@ -1442,6 +1495,8 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "best_epoch": None if best_point < 0 else history[best_point]["epoch"],
         "best_step": None if best_point < 0 else history[best_point]["step"],
         "selection_metric": selection,
+        "selection_slice": selection_slice,
+        "selection_slice_rows": slice_rows[selection_slice],
         "best_validation_mae": None if best_point < 0 else
         history[best_point]["validation"]["regression"]["mae"],
         "final_metrics_index": best_point if best_point >= 0 else len(history) - 1,

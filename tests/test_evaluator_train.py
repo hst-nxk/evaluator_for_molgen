@@ -571,6 +571,57 @@ def test_config_selection_metric_is_known_and_defaults_to_mae() -> None:
     assert train.SELECTION_METRICS == (train.SELECT_MAE, train.SELECT_PAIRWISE_MACRO)
 
 
+# ------------------------------------- lát cắt dùng để chọn checkpoint (12/11/2026)
+
+SLICES_FOR_SELECTION = {"slices": [{"name": "all", "filters": {}},
+                                   {"name": "strict", "filters": {"unseen_pair": True}}]}
+
+
+def test_selection_slice_defaults_to_all() -> None:
+    """Không khai báo gì thì giữ hành vi cũ, để số đo trước 12/11/2026 tái tạo được."""
+    assert train.resolve_selection_slice({}, SLICES_FOR_SELECTION) == "all"
+    assert train.SELECTION_SLICE_DEFAULT == "all"
+
+
+def test_selection_slice_accepts_a_declared_slice() -> None:
+    assert train.resolve_selection_slice({"selection_slice": "strict"},
+                                         SLICES_FOR_SELECTION) == "strict"
+
+
+@pytest.mark.parametrize("name", ["unseen", "ALL", "", "cliff"])
+def test_selection_slice_refuses_a_name_not_in_metrics_slices(name: str) -> None:
+    """Gõ sai tên lát phải báo ngay, không âm thầm chọn theo lát khác."""
+    with pytest.raises(ValueError, match="selection_slice"):
+        train.resolve_selection_slice({"selection_slice": name}, SLICES_FOR_SELECTION)
+
+
+def test_selection_slice_refuses_a_slice_with_no_validation_rows() -> None:
+    """Lát rỗng phải chặn TRƯỚC khi train, không để phát hiện sau vài giờ GPU."""
+    with pytest.raises(ValueError, match="không có dòng validation"):
+        train.resolve_selection_slice({"selection_slice": "strict"}, SLICES_FOR_SELECTION,
+                                      {"all": 100, "strict": 0})
+
+
+def test_selection_slice_passes_when_the_slice_has_rows() -> None:
+    assert train.resolve_selection_slice({"selection_slice": "strict"},
+                                         SLICES_FOR_SELECTION,
+                                         {"all": 100, "strict": 86}) == "strict"
+
+
+def test_config_selection_slice_defaults_to_all_and_strict_is_available() -> None:
+    """Mặc định phải là 'all'; đổi mặc định là mọi số trước 12/11/2026 không so được nữa."""
+    import json
+
+    root = Path(__file__).resolve().parents[1]
+    stage3 = json.loads((root / "config.json").read_text(encoding="utf-8"))["stage3"]
+    assert stage3["train"]["selection_slice"] == train.SELECTION_SLICE_DEFAULT == "all"
+    # 'strict' phải có thật trong metrics.slices để --set selection_slice=strict chạy được.
+    names = [item["name"] for item in stage3["metrics"]["slices"]]
+    assert "strict" in names
+    assert train.resolve_selection_slice({"selection_slice": "strict"},
+                                         stage3["metrics"]) == "strict"
+
+
 def test_ligand_features_switch_only_allows_the_two_known_modes() -> None:
     from molopt.evaluator import models
 
