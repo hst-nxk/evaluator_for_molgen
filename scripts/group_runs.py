@@ -77,9 +77,27 @@ def identity(manifest: dict[str, Any]) -> str:
 
 
 def name_of(manifest: dict[str, Any]) -> str:
-    """Nhãn để in: nhãn của summarize_runs.py, bỏ phần seed=..."""
+    """Nhãn để in: nhãn của summarize_runs.py, bỏ `seed=...`, và SẮP XẾP LẠI các mảnh.
+
+    VÌ SAO PHẢI SẮP XẾP. `summarize_runs.label` duyệt `overrides` theo thứ tự khóa trong
+    dict, tức theo THỨ TỰ CỜ `--set` lúc phóng. Hai script khác nhau đặt cùng một bộ cờ
+    theo thứ tự khác nhau sẽ cho hai chuỗi nhãn khác nhau, nên cùng một thí nghiệm bị tách
+    thành hai nhóm — rồi `--min-seeds 3` lọc sạch cả hai khỏi bảng mà KHÔNG báo gì.
+
+    Đã mắc đúng lỗi đó ngày 13/11: ba hạt giống của `augment_reverse=True` (việc 2 biên bản
+    09/11) bị tách 1 + 2 vì hạt 20261023 phóng bằng script cũ đặt `head_block` trước
+    `learning_rate`, hai hạt kia bằng script mới đặt ngược lại. Bảng `--min-seeds 3` không
+    có dòng nào cho việc 2, trong khi số liệu có đủ.
+
+    Sắp xếp là an toàn vì đây chỉ là MỘT NỬA khóa nhóm: `identity()` còn so các khóa cấu
+    trúc của manifest, nên hai lần chạy khác nhau thật vẫn không bị gộp. Hai mảnh đầu
+    (configuration, head) giữ nguyên vị trí để nhãn còn đọc được.
+    """
     parts = [part for part in label(manifest).split(" ") if not part.startswith("seed=")]
-    return " ".join(parts)
+    front, rest = parts[:2], parts[2:]
+    plain = sorted(part for part in rest if "=" not in part)
+    keyed = sorted(part for part in rest if "=" in part)
+    return " ".join(front + plain + keyed)
 
 
 def value_of(manifest: dict[str, Any], slice_name: str, metric: str) -> float | None:
