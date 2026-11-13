@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
-# Đợt 14/11/2026 (đợt 2): mang VIỆC 4 sang MoLFormer, và kiểm độ bền của trọng số phạt.
-# 12 lần chạy, tất cả trên TẬP CON 100.000 dòng, chọn checkpoint theo lát `strict`.
+# Đợt 14/11/2026 (đợt 2, chạy qua đêm): mang VIỆC 4 sang MoLFormer, bỏ hẳn nhánh protein
+# (hệ quả của việc 9), tách phần đóng góp của twin_edit (việc 12), và kiểm độ bền của
+# trọng số phạt.
+# 18 lần chạy, tất cả trên TẬP CON 100.000 dòng, chọn checkpoint theo lát `strict`.
+# Ước lượng 3,5 tiếng nếu GPU rảnh; trên GPU đang chia với job khác thì 5-6 tiếng.
+#
+# Năm phần, xếp theo thứ tự QUAN TRỌNG GIẢM DẦN, nên kill giữa đêm chỉ mất phần cuối:
+#   1. đối chứng MoLFormer                     3 lần  -> phải ra lại 0,5561 +/- 0,0006
+#   2. MoLFormer + phạt w = 1,0                3 lần  -> việc 4 có vào paper hay không
+#   3. no_protein (bỏ nhánh protein)           3 lần  -> hệ quả trực tiếp của việc 9
+#   4. head twin trơn (không twin_edit)        3 lần  -> tách phần đóng góp, việc 12
+#   5. phạt w = 0,3 và w = 3,0 trên Morgan     6 lần  -> độ bền của trọng số
 #
 # Cách chạy (trên server Brev, trong shell đã `conda activate nxk`):
 #   cd /data/khainx/evaluator_for_molgen
@@ -37,10 +47,20 @@
 #     - Nếu MẤT -> phải viết rõ trong báo cáo: phạt chỉ là cách vá biểu diễn Morgan,
 #       không phải phát hiện về tính phản đối xứng. Kết quả âm này vẫn phải báo.
 #
-#   PHẦN 3 hỏi tiếp: hiệu của phạt có phụ thuộc trọng số không? w = 0,3 và w = 3,0 trên
-#     Morgan. Nếu cả ba mức đều cho hiệu dương thì kết luận bền; nếu chỉ w = 1,0 ăn thì
-#     phải nói đó là một mức đã dò, không phải một tính chất.
-#     Phần 3 chạy CUỐI nên có thể kill sau phần 2 nếu cần nhường GPU, không mất gì.
+#   PHẦN 3 là hệ quả của việc 9, đo đêm 13/11: mô hình gần như không đọc protein (lát (a)
+#     sd dự đoán giữa các Context P 0,0114 so với sd nhãn 0,6566; lát (b) đúng chiều trong
+#     một protein 0,5605-0,5690, đúng bằng mức trên toàn validation). Bỏ hẳn nhánh protein
+#     mà điểm không giảm -> bằng chứng mạnh nhất cho phần phân tích lỗi. Điểm GIẢM rõ ->
+#     protein có đóng góp và phải viết lại cách diễn giải hai lát của việc 9.
+#
+#   PHẦN 4 tách phần đóng góp của twin_edit (việc 12). Bảng 13/11 có twin + twin_edit=True
+#     0,5517 +/- 0,0005 (t = 3,71), nhưng nhóm đó đổi HAI thứ cùng lúc so với đối chứng:
+#     head twin và twin_edit. Thiếu đúng nhóm twin trơn 3 hạt trên cùng tập con.
+#
+#   PHẦN 5 hỏi hiệu của phạt có phụ thuộc trọng số không? w = 0,3 và w = 3,0 trên Morgan.
+#     Nếu cả ba mức đều cho hiệu dương thì kết luận bền; nếu chỉ w = 1,0 ăn thì phải nói
+#     đó là một mức đã dò, không phải một tính chất.
+#     Phần 5 là 6 lần chạy, xếp CUỐI nên kill giữa đêm chỉ mất phần này.
 #
 # ------------------------------------------------------------------------------------
 # LƯU Ý ĐỌC SỐ
@@ -209,9 +229,38 @@ done
 
 echo
 echo "================================================================================"
-echo "=== PHẦN 3: độ bền của trọng số phạt trên Morgan (w = 0,3 và w = 3,0)"
+echo "=== PHẦN 3: BỎ HẲN NHÁNH PROTEIN (--config no_protein) — hệ quả của việc 9"
+echo "=== Việc 9 đo được: mô hình gần như không đọc protein. Lát (a) sd dự đoán giữa các"
+echo "=== Context P chỉ 0,0114 trong khi sd nhãn 0,6566; lát (b) đúng chiều TRONG một"
+echo "=== protein 0,5605-0,5690, đúng bằng mức trên toàn validation. Nếu bỏ hẳn nhánh"
+echo "=== protein mà điểm không giảm thì đó là bằng chứng mạnh nhất, và là số phải đưa"
+echo "=== vào phần phân tích lỗi của báo cáo. Nếu điểm GIẢM rõ thì ngược lại: protein có"
+echo "=== đóng góp, và hai lát của việc 9 phải viết lại cách diễn giải."
+
+for seed in "${SEEDS[@]}"; do
+    run_one "hạt giống $seed | no_protein (bỏ nhánh protein)" \
+        --mode train --config no_protein --head direct $COMMON $RESIDUAL \
+        --set seed="$seed"
+done
+
+echo
+echo "================================================================================"
+echo "=== PHẦN 4: head twin TRƠN (không twin_edit) — tách phần đóng góp, việc 12"
+echo "=== Bảng 13/11 có nhóm twin + twin_edit=True: 0,5517 +/- 0,0005 (t = 3,71 so với"
+echo "=== đối chứng 0,5499 +/- 0,0007). Nhưng nhóm đó đổi HAI thứ cùng lúc: head twin và"
+echo "=== twin_edit. Trên tập con 100k không có nhóm twin trơn đủ 3 hạt để tách. Phần này"
+echo "=== dựng đúng nhóm còn thiếu đó."
+
+for seed in "${SEEDS[@]}"; do
+    run_one "hạt giống $seed | head twin, twin_edit tắt" \
+        --mode train --config frozen --head twin $COMMON $RESIDUAL --set seed="$seed"
+done
+
+echo
+echo "================================================================================"
+echo "=== PHẦN 5: độ bền của trọng số phạt trên Morgan (w = 0,3 và w = 3,0)"
 echo "=== So với w = 1,0 đã đo: 0,5541 +/- 0,0002, và đối chứng 0,5499 +/- 0,0007."
-echo "=== Phần này có thể kill mà không mất phần 1 và 2."
+echo "=== Phần này 6 lần chạy, xếp CUỐI: kill được mà không mất phần nào ở trên."
 
 for weight in 0.3 3.0; do
     for seed in "${SEEDS[@]}"; do
@@ -225,5 +274,6 @@ echo
 echo "=== [$(date '+%F %T')] xong tất cả | $total lần chạy | số lần lỗi: $failed"
 echo "Đọc kết quả:"
 echo "  python scripts/group_runs.py --slice strict --min-seeds 3 | tee runs/groups_penalty.log"
+echo "Nếu có dòng CẢNH BÁO về khối metrics thì nhóm đó trộn hai thước đo, đừng đọc."
 echo "  python scripts/summarize_runs.py --ranking --slice strict | tee runs/summary_penalty.log"
 echo "XONG_PENALTY_MOLFORMER_1411"
