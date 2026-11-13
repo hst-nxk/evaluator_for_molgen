@@ -806,3 +806,122 @@ def test_the_config_default_keeps_every_earlier_number_comparable() -> None:
     assert stage3["train"]["label_normalization"] == train.LABEL_NONE
     assert stage3["train"]["augment_reverse"] is False
     assert stage3["inputs"]["train_subset"] == ""
+
+
+# ------------------------------ việc 4 họp 09/11: ép phản đối xứng bằng HÀM MẤT MÁT
+
+
+class SideModel(torch.nn.Module):
+    """Chỉ nhìn phía A: f(A,B) = w·A. Đổi chỗ cặp thì đầu ra KHÔNG đổi dấu."""
+
+    uses_edit_branch = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        torch.manual_seed(0)
+        self.layer = torch.nn.Linear(2, 1)
+        self.calls = 0
+
+    def forward(self, ligand_a, ligand_b, fragment_a, fragment_b, protein,
+                endpoint):  # noqa: ANN001, D102
+        self.calls += 1
+        return self.layer(ligand_a).squeeze(-1)
+
+
+class DifferenceModel(SideModel):
+    """f(A,B) = w·A − w·B: phản đối xứng do cấu tạo, giống head `twin`."""
+
+    def forward(self, ligand_a, ligand_b, fragment_a, fragment_b, protein,
+                endpoint):  # noqa: ANN001, D102
+        self.calls += 1
+        return (self.layer(ligand_a) - self.layer(ligand_b)).squeeze(-1)
+
+
+def pair_batch(arrays, rows, caches, protein_source, device, uses_edit):  # noqa: ANN001
+    """Batch có ĐỦ hai phía, để lượt forward đảo chiều chạy được."""
+    size = len(rows)
+    return {"ligand_a": torch.ones(size, 2), "ligand_b": torch.full((size, 2), 3.0),
+            "fragment_a": None, "fragment_b": None, "protein": None, "endpoint": None,
+            "target": torch.zeros(size)}
+
+
+def run_with_penalty(monkeypatch: pytest.MonkeyPatch, model, weight: float,
+                     rows: int = 40, batch_size: int = 10) -> tuple[float, dict]:
+    monkeypatch.setattr(train, "batch_tensors", pair_batch)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)   # lr 0: trọng số đứng yên
+    stats: dict[str, float] = {}
+    loss, _, _ = train.train_one_epoch(model, FakeArrays(rows), None, None, "cpu",
+                                       optimizer, torch.nn.MSELoss(), batch_size, 1.0,
+                                       np.random.default_rng(0), None, 0, None, False, 1,
+                                       weight, stats)
+    return loss, stats
+
+
+def test_weight_zero_runs_one_forward_per_batch_and_reports_nothing(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mặc định phải KHÔNG tốn thêm lượt forward nào: mọi lần chạy cũ giữ nguyên chi phí."""
+    model = SideModel()
+    _, stats = run_with_penalty(monkeypatch, model, 0.0)
+    assert model.calls == 4           # 40 dòng / batch 10
+    assert "antisymmetry_violation" not in stats
+
+
+def test_the_penalty_costs_a_second_forward_per_batch(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    model = SideModel()
+    _, stats = run_with_penalty(monkeypatch, model, 1.0)
+    assert model.calls == 8
+    assert "antisymmetry_violation" in stats
+
+
+def test_the_violation_is_zero_for_a_model_that_is_antisymmetric_by_construction(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Head `twin`/`antisymmetric` phải cho số hạng phạt đúng 0 — kiểm chéo cả hai phía."""
+    model = DifferenceModel()
+    _, stats = run_with_penalty(monkeypatch, model, 1.0)
+    assert stats["antisymmetry_violation"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_the_violation_matches_the_formula_for_a_one_sided_model(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mô hình chỉ nhìn phía A: f(A,B) = w·A, f(B,A) = w·B, nên vi phạm = (w·A + w·B)^2.
+
+    Kiểm đúng công thức chứ không chỉ kiểm "khác 0": lượt ngược phải thật sự ĐỔI CHỖ hai
+    phía, nếu nó chỉ chạy lại cùng một đầu vào thì con số vẫn khác 0 mà vô nghĩa.
+    """
+    model = SideModel()
+    with torch.no_grad():
+        side_a = float(model.layer(torch.ones(1, 2)).squeeze())
+        side_b = float(model.layer(torch.full((1, 2), 3.0)).squeeze())
+    _, stats = run_with_penalty(monkeypatch, model, 1.0)
+    assert stats["antisymmetry_violation"] == pytest.approx((side_a + side_b) ** 2,
+                                                            rel=1e-6)
+
+
+def test_the_reported_train_loss_excludes_the_penalty(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cột 'train loss' phải so được với các lần chạy không bật phạt, nếu không bảng cũ hỏng."""
+    without, _ = run_with_penalty(monkeypatch, SideModel(), 0.0)
+    with_penalty, stats = run_with_penalty(monkeypatch, SideModel(), 5.0)
+    assert stats["antisymmetry_violation"] > 0.0
+    assert with_penalty == pytest.approx(without, rel=1e-9)
+
+
+def test_the_penalty_reaches_the_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Số hạng phạt phải vào gradient: nếu quên backward thì mọi lần chạy việc 4 là vô nghĩa.
+
+    Đo bằng chính mức vi phạm sau MỘT bước, không đo bằng độ lớn trọng số: bước gradient
+    với trọng số phạt lớn có thể làm trọng số vọt lên rồi mới xuống.
+    """
+    monkeypatch.setattr(train, "batch_tensors", pair_batch)
+    model = SideModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+    first: dict[str, float] = {}
+    train.train_one_epoch(model, FakeArrays(10), None, None, "cpu", optimizer,
+                          torch.nn.MSELoss(), 10, 0.0, np.random.default_rng(0), None,
+                          0, None, False, 1, 1.0, first)
+    second: dict[str, float] = {}
+    train.train_one_epoch(model, FakeArrays(10), None, None, "cpu", optimizer,
+                          torch.nn.MSELoss(), 10, 0.0, np.random.default_rng(0), None,
+                          0, None, False, 1, 1.0, second)
+    assert second["antisymmetry_violation"] < first["antisymmetry_violation"]

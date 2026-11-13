@@ -697,3 +697,82 @@ def test_residual_head_defaults_reproduce_the_runs_before_the_sweep() -> None:
     block = built.predictor.blocks[0]
     assert block.body[0].out_features == 32
     assert block.body[2].p == 0.5 and block.body[4].p == 0.5
+
+
+# --------------------------------------------- việc 3 họp 09/11: đặc trưng hiệu A - B
+
+
+def test_pair_features_default_is_off_so_old_checkpoints_keep_their_shape() -> None:
+    """Mặc định phải KHÔNG đổi gì: nếu đổi thì mọi số đã đo trước 14/11/2026 hết so được."""
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    stage3 = json.loads((root / "config.json").read_text(encoding="utf-8"))["stage3"]
+    assert stage3["model"]["pair_features"] == models.PAIR_FEATURES_NONE
+
+    plain = build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN)
+    explicit = build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
+                          pair_features=models.PAIR_FEATURES_NONE)
+    assert (models.count_parameters(plain)["total"]
+            == models.count_parameters(explicit)["total"])
+    assert plain.token_kinds == explicit.token_kinds
+
+
+def test_difference_adds_one_token_and_product_adds_two() -> None:
+    base = build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN)
+    difference = build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
+                            pair_features=models.PAIR_FEATURES_DIFFERENCE)
+    product = build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
+                         pair_features=models.PAIR_FEATURES_DIFFERENCE_PRODUCT)
+    assert len(difference.token_kinds) == len(base.token_kinds) + 1
+    assert len(product.token_kinds) == len(base.token_kinds) + 2
+    # Hai token mới đứng ngay sau hai token ligand, trước nhánh edit: thứ tự này cố định.
+    assert product.token_kinds[:4] == (models.KIND_LIGAND, models.KIND_LIGAND,
+                                       models.KIND_DIFFERENCE, models.KIND_PRODUCT)
+    for built in (difference, product):
+        assert built(**inputs()).shape == (BATCH,)
+
+
+def test_pair_pieces_are_exactly_the_difference_and_the_elementwise_product() -> None:
+    """Phép toán phải đúng như mô tả trong biên bản, không phải một biến thể gần giống."""
+    built = build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
+                       pair_features=models.PAIR_FEATURES_DIFFERENCE_PRODUCT)
+    left = torch.tensor([[1.0, 2.0, 3.0]])
+    right = torch.tensor([[0.5, -2.0, 1.0]])
+    difference, product = built.pair_pieces(left, right)
+    assert torch.allclose(difference, torch.tensor([[0.5, 4.0, 2.0]]))
+    assert torch.allclose(product, torch.tensor([[0.5, -4.0, 3.0]]))
+
+
+def test_the_difference_token_flips_sign_when_the_pair_is_swapped() -> None:
+    """Kiểm tính chất mà việc 3 dựa vào: token hiệu mang đúng thông tin "chiều của cặp"."""
+    built = build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
+                       pair_features=models.PAIR_FEATURES_DIFFERENCE)
+    left = torch.rand(2, 4)
+    right = torch.rand(2, 4)
+    assert torch.allclose(built.pair_pieces(left, right)[0],
+                          -built.pair_pieces(right, left)[0])
+
+
+def test_pair_features_refuses_the_heads_where_it_has_no_meaning() -> None:
+    for head in (models.HEAD_TWIN, models.HEAD_ANTISYMMETRIC):
+        with pytest.raises(ValueError, match="pair_features"):
+            build_with(head, models.PROTEIN_FROZEN,
+                       pair_features=models.PAIR_FEATURES_DIFFERENCE)
+
+
+def test_pair_features_refuses_linear_head_and_the_other_fusions() -> None:
+    with pytest.raises(ValueError, match="trùng nút"):
+        build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
+                   head_block=models.HEAD_BLOCK_LINEAR,
+                   pair_features=models.PAIR_FEATURES_DIFFERENCE)
+    with pytest.raises(ValueError, match="fusion='concat'"):
+        build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
+                   fusion=models.FUSION_ATTENTION,
+                   pair_features=models.PAIR_FEATURES_DIFFERENCE)
+
+
+def test_pair_features_rejects_an_unknown_value() -> None:
+    with pytest.raises(ValueError, match="pair_features lạ"):
+        build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN, pair_features="hiệu")

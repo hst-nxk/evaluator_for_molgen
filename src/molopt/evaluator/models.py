@@ -151,12 +151,35 @@ HEAD_NORM_NONE = "none"
 HEAD_NORM_LAYER = "layernorm"
 HEAD_NORMS = (HEAD_NORM_NONE, HEAD_NORM_LAYER)
 
+# Đặc trưng CẶP ghép thêm vào đầu vào của head joint — việc 3 họp 09/11/2026: "thêm đặc
+# trưng hiệu A − B vào input, theo PBCNet 2.0: lấy hai vector trừ nhau rồi nhân tương tác".
+#   none               : bản v1, chỉ [enc(A), enc(B)]. Mặc định, giữ nguyên mọi số cũ.
+#   difference         : ghép thêm enc(A) − enc(B).
+#   difference_product : ghép thêm enc(A) − enc(B) VÀ enc(A) * enc(B) (nhân theo từng chiều).
+# MLP vốn xấp xỉ được hiệu của hai vector, nên cái thêm vào đây KHÔNG phải thông tin mới —
+# nó là một ƯU TIÊN QUY NẠP: đặt sẵn phép toán mà bài toán cần, để mạng không phải học.
+# Vì vậy kết quả có thể bằng 0, và nếu bằng 0 thì đó cũng là một câu trả lời có nghĩa.
+# CHƯA ĐỐI CHIẾU VỚI BÀI GỐC: việc 6 (đọc lại PBCNet 2.0) chưa làm, nên ở đây chỉ cài đúng
+# mô tả trong biên bản, không khẳng định trùng với thiết kế của bài.
+# Vì sao chỉ cho head joint: `twin` chấm điểm TỪNG phân tử nên không có chỗ nào nhìn thấy
+# cả hai vector cùng lúc; `antisymmetric` thì ĐÃ dựng trên vector hiệu, và ghép thêm tích
+# enc(A) * enc(B) — một hàm CHẴN khi đổi chỗ A và B — sẽ phá tính phản đối xứng do cấu tạo.
+PAIR_FEATURES_NONE = "none"
+PAIR_FEATURES_DIFFERENCE = "difference"
+PAIR_FEATURES_DIFFERENCE_PRODUCT = "difference_product"
+PAIR_FEATURES = (PAIR_FEATURES_NONE, PAIR_FEATURES_DIFFERENCE,
+                 PAIR_FEATURES_DIFFERENCE_PRODUCT)
+
 # Loại của từng token, theo đúng thứ tự ghép. A và B cùng loại `ligand` nên dùng chung
 # lớp chiếu, giống như chúng dùng chung encoder.
 KIND_LIGAND = "ligand"
 KIND_EDIT = "edit"
 KIND_PROTEIN = "protein"
 KIND_ENDPOINT = "endpoint"
+# Hai loại token của đặc trưng cặp. Chúng sống trong cùng không gian với token ligand
+# (hiệu và tích của hai vector ligand) nên chiều của chúng bằng `ligand_out`.
+KIND_DIFFERENCE = "difference"
+KIND_PRODUCT = "product"
 
 # Cấu hình chạy -> chế độ nhánh protein. `no_protein` là đối chứng: bỏ hẳn nhánh protein
 # để biết protein có đóng góp gì không.
@@ -379,6 +402,32 @@ class EvaluatorModel(nn.Module):
                              "tầng ghép; chỉ dùng với fusion='concat'")
         if twin_edit and head != HEAD_TWIN:
             raise ValueError(f"twin_edit chỉ có nghĩa với head='twin', nhận {head!r}")
+        pair_features = str(settings.get("pair_features", PAIR_FEATURES_NONE))
+        if pair_features not in PAIR_FEATURES:
+            raise ValueError(f"pair_features lạ: {pair_features!r}; chỉ có {PAIR_FEATURES}")
+        if pair_features != PAIR_FEATURES_NONE:
+            # Ba điều kiện này đều là "không có nghĩa", không phải "chưa kịp làm": xem khối
+            # chú thích ở PAIR_FEATURES. Báo lỗi thay vì nhận im lặng, vì nhận im lặng thì
+            # cả một đợt chạy tưởng đang thử việc 3 mà thật ra không đổi gì.
+            if head not in JOINT_HEADS:
+                raise ValueError(
+                    f"pair_features chỉ dùng được với head {JOINT_HEADS} (hai head nhìn "
+                    f"thấy A và B cùng lúc), nhận {head!r}. `twin` chấm từng phân tử nên "
+                    f"không có chỗ ghép; `antisymmetric` đã dựng sẵn trên vector hiệu, và "
+                    f"tích enc(A)*enc(B) là hàm chẵn nên sẽ phá tính phản đối xứng.")
+            if fusion != FUSION_CONCAT:
+                raise ValueError(
+                    f"pair_features mới chỉ cài cho fusion='concat', nhận {fusion!r}. "
+                    f"projector và attention đã có đường cho các nhánh tác động lẫn nhau, "
+                    f"nên hai thứ này chồng lên nhau và hiệu đo được sẽ không đọc được.")
+            if head_block == HEAD_BLOCK_LINEAR:
+                raise ValueError(
+                    "head_block='linear' + pair_features là trùng nút ở phần hiệu: với "
+                    "head linear, enc(x) = x nên enc(A) − enc(B) là tổ hợp TUYẾN TÍNH của "
+                    "chính đầu vào, lớp Linear duy nhất đã biểu diễn được. Muốn thử tích "
+                    "A*B trên baseline tuyến tính thì phải dựng nút riêng và nói rõ rằng "
+                    "mô hình không còn tuyến tính theo đầu vào nữa.")
+        self.pair_features = pair_features
         self.head_norm = head_norm
         self.head = head
         self.protein_mode = protein_mode
@@ -408,6 +457,14 @@ class EvaluatorModel(nn.Module):
         # `twin` chấm từng phân tử nên mỗi lượt chỉ có MỘT ligand và MỘT edit.
         single = head in (HEAD_TWIN, HEAD_ANTISYMMETRIC)
         kinds = [KIND_LIGAND] if single else [KIND_LIGAND, KIND_LIGAND]
+        # Đặc trưng cặp đứng NGAY SAU hai token ligand và trước nhánh edit: thứ tự này chỉ
+        # là quy ước, nhưng phải cố định vì head `linear` và mọi checkpoint đọc vector ghép
+        # theo vị trí. Khi pair_features='none' danh sách không đổi, nên checkpoint cũ nạp
+        # lại vẫn đúng từng chiều.
+        if pair_features != PAIR_FEATURES_NONE:
+            kinds.append(KIND_DIFFERENCE)
+            if pair_features == PAIR_FEATURES_DIFFERENCE_PRODUCT:
+                kinds.append(KIND_PRODUCT)
         if self.edit_encoder is not None:
             kinds += [KIND_EDIT] if single else [KIND_EDIT, KIND_EDIT]
         if protein_mode != PROTEIN_NONE:
@@ -431,7 +488,8 @@ class EvaluatorModel(nn.Module):
             if protein_mode != PROTEIN_NONE and not plain_protein:
                 self.protein_projection = build_mlp(int(protein_dim), [], protein_out, 0.0)
             sizes = {KIND_LIGAND: ligand_out, KIND_EDIT: edit_out,
-                     KIND_PROTEIN: protein_out, KIND_ENDPOINT: endpoint_dim}
+                     KIND_PROTEIN: protein_out, KIND_ENDPOINT: endpoint_dim,
+                     KIND_DIFFERENCE: ligand_out, KIND_PRODUCT: ligand_out}
             width = sum(sizes[kind] for kind in self.token_kinds)
         else:
             shared = int(settings["fusion_dim"])
@@ -519,6 +577,20 @@ class EvaluatorModel(nn.Module):
         pieces.append(self.endpoint_embedding(endpoint))
         return pieces
 
+    def pair_pieces(self, hidden_a: Tensor, hidden_b: Tensor) -> list[Tensor]:
+        """Đặc trưng cặp ghép thêm: [] | [A − B] | [A − B, A * B] (việc 3 họp 09/11/2026).
+
+        Lấy trên vector ĐÃ MÃ HÓA chứ không trên fingerprint thô: hiệu của hai fingerprint
+        Morgan chỉ là tập bit có ở A mà không có ở B (và ngược lại, mang dấu âm), còn hiệu
+        của hai vector sau encoder là hiệu trong không gian mà mạng đang dùng để dự đoán.
+        """
+        if self.pair_features == PAIR_FEATURES_NONE:
+            return []
+        pieces = [hidden_a - hidden_b]
+        if self.pair_features == PAIR_FEATURES_DIFFERENCE_PRODUCT:
+            pieces.append(hidden_a * hidden_b)
+        return pieces
+
     def combine(self, pieces: Sequence[Tensor]) -> Tensor:
         """Ghép các nhánh thành một vector cho đầu dự đoán."""
         if len(pieces) != len(self.token_kinds):
@@ -547,6 +619,7 @@ class EvaluatorModel(nn.Module):
             side_b = [hidden_b] + ([] if edit_b is None else [edit_b]) + list(context)
             return [self.combine(side_a), self.combine(side_b)]
         pieces = [hidden_a, hidden_b]
+        pieces.extend(self.pair_pieces(hidden_a, hidden_b))
         if edit_a is not None and edit_b is not None:
             pieces.append(edit_a)
             pieces.append(edit_b)

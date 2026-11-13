@@ -1,11 +1,12 @@
 """Task 1 họp 09/11/2026: phân tích lỗi trên checkpoint hiện tại, không cần train lại.
 
-Bốn lệnh con, tất cả đều đọc thư mục `rows.parquet` do `--mode errors` ghi ra:
+Năm lệnh con, tất cả đều đọc thư mục `rows.parquet` do `--mode errors` ghi ra:
 
-    python scripts/error_analysis.py gap   --train <dir_train> --validation <dir_val>
-    python scripts/error_analysis.py hist  --train <dir_train> --validation <dir_val>
-    python scripts/error_analysis.py flip  --validation <dir_val> [--train <dir_train>]
-    python scripts/error_analysis.py scale --rows <dir>
+    python scripts/error_analysis.py gap     --train <dir_train> --validation <dir_val>
+    python scripts/error_analysis.py hist    --train <dir_train> --validation <dir_val>
+    python scripts/error_analysis.py flip    --validation <dir_val> [--train <dir_train>]
+    python scripts/error_analysis.py context --rows <dir> [--worst 200]
+    python scripts/error_analysis.py scale   --rows <dir>
 
 với <dir> là runs/evaluator/errors_<cấu hình>_<đầu ra>_<partition>_<stamp>/.
 
@@ -27,6 +28,16 @@ VÌ SAO TỪNG LỆNH, và nó trả lời câu nào của ai:
             thêm --train thì đo tiếp phép thử mạnh hơn: với các dòng validation trùng cặp
             (A, B) với train, dự đoán của mô hình tương quan với nhãn THẬT của dòng
             validation hơn, hay với nhãn của dòng TRAIN cùng cặp hơn.
+    context — NỬA CÒN LẠI của việc 9 họp 09/11/2026. Biên bản giao hai lát: (a) "cùng cặp
+            (A, B), khác Context P" — đó là lệnh `flip`; và (b) "cùng Context P, khác cặp
+            (A, B)" — đó là lệnh này. Câu hỏi của lát (b) ngược hẳn với lát (a): trong
+            CÙNG MỘT protein, mô hình có phân biệt được cặp này với cặp kia không, hay nó
+            trả về gần như một con số cho cả protein? Vì mọi protein của validation đều
+            chưa từng thấy, đây là phép đo "đọc được Context P mới đến đâu".
+            Lệnh này còn tách phương sai của dự đoán thành phần GIỮA các protein và phần
+            TRONG một protein, rồi so với phân tách tương ứng của nhãn — hai cặp số này
+            nói thẳng mô hình đang biến thiên theo chiều nào. Thêm --worst N thì ghi ra
+            một bảng N dòng sai nặng nhất để ĐỌC TRỰC TIẾP, đúng như biên bản yêu cầu.
     scale — dòng 85, Tùng: Context P dưới 1.000 mẫu đúng chiều ~75 %, trên 50.000 mẫu
             ~89 %. Lệnh này bóc theo đúng các ngưỡng TUYỆT ĐỐI đó để tái lập con số, chứ
             không dùng ngưỡng phân vị như `--mode errors` đang làm.
@@ -394,6 +405,203 @@ def memorization_block(validation: pa.Table, train_folder: Path, validation_code
     return block
 
 
+def context_codes(table: pa.Table) -> np.ndarray:
+    """Mã nhóm theo (protein_hash, endpoint) — tức "cùng một Context P".
+
+    Endpoint vào khóa vì Δp đo bằng IC50 và Δp đo bằng Ki không so thẳng với nhau được;
+    đây cũng đúng định nghĩa query mà metrics.query_groups dùng (tham chiếu, protein,
+    endpoint), chỉ bỏ phân tử tham chiếu ra để nhóm rộng hơn: cả protein một nhóm.
+    """
+    missing = sorted({"protein_hash", "endpoint"} - set(table.column_names))
+    if missing:
+        raise ValueError(f"rows.parquet thiếu cột {missing}; chạy lại --mode errors")
+    pieces = []
+    for name in ("protein_hash", "endpoint"):
+        encoded = pc.dictionary_encode(table.column(name).combine_chunks())
+        pieces.append(np.asarray(encoded.indices.to_numpy(zero_copy_only=False),
+                                 dtype=np.int64))
+    return metric_module.query_groups(pieces)
+
+
+def variance_split(values: np.ndarray, groups: list[np.ndarray]) -> dict[str, float]:
+    """Tách phương sai thành phần GIỮA các nhóm và phần TRONG nhóm (luật phương sai toàn phần).
+
+    Trả về sd của từng phần và tỉ lệ phần giữa nhóm. Trọng số theo số dòng của nhóm, nên
+    một protein 10.000 dòng nặng hơn một protein 10 dòng — đúng với cách mọi chỉ số khác
+    của dự án tính trên dòng.
+    """
+    counts = np.array([group.size for group in groups], dtype=np.float64)
+    means = np.array([float(values[group].mean()) for group in groups])
+    variances = np.array([float(values[group].var()) for group in groups])
+    total_rows = float(counts.sum())
+    overall = float((counts * means).sum() / total_rows)
+    within = float((counts * variances).sum() / total_rows)
+    between = float((counts * (means - overall) ** 2).sum() / total_rows)
+    whole = within + between
+    return {"sd trong nhóm": float(np.sqrt(within)),
+            "sd giữa các nhóm": float(np.sqrt(between)),
+            "sd toàn phần": float(np.sqrt(whole)),
+            "tỉ lệ phương sai nằm giữa các nhóm": (between / whole) if whole > 0 else None}
+
+
+def run_context(args: argparse.Namespace) -> int:
+    """Cùng Context P, KHÁC cặp (A, B): lát (b) của việc 9 họp 09/11/2026.
+
+    `flip` hỏi: giữ nguyên cặp, đổi protein thì mô hình có theo kịp không (câu trả lời
+    11/11: không). Lệnh này hỏi chiều ngược lại: trong cùng một protein, mô hình có phân
+    biệt được cặp này với cặp kia không. Hai lát cộng lại trả lời được câu "mô hình đang
+    biến thiên theo chiều nào".
+    """
+    table = read_rows(Path(args.rows))
+    truth, prediction = columns(table, "delta_p", "prediction")
+    truth, prediction = truth.astype(np.float64), prediction.astype(np.float64)
+    codes = context_codes(table)
+    pairs = pair_codes(table)
+    tolerance = float(args.tolerance)
+    rng = np.random.default_rng(args.seed)
+
+    order, bounds = metric_module.group_bounds(codes)
+    kept: list[np.ndarray] = []
+    distinct: list[int] = []
+    for start, stop in zip(bounds[:-1], bounds[1:]):
+        rows = order[start:stop]
+        count = int(np.unique(pairs[rows]).size)
+        if count < args.min_pairs:
+            continue
+        kept.append(rows)
+        distinct.append(count)
+    if not kept:
+        print(f"không có Context P nào có >= {args.min_pairs} cặp (A, B) phân biệt")
+        return 1
+
+    # Đúng chiều TRONG nhóm: mọi cặp ứng viên của cùng một Context P, đúng hàm mà chỉ số
+    # pairwise_accuracy của dự án dùng. O(n^2) theo nhóm, nên nhóm lớn được lấy mẫu
+    # `--max-rows-per-group` dòng (hạt giống cố định) thay vì bỏ qua.
+    agree_total = 0
+    counted_total = 0
+    capped = 0
+    spearmans: list[float] = []
+    shrink: list[float] = []
+    for rows in kept:
+        sample = rows
+        if sample.size > args.max_rows_per_group:
+            sample = np.sort(rng.choice(rows, size=args.max_rows_per_group, replace=False))
+            capped += 1
+        agree, counted = metric_module.pairwise_direction(truth[sample],
+                                                          prediction[sample], tolerance)
+        agree_total += agree
+        counted_total += counted
+        if sample.size >= args.min_rows_for_correlation:
+            value = metric_module.spearman(truth[sample], prediction[sample])
+            if value is not None:
+                spearmans.append(float(value))
+            spread = float(truth[sample].std())
+            if spread > 0:
+                shrink.append(float(prediction[sample].std()) / spread)
+
+    rows_kept = np.concatenate(kept)
+    report: dict[str, Any] = {
+        "nguồn": str(Path(args.rows)),
+        "ngưỡng đúng chiều": tolerance,
+        "số Context P giữ lại": len(kept),
+        "số cặp (A, B) phân biệt mỗi Context P": {
+            "trung vị": float(np.median(distinct)), "lớn nhất": int(max(distinct))},
+        "dòng": int(rows_kept.size),
+        "dòng trên toàn partition": int(table.num_rows),
+        "nhóm bị lấy mẫu vì quá lớn": capped,
+        "đúng chiều TRONG Context P": (float(agree_total) / counted_total
+                                       if counted_total else None),
+        "mẫu số (số cặp ứng viên)": counted_total,
+        "spearman trung bình trong nhóm": (float(np.mean(spearmans)) if spearmans
+                                           else None),
+        "số nhóm tính được spearman": len(spearmans),
+        "độ co trung bình trong nhóm": float(np.mean(shrink)) if shrink else None,
+        "phương sai NHÃN": variance_split(truth, kept),
+        "phương sai DỰ ĐOÁN": variance_split(prediction, kept),
+    }
+
+    print(f"Nguồn: {Path(args.rows)}")
+    print(f"Context P (protein × endpoint) có >= {args.min_pairs} cặp phân biệt: "
+          f"{len(kept):,} nhóm | {rows_kept.size:,} dòng "
+          f"({100.0 * rows_kept.size / table.num_rows:.1f} % partition)")
+    print(f"Số cặp phân biệt mỗi nhóm: trung vị {np.median(distinct):,.0f}, "
+          f"lớn nhất {max(distinct):,}")
+    if capped:
+        print(f"  ({capped:,} nhóm quá lớn, lấy mẫu {args.max_rows_per_group:,} dòng)")
+    print()
+    print(f"Đúng chiều giữa HAI CẶP trong cùng một Context P : "
+          f"{show(report['đúng chiều TRONG Context P'])} "
+          f"(mẫu số {counted_total:,} cặp ứng viên)")
+    print(f"Spearman trung bình trong một Context P          : "
+          f"{show(report['spearman trung bình trong nhóm'])} "
+          f"({len(spearmans):,} nhóm >= {args.min_rows_for_correlation} dòng)")
+    print(f"Độ co trung bình trong một Context P            : "
+          f"{show(report['độ co trung bình trong nhóm'])}  (sd dự đoán / sd nhãn)")
+    print()
+    print(f"{'phân tách phương sai':<26}{'nhãn':>14}{'dự đoán':>14}")
+    print("-" * 54)
+    for key in ("sd trong nhóm", "sd giữa các nhóm", "sd toàn phần",
+                "tỉ lệ phương sai nằm giữa các nhóm"):
+        print(f"{key:<26}{show(report['phương sai NHÃN'][key]):>14}"
+              f"{show(report['phương sai DỰ ĐOÁN'][key]):>14}")
+    print()
+    print("Đọc bảng này cùng với lệnh `flip`. `flip` đã chứng minh mô hình gần như không")
+    print("đổi dự đoán khi chỉ đổi Context P. Nếu ở đây 'sd trong nhóm' của dự đoán cũng")
+    print("nhỏ hơn hẳn của nhãn thì mô hình co về trung bình ở CẢ HAI chiều; còn nếu")
+    print("'đúng chiều trong Context P' vượt rõ 0,5 thì trong một protein mô hình vẫn xếp")
+    print("hạng được các cặp — tức cái nó học là hóa học của cặp, không phải vai trò của P.")
+
+    if args.worst:
+        report["bảng ca sai"] = write_worst_rows(table, rows_kept, truth, prediction,
+                                                 Path(args.rows), args)
+
+    target = Path(args.out) if args.out else Path(args.rows) / "context_pairs.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\nđã ghi {target}")
+    return 0
+
+
+def write_worst_rows(table: pa.Table, rows: np.ndarray, truth: np.ndarray,
+                     prediction: np.ndarray, folder: Path,
+                     args: argparse.Namespace) -> dict[str, Any]:
+    """Ghi N dòng sai nặng nhất ra CSV để ĐỌC TRỰC TIẾP (yêu cầu của việc 9).
+
+    "Sai nặng" ở đây là sai NGƯỢC CHIỀU và lệch nhiều: |Δp dự đoán − Δp thật| lớn trong
+    số các dòng mà hai bên trái dấu. Dòng lệch nhiều nhưng cùng chiều không vào bảng này,
+    vì chúng là lỗi độ lớn chứ không phải lỗi quy luật.
+    """
+    error = prediction[rows] - truth[rows]
+    opposite = np.sign(truth[rows]) != np.sign(prediction[rows])
+    candidates = rows[opposite]
+    magnitude = np.abs(error)[opposite]
+    if candidates.size == 0:
+        return {"ghi chú": "không có dòng nào trái dấu"}
+    picked = candidates[np.argsort(-magnitude)[:args.worst]]
+    wanted = [name for name in ("smiles_a", "smiles_b", "endpoint", "protein_hash",
+                                "protein_rows", "delta_p", "prediction", "unseen_pair")
+              if name in table.column_names]
+    extracted = {name: np.asarray(table.column(name).to_numpy(zero_copy_only=False))[picked]
+                 for name in wanted}
+    extracted["sai_số"] = prediction[picked] - truth[picked]
+    target = Path(args.worst_out) if args.worst_out else folder / "worst_rows.csv"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    import csv
+
+    with target.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(list(extracted))
+        for index in range(picked.size):
+            writer.writerow([extracted[name][index] for name in extracted])
+    print()
+    print(f"{picked.size:,} dòng TRÁI DẤU lệch nặng nhất -> {target}")
+    print("Mở file này đọc tay: biên bản 09/11 yêu cầu đọc trực tiếp các ca sai để tìm quy")
+    print("luật, không chỉ nhìn số tổng hợp.")
+    return {"số dòng ghi": int(picked.size), "file": str(target),
+            "số dòng trái dấu trong các nhóm đã giữ": int(candidates.size),
+            "tỉ lệ trái dấu": float(candidates.size) / float(rows.size)}
+
+
 def run_scale(args: argparse.Namespace) -> int:
     """Đúng chiều theo QUY MÔ nhóm Context P, ngưỡng tuyệt đối của Tùng (dòng 85)."""
     table = read_rows(Path(args.rows))
@@ -468,6 +676,24 @@ def main() -> int:
                       help="ngưỡng coi Δp là khác 0; mặc định 0,3 = direction_tolerance")
     flip.add_argument("--out", default="")
     flip.set_defaults(handler=run_flip)
+
+    context = subparsers.add_parser("context", help="cùng Context P, khác cặp (A, B)")
+    context.add_argument("--rows", required=True, help="thư mục errors_*")
+    context.add_argument("--min-pairs", type=int, default=2,
+                         help="bỏ qua Context P có ít cặp (A, B) phân biệt hơn mức này")
+    context.add_argument("--max-rows-per-group", type=int, default=500,
+                         help="nhóm lớn hơn mức này được lấy mẫu; phép đếm cặp là O(n^2)")
+    context.add_argument("--min-rows-for-correlation", type=int, default=5,
+                         help="nhóm ít dòng hơn mức này không tính spearman/độ co")
+    context.add_argument("--tolerance", type=float, default=0.3,
+                         help="ngưỡng coi hai nhãn là bằng; mặc định 0,3 = direction_tolerance")
+    context.add_argument("--worst", type=int, default=0,
+                         help="ghi ra N dòng TRÁI DẤU lệch nặng nhất để đọc tay")
+    context.add_argument("--worst-out", default="", help="file .csv cho --worst")
+    context.add_argument("--seed", type=int, default=20261023,
+                         help="hạt giống của phép lấy mẫu nhóm lớn")
+    context.add_argument("--out", default="")
+    context.set_defaults(handler=run_context)
 
     scale = subparsers.add_parser("scale", help="đúng chiều theo quy mô nhóm Context P")
     scale.add_argument("--rows", required=True, help="thư mục errors_*")

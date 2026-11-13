@@ -977,8 +977,34 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
                     eval_every: int = 0,
                     on_eval: Callable[[int], bool] | None = None,
                     group_by_protein: bool = False,
-                    accumulate_steps: int = 1) -> tuple[float, bool, int]:
+                    accumulate_steps: int = 1,
+                    antisymmetry_weight: float = 0.0,
+                    stats: dict[str, float] | None = None) -> tuple[float, bool, int]:
     """Một epoch; trả về (mất mát trung bình theo dòng, có dừng sớm không, số bước).
+
+    ``antisymmetry_weight`` > 0 thì mỗi batch chạy THÊM một lượt forward trên đầu vào đã
+    đảo chiều (B, A, F_B, F_A, cùng P và endpoint) và cộng vào mất mát số hạng
+
+        w * trung bình( (f(A,B) + f(B,A))^2 )
+
+    Đây là việc 4 họp 09/11/2026: ép f(A,B) = −f(B,A) bằng HÀM MẤT MÁT, để so trực tiếp
+    với việc 2 (augment đảo chiều) và với việc 5 (ép bằng kiến trúc). Ba đường cùng một
+    mục tiêu, khác chỗ đặt ràng buộc: dữ liệu, mất mát, hay cấu tạo.
+
+    BA ĐIỀU PHẢI BIẾT TRƯỚC KHI ĐỌC KẾT QUẢ:
+      1. Chi phí gấp đôi: hai lượt forward mỗi batch (lượt ngược cũng vào đồ thị tính
+         gradient, vì đó mới là chỗ ràng buộc tác động).
+      2. Với dropout > 0, số hạng này KHÔNG xuống 0 được, kể cả ở một mô hình phản đối
+         xứng hoàn hảo: hai lượt forward lấy hai mặt nạ dropout độc lập, nên
+         f_{m1}(A,B) + f_{m2}(B,A) còn lại phần nhiễu của dropout. Vậy nên nó vừa phạt
+         bất đối xứng vừa phạt PHƯƠNG SAI DO DROPOUT — một tác dụng phụ, phải nói ra khi
+         báo cáo. Muốn tách hai thứ thì chạy thêm một lần ở dropout = 0.
+      3. Số đo cuối cùng của tính phản đối xứng vẫn là `asymmetry_report` ở chế độ eval
+         (dropout tắt), không phải con số phạt lúc train.
+
+    ``stats`` khác None thì hàm ghi vào đó khóa ``antisymmetry_violation``: trung bình
+    theo dòng của (f(A,B) + f(B,A))^2 trong cả epoch, kể cả khi trọng số bằng 0 thì khóa
+    này không được ghi (không chạy lượt ngược nên không có số).
 
     ``penalty`` khác None thì mỗi batch đi theo Algorithm 1 của IGNITE thay vì
     ``loss.backward()`` (xem molopt.evaluator.sharpness).
@@ -1008,6 +1034,7 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
     if isinstance(protein_source, ProteinEncoderRuntime):
         trainable += list(protein_source.parameters())
     total = 0.0
+    violation_total = 0.0
     seen = 0
     step = 0
     stopped = False
@@ -1021,6 +1048,18 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
         prediction = model(batch["ligand_a"], batch["ligand_b"], batch["fragment_a"],
                            batch["fragment_b"], batch["protein"], batch["endpoint"])
         loss = criterion(prediction, batch["target"])
+        # Ghi lại mất mát DỮ LIỆU trước khi cộng số hạng phạt: cột "train loss" của log và
+        # của manifest phải so được với các lần chạy không bật phạt.
+        total += float(loss.detach().to("cpu")) * rows.size
+        if antisymmetry_weight > 0.0:
+            # Lượt ngược: đổi chỗ (A, B) và (F_A, F_B), giữ nguyên P và endpoint — đúng
+            # phép đổi chỗ mà data.swap_sides làm trên mảng, nhưng làm thẳng trên tensor
+            # đã dựng nên không phải đọc lại cache.
+            reverse = model(batch["ligand_b"], batch["ligand_a"], batch["fragment_b"],
+                            batch["fragment_a"], batch["protein"], batch["endpoint"])
+            violation = ((prediction + reverse) ** 2).mean()
+            violation_total += float(violation.detach().to("cpu")) * rows.size
+            loss = loss + antisymmetry_weight * violation
         share = 1.0 / accumulate_steps
         if penalty is None:
             # PyTorch vốn CỘNG vào .grad, nên chia mất mát là đủ để lấy trung bình.
@@ -1030,7 +1069,6 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
                           lambda rows=rows: forward_mean(model, arrays, rows, caches,
                                                          protein_source, device),
                           share, accumulate_steps > 1)
-        total += float(loss.detach().to("cpu")) * rows.size
         seen += rows.size
         pending += 1
         if pending < accumulate_steps:
@@ -1056,6 +1094,8 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         step += 1
+    if stats is not None and antisymmetry_weight > 0.0:
+        stats["antisymmetry_violation"] = violation_total / max(seen, 1)
     return total / max(seen, 1), stopped, step
 
 
@@ -1332,6 +1372,24 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
     else:
         LOGGER.info("số hạng phạt IGNITE: BẬT (lambda đầu %.4g, rho %.4g, epsilon %.4g)",
                     penalty.lambda_value, penalty.rho, penalty.epsilon)
+    # Việc 4 họp 09/11/2026: ép phản đối xứng bằng HÀM MẤT MÁT. Xem train_one_epoch.
+    antisymmetry_weight = float(settings.get("antisymmetry_penalty", 0.0) or 0.0)
+    if antisymmetry_weight < 0.0:
+        raise ValueError(f"antisymmetry_penalty phải >= 0, nhận {antisymmetry_weight}")
+    if antisymmetry_weight > 0.0:
+        LOGGER.info("số hạng phạt phản đối xứng: BẬT (w = %.4g) — mỗi batch chạy hai lượt "
+                    "forward nên chậm khoảng gấp đôi", antisymmetry_weight)
+        if model.antisymmetric_by_construction:
+            LOGGER.warning("kiến trúc %r ĐÃ phản đối xứng do cấu tạo: ở chế độ eval số "
+                           "hạng phạt này luôn bằng 0 nên không ép thêm được gì, chỉ còn "
+                           "tác dụng phụ là phạt phương sai do dropout giữa hai lượt "
+                           "forward. Chỉ bật cùng nhau khi đang đo chính tác dụng phụ đó.",
+                           head)
+        if float(config["stage3"]["model"]["dropout"]) > 0.0:
+            LOGGER.info("lưu ý khi đọc: dropout = %.4g > 0 nên số hạng phạt KHÔNG xuống 0 "
+                        "được lúc train (hai lượt forward lấy hai mặt nạ khác nhau); số "
+                        "phản đối xứng để báo cáo là số trong asymmetry_report ở chế độ "
+                        "eval.", float(config["stage3"]["model"]["dropout"]))
     eval_every = int(settings.get("eval_every_steps", 0) or 0)
     if smoke:
         # Smoke chỉ chạy vài nghìn dòng nên một epoch ngắn hơn eval_every rất nhiều;
@@ -1434,13 +1492,18 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
             return True
         return False
 
+    epoch_stats: dict[str, float] = {}
     for epoch in range(epochs):
         loss, stopped, steps = train_one_epoch(
             model, train_arrays_fit, caches, protein_source, device, optimizer, criterion,
             batch_size, float(settings["grad_clip"]), rng, penalty, eval_every,
             lambda step, current=epoch: consider(current, step, None),
-            group_by_protein, accumulate_steps)
+            group_by_protein, accumulate_steps, antisymmetry_weight, epoch_stats)
         LOGGER.info("epoch %s: %s bước", epoch, f"{steps:,}")
+        if "antisymmetry_violation" in epoch_stats:
+            # Trung bình (f(A,B) + f(B,A))^2 trên train, ở chế độ TRAIN (còn dropout).
+            LOGGER.info("epoch %s: phạt phản đối xứng trung bình %.6g", epoch,
+                        epoch_stats["antisymmetry_violation"])
         if stopped or consider(epoch, None, loss):
             break
 
@@ -1481,6 +1544,13 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "parameters": models.count_parameters(model),
         "fingerprint_bits": {"ligand": caches.ligand_bits, "fragment": caches.fragment_bits},
         "uses_edit_branch": model.uses_edit_branch,
+        # Trọng số của số hạng phạt phản đối xứng (việc 4 họp 09/11/2026). CHỈ ghi con số
+        # cấu hình, không ghi mức vi phạm đo được: scripts/group_runs.py gom các lần chạy
+        # theo các khóa này, nên một giá trị thay đổi theo hạt giống sẽ làm mỗi hạt thành
+        # một nhóm riêng và không bao giờ gom được. Mức vi phạm nằm trong log và trong
+        # asymmetry (đo ở chế độ eval).
+        "antisymmetry_penalty": antisymmetry_weight,
+        "antisymmetry_violation_last_epoch": epoch_stats.get("antisymmetry_violation"),
         "edit_filter": edit_filter,
         "branch_learning_rate_scale": dict(
             settings.get("branch_learning_rate_scale") or {}),

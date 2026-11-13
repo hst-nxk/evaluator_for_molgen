@@ -45,7 +45,7 @@ IDENTITY_KEYS = ("configuration", "head", "protein_mode", "model", "batch_size",
                  "augment_reverse", "train_subset", "partition_override",
                  "selection_metric", "selection_slice", "edit_filter",
                  "branch_learning_rate_scale", "sharpness_penalty", "accumulate_steps",
-                 "group_by_protein")
+                 "group_by_protein", "antisymmetry_penalty")
 
 
 def identity(manifest: dict[str, Any]) -> str:
@@ -63,9 +63,17 @@ def identity(manifest: dict[str, Any]) -> str:
     không đổi kết quả. `eval_batch_size` thì KHÔNG được bỏ qua: nó nằm trong nhãn, nên các
     lần chạy cũ không đặt khóa đó sẽ thành nhóm riêng. Đó cũng đúng, vì chúng là đợt khác.
     """
-    structural = json.dumps({key: manifest.get(key) for key in IDENTITY_KEYS},
-                            sort_keys=True, ensure_ascii=False, default=str)
-    return name_of(manifest) + "\n" + structural
+    structural = {key: manifest.get(key) for key in IDENTITY_KEYS}
+    # `sharpness_penalty` chứa lambda_final — giá trị ĐO ĐƯỢC ở cuối lần chạy, nên nó khác
+    # nhau giữa các hạt giống. Để nguyên thì mỗi lần chạy IGNITE thành một nhóm riêng, rồi
+    # --min-seeds lọc sạch chúng khỏi bảng mà không báo gì. Chỉ giữ phần CẤU HÌNH.
+    volatile = ("lambda_final",)
+    if isinstance(structural.get("sharpness_penalty"), dict):
+        structural["sharpness_penalty"] = {
+            key: value for key, value in structural["sharpness_penalty"].items()
+            if key not in volatile}
+    return name_of(manifest) + "\n" + json.dumps(structural, sort_keys=True,
+                                                 ensure_ascii=False, default=str)
 
 
 def name_of(manifest: dict[str, Any]) -> str:
