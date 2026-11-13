@@ -148,8 +148,15 @@ def main() -> int:
         if value is None:
             continue
         group = groups.setdefault(identity(manifest),
-                                  {"name": name_of(manifest), "seeds": {}})
+                                  {"name": name_of(manifest), "seeds": {}, "rulers": {}})
         seed = int(manifest.get("seed") or 0)
+        # THƯỚC ĐO của lần chạy (khối `metrics`), ghi vào manifest từ 13/11/2026. Không
+        # dùng để nhóm (các lần chạy cũ không có khóa này, nhóm theo nó là tách đôi mọi
+        # bảng), nhưng một nhóm trộn hai thước đo khác nhau thì trung bình vô nghĩa, nên
+        # phải nói ra.
+        if manifest.get("metrics") is not None:
+            group["rulers"][seed] = json.dumps(manifest["metrics"], sort_keys=True,
+                                               ensure_ascii=False, default=str)
         # Cùng hạt giống chạy lại hai lần: giữ lần MỚI NHẤT, và nói ra.
         if seed in group["seeds"]:
             print(f"ghi chú: {group['name']} có hai lần chạy hạt {seed}; lấy lần mới hơn",
@@ -162,6 +169,12 @@ def main() -> int:
             continue
         if args.grep and args.grep not in group["name"]:
             continue
+        rulers = {group["rulers"][seed] for seed in sorted(group["seeds"])
+                  if seed in group["rulers"]}
+        if len(rulers) > 1:
+            print(f"CẢNH BÁO: {group['name']} gom các lần chạy có khối `metrics` KHÁC nhau"
+                  f" ({len(rulers)} thước đo); trung bình của nhóm này không đọc được",
+                  file=sys.stderr)
         points = [group["seeds"][seed] for seed in sorted(group["seeds"])]
         rows.append((statistics.fmean(points),
                      statistics.stdev(points) if len(points) > 1 else None,

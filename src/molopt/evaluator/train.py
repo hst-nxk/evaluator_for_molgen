@@ -1552,6 +1552,18 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "antisymmetry_penalty": antisymmetry_weight,
         "antisymmetry_violation_last_epoch": epoch_stats.get("antisymmetry_violation"),
         "edit_filter": edit_filter,
+        # Ảnh chụp khối `metrics` đang dùng: THƯỚC ĐO của lần chạy này, không phải tham số
+        # của mô hình. Phải ghi vì trước 13/11/2026 manifest không có nó, nên
+        # scripts/group_runs.py chỉ nhìn thấy thay đổi phép đo khi nó được `--set` tường
+        # minh; đổi mặc định trong config.json giữa hai đợt thì hai đợt đo bằng hai thước
+        # khác nhau vẫn bị gộp làm một nhóm và trung bình ra số vô nghĩa. Thấy chỗ hở này
+        # khi nhóm `expand_both_directions=False` (một khóa của `metrics`) hiện ra trong
+        # bảng với chênh +0,0046 — con số đó KHÔNG so được với đối chứng vì nó đo trên tập
+        # query khác. CỐ Ý không đưa vào IDENTITY_KEYS: các lần chạy cũ không có khóa này,
+        # thêm vào là mọi nhóm cũ bị tách khỏi nhóm mới. group_runs.py chỉ CẢNH BÁO khi một
+        # nhóm trộn hai ảnh chụp khác nhau.
+        "metrics": {key: value for key, value in config["stage3"]["metrics"].items()
+                    if not key.endswith("note")},
         "branch_learning_rate_scale": dict(
             settings.get("branch_learning_rate_scale") or {}),
         "sharpness_penalty": None if penalty is None else {

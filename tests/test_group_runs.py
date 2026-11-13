@@ -86,3 +86,50 @@ def test_the_antisymmetry_weight_splits_groups() -> None:
     overrides = {"antisymmetry_penalty": 1.0}
     assert (group_runs.identity(manifest(overrides, antisymmetry_penalty=1.0))
             != group_runs.identity(manifest({}, antisymmetry_penalty=0.0)))
+
+
+def test_a_group_that_mixes_two_rulers_is_called_out(capsys) -> None:
+    """Khối `metrics` khác nhau = đo bằng hai thước; trung bình nhóm đó vô nghĩa."""
+    import json as _json
+    import tempfile
+    from pathlib import Path as _Path
+
+    overrides = {"model.head_block": "residual"}
+    runs = [
+        manifest(overrides, seed=20261023,
+                 metrics={"expand_both_directions": True},
+                 validation_metrics={"strict": {"ranking": {"pairwise_accuracy_macro": 0.55}}}),
+        manifest(overrides, seed=20261024,
+                 metrics={"expand_both_directions": False},
+                 validation_metrics={"strict": {"ranking": {"pairwise_accuracy_macro": 0.56}}}),
+    ]
+    with tempfile.TemporaryDirectory() as folder:
+        for index, run in enumerate(runs):
+            (_Path(folder) / f"train_{index}.json").write_text(
+                _json.dumps(run), encoding="utf-8")
+        sys.argv = ["group_runs.py", "--slice", "strict", "--min-seeds", "2",
+                    "--runs-dir", folder]
+        assert group_runs.main() == 0
+    assert "CẢNH BÁO" in capsys.readouterr().err
+
+
+def test_runs_without_the_ruler_key_do_not_warn(capsys) -> None:
+    """Các lần chạy trước 13/11/2026 không có khóa `metrics`: không được báo động giả."""
+    import json as _json
+    import tempfile
+    from pathlib import Path as _Path
+
+    overrides = {"model.head_block": "residual"}
+    runs = [
+        manifest(overrides, seed=seed,
+                 validation_metrics={"strict": {"ranking": {"pairwise_accuracy_macro": 0.55}}})
+        for seed in (20261023, 20261024)
+    ]
+    with tempfile.TemporaryDirectory() as folder:
+        for index, run in enumerate(runs):
+            (_Path(folder) / f"train_{index}.json").write_text(
+                _json.dumps(run), encoding="utf-8")
+        sys.argv = ["group_runs.py", "--slice", "strict", "--min-seeds", "2",
+                    "--runs-dir", folder]
+        assert group_runs.main() == 0
+    assert "CẢNH BÁO" not in capsys.readouterr().err
