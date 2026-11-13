@@ -147,21 +147,36 @@ def main() -> int:
               + (f" khớp '{args.grep}'" if args.grep else ""))
         return 0
 
+    # Phần phân biệt các dòng nằm ở CUỐI nhãn (ligand_features, train_subset, fusion...),
+    # còn đầu nhãn thì mọi dòng giống nhau. Cắt từ bên phải là cắt mất đúng phần cần đọc,
+    # nên bỏ hẳn tiền tố chung và in nó một lần.
+    token_lists = [name.split(" ") for _, _, _, name, _, _ in rows]
+    shared: list[str] = []
+    if len(token_lists) > 1:
+        for tokens in zip(*token_lists):
+            if len(set(tokens)) != 1:
+                break
+            shared.append(tokens[0])
+    prefix = len(shared)
+
     width = args.width
     print(f"lát {args.slice_name} | {args.metric} | nhóm = giống nhau mọi thứ trừ hạt giống"
           f" | sd mẫu (n-1) | {runs_dir}")
-    print(f"{'trung bình':>11}{'sd':>9}{'n':>4}  {'từng hạt':<26}lần chạy")
+    if shared:
+        print(f"mọi dòng dưới đây đều có: {' '.join(shared)}")
+    print(f"{'trung bình':>11}{'sd':>9}{'n':>4}  {'từng hạt':<26}khác nhau ở")
     print("-" * (50 + width))
     for mean, sd, count, name, seeds, points in rows:
+        rest = " ".join(name.split(" ")[prefix:]) or "(không còn khác gì)"
         each = " ".join(f"{value:.4f}" for value in points)
-        shown = name if len(name) <= width else name[:width - 1] + "…"
+        shown = rest if len(rest) <= width else "…" + rest[-(width - 1):]
         sd_text = "" if sd is None else f"{sd:.4f}"
         print(f"{mean:>11.4f}{sd_text:>9}{count:>4}  {each:<26}{shown}")
     print()
-    print("Hạt giống của từng nhóm, theo thứ tự cột 'từng hạt':")
-    for _, _, _, name, seeds, _ in rows:
-        shown = name if len(name) <= width else name[:width - 1] + "…"
-        print(f"   {' '.join(str(seed) for seed in seeds)}  {shown}")
+    print("Thứ tự hạt giống của cột 'từng hạt' (giống nhau ở mọi nhóm nếu chỉ in một dòng):")
+    orders = {" ".join(str(seed) for seed in seeds) for _, _, _, _, seeds, _ in rows}
+    for order in sorted(orders):
+        print(f"   {order}")
     return 0
 
 
