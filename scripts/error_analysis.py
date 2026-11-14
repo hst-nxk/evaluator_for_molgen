@@ -1,11 +1,12 @@
 """Task 1 họp 09/11/2026: phân tích lỗi trên checkpoint hiện tại, không cần train lại.
 
-Năm lệnh con, tất cả đều đọc thư mục `rows.parquet` do `--mode errors` ghi ra:
+Sáu lệnh con, tất cả đều đọc thư mục `rows.parquet` do `--mode errors` ghi ra:
 
     python scripts/error_analysis.py gap     --train <dir_train> --validation <dir_val>
     python scripts/error_analysis.py hist    --train <dir_train> --validation <dir_val>
     python scripts/error_analysis.py classes --train <dir_train> --validation <dir_val>
     python scripts/error_analysis.py flip    --validation <dir_val> [--train <dir_train>]
+    python scripts/error_analysis.py lookup  --train <dir_train> --validation <dir_val>
     python scripts/error_analysis.py context --rows <dir> [--worst 200]
     python scripts/error_analysis.py scale   --rows <dir>
 
@@ -36,6 +37,19 @@ VÌ SAO TỪNG LỆNH, và nó trả lời câu nào của ai:
             thêm --train thì đo tiếp phép thử mạnh hơn: với các dòng validation trùng cặp
             (A, B) với train, dự đoán của mô hình tương quan với nhãn THẬT của dòng
             validation hơn, hay với nhãn của dòng TRAIN cùng cặp hơn.
+    lookup — KHÔNG có trong biên bản; sinh ra ngày 14/11/2026 từ số của đợt 4. Cách chia
+            theo CẶP (trùng protein được, trùng cặp thì không) cho Morgan 0,7769 so
+            MoLFormer 0,6583, tức ĐỔI CHIỀU kết luận chính của paper, chênh +0,1186 —
+            hiệu ứng lớn nhất dự án từng đo. Giả thuyết: khi protein P đã có trong train,
+            bài toán chuyển dần về TRA CỨU, mà Morgan mã hóa cấu trúc chính xác nên khớp
+            lại được đúng phân tử đã thấy. `flip` không đo được giả thuyết đó trên cách
+            chia này (nó đòi cùng cặp xuất hiện với >= 2 protein, mà validation đợt 4 có
+            24.751 cặp phân biệt trên 24.946 dòng). Lệnh này chia dòng validation theo
+            min(số lần thấy A, số lần thấy B) trong train, rồi so đúng chiều và MAE theo
+            thùng; bảng thứ hai chặt hơn, đòi cả A và B đã thấy cùng ĐÚNG protein của
+            dòng đó. Bằng chứng KHÔNG nằm trong một mô hình mà trong HIỆU hai mô hình:
+            lợi thế của Morgan dồn vào thùng tần suất cao và tắt ở thùng 0 thì cơ chế tra
+            cứu được xác nhận; rải đều mọi thùng thì không phải tra cứu.
     context — NỬA CÒN LẠI của việc 9 họp 09/11/2026. Biên bản giao hai lát: (a) "cùng cặp
             (A, B), khác Context P" — đó là lệnh `flip`; và (b) "cùng Context P, khác cặp
             (A, B)" — đó là lệnh này. Câu hỏi của lát (b) ngược hẳn với lát (a): trong
@@ -78,6 +92,11 @@ ROWS_FILE = "rows.parquet"
 # Ngưỡng của Tùng ở dòng 85 biên bản 09/11/2026, tính theo SỐ DÒNG của Context P trong
 # chính partition đang xét (cột protein_rows của rows.parquet).
 SCALE_EDGES = (1_000, 10_000, 50_000)
+
+# Bờ DƯỚI của các thùng "phân tử này xuất hiện bao nhiêu lần trong train" (xem run_lookup).
+# Chọn thưa dần vì phân phối tần suất phân tử lệch nặng: phần lớn phân tử xuất hiện 1-2
+# lần, một ít xuất hiện hàng trăm lần.
+LOOKUP_EDGES = (0, 1, 2, 5, 20)
 
 
 def read_rows(folder: Path) -> pa.Table:
@@ -834,6 +853,148 @@ def run_classes(args: argparse.Namespace) -> int:
     return 0
 
 
+def molecule_occurrences(table: pa.Table) -> tuple[dict[str, int], set[tuple[str, str]]]:
+    """Đếm phân tử trong một dump train: (số lần mỗi SMILES xuất hiện, tập (SMILES, protein)).
+
+    Một dòng đóng góp CẢ HAI phía A và B, vì "đã thấy phân tử này trong train" không phân
+    biệt nó nằm bên nào của cặp.
+
+    Tập (SMILES, protein) là dấu hiệu tra cứu CHẶT hơn: phân tử đã xuất hiện trong train
+    cùng ĐÚNG protein đang hỏi thì mô hình chỉ cần nhớ lại, không cần tổng quát hóa gì.
+    """
+    counts: dict[str, int] = {}
+    seen_with_protein: set[tuple[str, str]] = set()
+    proteins = table.column("protein_hash").to_pylist()
+    for name in ("smiles_a", "smiles_b"):
+        for smiles, protein in zip(table.column(name).to_pylist(), proteins):
+            counts[smiles] = counts.get(smiles, 0) + 1
+            seen_with_protein.add((smiles, protein))
+    return counts, seen_with_protein
+
+
+def lookup_bucket_labels() -> list[str]:
+    """Nhãn các thùng tần suất, khớp đúng thứ tự LOOKUP_EDGES."""
+    labels = []
+    for index, low in enumerate(LOOKUP_EDGES):
+        if index + 1 < len(LOOKUP_EDGES):
+            high = LOOKUP_EDGES[index + 1] - 1
+            labels.append(f"{low}" if low == high else f"{low}-{high}")
+        else:
+            labels.append(f">={low}")
+    return labels
+
+
+def run_lookup(args: argparse.Namespace) -> int:
+    """Lợi thế của mô hình có tập trung vào các dòng đã THẤY phân tử trong train không?
+
+    VÌ SAO CÓ LỆNH NÀY (14/11/2026): đợt 4 chia theo CẶP (trùng protein được, trùng cặp
+    thì không) cho Morgan 0,7769 so MoLFormer 0,6583, tức ĐỔI CHIỀU kết luận chính, với
+    chênh lệch +0,1186 — hiệu ứng lớn nhất dự án từng đo. Giả thuyết: khi protein P đã có
+    trong train, bài toán chuyển dần về TRA CỨU, và Morgan mã hóa cấu trúc chính xác nên
+    khớp lại được đúng phân tử đã thấy, còn embedding MoLFormer trơn nên mất lợi thế đó.
+
+    `flip` KHÔNG đo được giả thuyết này trên cách chia đó: nó đòi cùng một cặp (A, B) xuất
+    hiện với >= 2 Context P, mà validation của đợt 4 có 24.751 cặp phân biệt trên 24.946
+    dòng, nên gần như không nhóm nào đủ điều kiện. Lệnh này đo trực tiếp: chia dòng
+    validation theo "phân tử A và B đã xuất hiện bao nhiêu lần trong train", rồi xem đúng
+    chiều và MAE theo từng thùng.
+
+    Thùng lấy theo min(số lần thấy A, số lần thấy B): tra cứu cần CẢ HAI phía, một phía lạ
+    là đã phải tổng quát hóa. Bảng thứ hai chặt hơn: cả A và B đã từng xuất hiện trong
+    train cùng ĐÚNG protein của dòng đó.
+
+    Dump train đọc KHÔNG cắt lát — nó là kho đối chiếu, mọi dòng train đều đã được mô hình
+    thấy. Chỉ validation mới cắt lát.
+    """
+    train_table = read_rows(Path(args.train))
+    validation_table = select_slice(read_rows(Path(args.validation)), args.slice)
+    for label, table in (("train", train_table), ("validation", validation_table)):
+        missing = sorted({"smiles_a", "smiles_b"} - set(table.column_names))
+        if missing:
+            raise ValueError(f"dump {label} thiếu cột {missing}; chạy lại --mode errors "
+                             f"(các cột này được thêm ngày 10/11/2026)")
+
+    counts, seen_with_protein = molecule_occurrences(train_table)
+    first = validation_table.column("smiles_a").to_pylist()
+    second = validation_table.column("smiles_b").to_pylist()
+    proteins = validation_table.column("protein_hash").to_pylist()
+    times = np.array([min(counts.get(a, 0), counts.get(b, 0))
+                      for a, b in zip(first, second)], dtype=np.int64)
+    both_with_protein = np.array(
+        [((a, p) in seen_with_protein) and ((b, p) in seen_with_protein)
+         for a, b, p in zip(first, second, proteins)], dtype=bool)
+
+    truth, prediction = columns(validation_table, "delta_p", "prediction")
+    counted, correct = columns(validation_table, "sign_counted", "sign_correct")
+    counted, correct = counted.astype(bool), correct.astype(bool)
+
+    def block(mask: np.ndarray, label: str) -> dict[str, Any]:
+        rows = int(np.count_nonzero(mask))
+        if rows == 0:
+            return {"nhãn": label, "dòng": 0, "tỉ lệ dòng": 0.0, "mae": None,
+                    "đúng chiều": None, "mẫu số": 0}
+        accuracy, denominator = sign_accuracy(counted[mask], correct[mask])
+        return {"nhãn": label, "dòng": rows,
+                "tỉ lệ dòng": rows / float(validation_table.num_rows),
+                "mae": float(np.mean(np.abs(prediction[mask] - truth[mask]))),
+                "đúng chiều": accuracy, "mẫu số": denominator}
+
+    labels = lookup_bucket_labels()
+    buckets = []
+    for index, low in enumerate(LOOKUP_EDGES):
+        mask = times >= low
+        if index + 1 < len(LOOKUP_EDGES):
+            mask = mask & (times < LOOKUP_EDGES[index + 1])
+        buckets.append(block(mask, labels[index]))
+
+    report: dict[str, Any] = {
+        "train": Path(args.train).name,
+        "validation": Path(args.validation).name,
+        "slice": args.slice,
+        "label": args.label,
+        "rows": int(validation_table.num_rows),
+        "phân tử phân biệt trong train": len(counts),
+        "theo min(số lần thấy A, số lần thấy B)": buckets,
+        "cả A và B đã thấy cùng protein": block(both_with_protein, "có"),
+        "không": block(~both_with_protein, "không"),
+        "tất cả": block(np.ones(validation_table.num_rows, dtype=bool), "tất cả"),
+    }
+
+    name = args.label or Path(args.validation).name
+    print(f"\n=== {name} · lát {args.slice} · {validation_table.num_rows:,} dòng "
+          f"validation · train {train_table.num_rows:,} dòng, "
+          f"{len(counts):,} phân tử phân biệt")
+    print("\nmin(số lần thấy A, số lần thấy B) trong train:")
+    print(f"{'thùng':>8} {'dòng':>10} {'tỉ lệ':>8} {'MAE':>8} {'đúng chiều':>12} "
+          f"{'mẫu số':>10}")
+    for entry in buckets:
+        print(f"{entry['nhãn']:>8} {entry['dòng']:>10,} "
+              f"{entry['tỉ lệ dòng'] * 100:>7.1f}% {show(entry['mae']):>8} "
+              f"{show(entry['đúng chiều']):>12} {entry['mẫu số']:>10,}")
+    print("\ncả A và B đã xuất hiện trong train CÙNG ĐÚNG protein của dòng đó:")
+    for key in ("cả A và B đã thấy cùng protein", "không", "tất cả"):
+        entry = report[key]
+        print(f"{entry['nhãn']:>8} {entry['dòng']:>10,} "
+              f"{entry['tỉ lệ dòng'] * 100:>7.1f}% {show(entry['mae']):>8} "
+              f"{show(entry['đúng chiều']):>12} {entry['mẫu số']:>10,}")
+
+    low_bucket, high_bucket = buckets[0], buckets[-1]
+    if low_bucket["đúng chiều"] is not None and high_bucket["đúng chiều"] is not None:
+        print(f"\nchênh thùng '{high_bucket['nhãn']}' trừ thùng '{low_bucket['nhãn']}': "
+              f"{high_bucket['đúng chiều'] - low_bucket['đúng chiều']:+.4f} đúng chiều")
+        print("ĐỌC THẾ NÀO: số này một mình KHÔNG chứng minh tra cứu — thùng tần suất cao "
+              "cũng có thể dễ hơn vì lý do khác. Bằng chứng là HIỆU giữa hai mô hình: nếu "
+              "lợi thế của Morgan dồn vào thùng cao và tắt ở thùng 0 thì cơ chế tra cứu "
+              "được xác nhận; nếu lợi thế rải đều mọi thùng thì KHÔNG phải tra cứu.")
+    if args.out:
+        target = Path(args.out)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(report, ensure_ascii=False, indent=2),
+                          encoding="utf-8")
+        print(f"\nđã ghi {target}")
+    return 0
+
+
 def main() -> int:
     """Phân tích tham số và gọi lệnh con. Trả về mã thoát (0 = xong)."""
     if hasattr(sys.stdout, "reconfigure"):
@@ -903,6 +1064,20 @@ def main() -> int:
     scale.add_argument("--rows", required=True, help="thư mục errors_*")
     scale.add_argument("--out", default="")
     scale.set_defaults(handler=run_scale)
+
+    lookup = subparsers.add_parser(
+        "lookup", help="đúng chiều theo số lần phân tử A, B đã xuất hiện trong train")
+    lookup.add_argument("--train", required=True,
+                        help="thư mục errors_*_train_* — kho đối chiếu, KHÔNG cắt lát")
+    lookup.add_argument("--validation", required=True,
+                        help="thư mục errors_*_validation_* của CÙNG checkpoint")
+    lookup.add_argument("--slice", default="all", choices=SLICE_NAMES,
+                        help="lát của validation; trên cách chia theo cặp thì strict "
+                             "trùng all vì mọi cặp validation đều chưa thấy ở train")
+    lookup.add_argument("--label", default="",
+                        help="tên mô hình để in và ghi vào .json, ví dụ 'Morgan'")
+    lookup.add_argument("--out", default="", help="file .json để ghi; mặc định chỉ in")
+    lookup.set_defaults(handler=run_lookup)
 
     args = parser.parse_args()
     return int(args.handler(args))
