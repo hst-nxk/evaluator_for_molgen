@@ -123,6 +123,30 @@ def select_slice(table: pa.Table, name: str) -> pa.Table:
     return kept
 
 
+def partition_slice(table: pa.Table, name: str, label: str) -> tuple[pa.Table, str]:
+    """Lát cắt cho MỘT partition; trả về (bảng đã lọc, tên lát THỰC SỰ dùng).
+
+    Lát `strict` giữ các cặp (A, B) chưa thấy trong train, nên TRÊN TRAIN nó rỗng theo
+    đúng định nghĩa — mọi cặp của train đều đã thấy trong train. Gọi `strict` cho cặp
+    train + validation là chuyện thường (lát chỉ có nghĩa ở validation), nên ở riêng train
+    ta lùi về `all`, IN CẢNH BÁO, và trả về tên lát thật để nó đi vào tiêu đề hình và vào
+    .json. Không lùi âm thầm: số lát `all` và số lát `strict` không so thẳng với nhau được.
+
+    Trên validation thì KHÔNG lùi: lát strict rỗng ở đó nghĩa là dump hỏng hoặc chia tập
+    sai, phải dừng chứ không được lặng lẽ đổi thước đo giữa chừng.
+    """
+    if name == "strict" and label == "train" and "unseen_pair" in table.column_names:
+        kept = table.filter(pc.equal(table.column("unseen_pair"), True))
+        if kept.num_rows == 0:
+            print("CẢNH BÁO: lát strict rỗng trên train (đúng định nghĩa: mọi cặp của "
+                  "train đều đã thấy trong train) -> cột train dưới đây là lát `all`, "
+                  "KHÔNG so trực tiếp được với cột validation lát `strict`.",
+                  file=sys.stderr)
+            return table, "all (strict rỗng trên train)"
+        return kept, name
+    return select_slice(table, name), name
+
+
 def config_threshold() -> float:
     """Ngưỡng ba lớp mặc định, ĐỌC từ config.json chứ không chép số vào script."""
     data = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
@@ -189,7 +213,9 @@ def run_gap(args: argparse.Namespace) -> int:
     for label, folder in (("train", args.train), ("validation", args.validation)):
         if not folder:
             continue
-        blocks[label] = row_summary(select_slice(read_rows(Path(folder)), args.slice))
+        table, used = partition_slice(read_rows(Path(folder)), args.slice, label)
+        blocks[label] = row_summary(table)
+        blocks[label]["slice"] = used
     if not blocks:
         raise ValueError("cần ít nhất một trong --train hoặc --validation")
     print(f"lát cắt: {args.slice}"
@@ -245,14 +271,14 @@ def run_hist(args: argparse.Namespace) -> int:
     edges = np.linspace(-args.range, args.range, args.bins + 1)
     report: dict[str, Any] = {}
     for index, (label, folder) in enumerate(picked):
-        table = select_slice(read_rows(folder), args.slice)
+        table, used = partition_slice(read_rows(folder), args.slice, label)
         truth, prediction = columns(table, "delta_p", "prediction")
         top = axes[0][index]
         top.hist(truth, bins=edges, histtype="step", linewidth=1.6, density=True,
                  label=f"nhãn thật (sd {truth.std():.3f})")
         top.hist(prediction, bins=edges, histtype="step", linewidth=1.6, density=True,
                  label=f"dự đoán (sd {prediction.std():.3f})")
-        top.set_title(f"{label} · lát {args.slice}: {table.num_rows:,} dòng")
+        top.set_title(f"{label} · lát {used}: {table.num_rows:,} dòng")
         top.set_xlabel("Δp")
         top.set_ylabel("mật độ")
         top.legend(fontsize=8)
@@ -267,7 +293,8 @@ def run_hist(args: argparse.Namespace) -> int:
         bottom.set_ylabel("Δp dự đoán")
         bottom.legend(fontsize=8)
         report[label] = {
-            "slice": args.slice,
+            "slice": used,
+            "slice_requested": args.slice,
             "rows": table.num_rows,
             "truth": {"mean": float(truth.mean()), "sd": float(truth.std()),
                       "min": float(truth.min()), "max": float(truth.max())},
@@ -717,7 +744,7 @@ def run_classes(args: argparse.Namespace) -> int:
                                squeeze=False)
     report: dict[str, Any] = {}
     for index, (label, folder) in enumerate(picked):
-        table = select_slice(read_rows(folder), args.slice)
+        table, used = partition_slice(read_rows(folder), args.slice, label)
         truth, prediction = columns(table, "delta_p", "prediction")
         scores = metric_module.change_class_metrics(truth.astype(np.float64),
                                                     prediction.astype(np.float64),
@@ -738,7 +765,7 @@ def run_classes(args: argparse.Namespace) -> int:
         top.set_yticks(range(size), ticks)
         top.set_xlabel("dự đoán")
         top.set_ylabel("nhãn thật")
-        top.set_title(f"{label} · lát {args.slice} · {int(total):,} dòng\n"
+        top.set_title(f"{label} · lát {used} · {int(total):,} dòng\n"
                       f"accuracy {show(scores.get('accuracy'))} · "
                       f"macro-F1 {show(scores.get('macro_f1'))} · mỗi hàng cộng 100 %",
                       fontsize=9)
@@ -762,7 +789,8 @@ def run_classes(args: argparse.Namespace) -> int:
         bottom.legend(fontsize=8)
         report[label] = dict(scores)
         report[label].update({
-            "slice": args.slice,
+            "slice": used,
+            "slice_requested": args.slice,
             "rows": int(total),
             "truth_share": {name: float(value)
                             for name, value in zip(names, truth_share)},

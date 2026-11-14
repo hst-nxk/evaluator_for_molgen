@@ -205,3 +205,61 @@ def test_gap_reads_the_slice_it_was_given(tmp_path: Path, capsys) -> None:
     assert "rows" in strict and strict.count("1") >= 1
     assert "0.0000" in strict
     assert "0.0000" not in every.split("mae")[1].split("\n")[0]
+
+
+# ------------------------------------------------- lát strict trên train
+
+def test_strict_on_train_falls_back_to_all_and_says_so(tmp_path: Path, capsys) -> None:
+    """Mọi cặp của train đều đã thấy trong train, nên lát strict ở đó rỗng theo định nghĩa.
+
+    Lùi về `all` thì được, nhưng phải NÓI RA: cảnh báo ra stderr, tên lát thật vào .json
+    và vào tiêu đề hình. Lặng lẽ lùi là đổi thước đo giữa chừng.
+    """
+    train = write_rows(tmp_path / "errors_train",
+                       [{"truth": 1.0, "prediction": 0.9, "unseen": False},
+                        {"truth": -1.0, "prediction": -0.9, "unseen": False}])
+    validation = write_rows(tmp_path / "errors_val",
+                            [{"truth": 2.0, "prediction": 0.1, "unseen": True},
+                             {"truth": -2.0, "prediction": 0.0, "unseen": False}])
+    target = tmp_path / "classes.png"
+    assert analysis.run_classes(arguments(validation, train=str(train),
+                                          out=str(target))) == 0
+    captured = capsys.readouterr()
+    assert "CẢNH BÁO" in captured.err and "strict rỗng trên train" in captured.err
+    written = json.loads(target.with_suffix(".json").read_text(encoding="utf-8"))
+    assert written["train"]["slice"] == "all (strict rỗng trên train)"
+    assert written["train"]["slice_requested"] == "strict"
+    assert written["train"]["rows"] == 2
+    # validation vẫn được lọc thật: chỉ còn 1 dòng unseen_pair = True.
+    assert written["validation"]["slice"] == "strict"
+    assert written["validation"]["rows"] == 1
+
+
+def test_strict_on_validation_still_raises_when_empty(tmp_path: Path) -> None:
+    """Ở validation, lát strict rỗng là dấu hiệu hỏng — phải dừng, không được lùi."""
+    folder = write_rows(tmp_path / "errors",
+                        [{"truth": 1.0, "prediction": 0.9, "unseen": False}])
+    with pytest.raises(ValueError, match="không còn dòng nào"):
+        analysis.run_classes(arguments(folder))
+
+
+def test_train_with_some_unseen_pairs_is_filtered_not_waved_through(tmp_path: Path) -> None:
+    """Nếu train THẬT SỰ có cặp unseen thì vẫn lọc bình thường, không lùi."""
+    folder = write_rows(tmp_path / "errors_train",
+                        [{"truth": 1.0, "prediction": 0.9, "unseen": True},
+                         {"truth": -1.0, "prediction": -0.9, "unseen": False}])
+    table, used = analysis.partition_slice(analysis.read_rows(folder), "strict", "train")
+    assert used == "strict" and table.num_rows == 1
+
+
+def test_gap_reports_the_slice_it_actually_used_per_partition(tmp_path: Path) -> None:
+    train = write_rows(tmp_path / "errors_train",
+                       [{"truth": 1.0, "prediction": 0.9, "unseen": False}])
+    validation = write_rows(tmp_path / "errors_val",
+                            [{"truth": 2.0, "prediction": 0.1, "unseen": True}])
+    out = tmp_path / "gap.json"
+    analysis.run_gap(argparse.Namespace(train=str(train), validation=str(validation),
+                                        slice="strict", out=str(out)))
+    blocks = json.loads(out.read_text(encoding="utf-8"))
+    assert blocks["train"]["slice"].startswith("all")
+    assert blocks["validation"]["slice"] == "strict"
