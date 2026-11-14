@@ -186,17 +186,25 @@ def main() -> int:
               + (f" khớp '{args.grep}'" if args.grep else ""))
         return 0
 
-    # Phần phân biệt các dòng nằm ở CUỐI nhãn (ligand_features, train_subset, fusion...),
-    # còn đầu nhãn thì mọi dòng giống nhau. Cắt từ bên phải là cắt mất đúng phần cần đọc,
-    # nên bỏ hẳn tiền tố chung và in nó một lần.
+    # Bỏ MỌI mảnh có mặt ở tất cả các dòng, không chỉ tiền tố chung, rồi in chúng một lần.
+    #
+    # Bản trước chỉ bỏ tiền tố chung và cắt nhãn dài từ bên phải, vì hồi đó
+    # `summarize_runs.label` xếp mảnh theo thứ tự cờ `--set` nên phần phân biệt nằm ở CUỐI.
+    # Ngày 13/11/2026 `name_of` bắt đầu sắp xếp các mảnh theo thứ tự chữ cái (để thứ tự cờ
+    # không tạo nhóm mới) — phần phân biệt chuyển lên ĐẦU nhãn, đúng chỗ bị cắt. Bảng đợt
+    # đêm 13/11 in ra 5 nhóm mới mà cả 5 hiện cùng một cái đuôi `residual_* selection_*
+    # weight_decay=0.0`, không phân biệt được MoLFormer với Morgan, không thấy `no_protein`
+    # hay `twin` — số đo tốt mà bảng không đọc được thì cũng như không có.
+    #
+    # Bỏ theo TẬP HỢP thì mảnh chung nằm rải rác ở đâu cũng bị bỏ, nên phần còn lại của mỗi
+    # dòng đúng là phần làm nó khác các dòng khác, và hiếm khi còn dài tới mức phải cắt.
     token_lists = [name.split(" ") for _, _, _, name, _, _ in rows]
-    shared: list[str] = []
+    shared_set: set[str] = set()
     if len(token_lists) > 1:
-        for tokens in zip(*token_lists):
-            if len(set(tokens)) != 1:
-                break
-            shared.append(tokens[0])
-    prefix = len(shared)
+        shared_set = set(token_lists[0]).intersection(*token_lists[1:])
+    # In theo thứ tự của dòng đầu để người đọc còn nhận ra cấu hình, không phải thứ tự
+    # ngẫu nhiên của set.
+    shared = [token for token in token_lists[0] if token in shared_set]
 
     width = args.width
     print(f"lát {args.slice_name} | {args.metric} | nhóm = giống nhau mọi thứ trừ hạt giống"
@@ -206,9 +214,13 @@ def main() -> int:
     print(f"{'trung bình':>11}{'sd':>9}{'n':>4}  {'từng hạt':<26}khác nhau ở")
     print("-" * (50 + width))
     for mean, sd, count, name, seeds, points in rows:
-        rest = " ".join(name.split(" ")[prefix:]) or "(không còn khác gì)"
+        rest = " ".join(token for token in name.split(" ")
+                        if token not in shared_set) or "(không còn khác gì)"
         each = " ".join(f"{value:.4f}" for value in points)
-        shown = rest if len(rest) <= width else "…" + rest[-(width - 1):]
+        # Cắt từ bên PHẢI: sau khi `name_of` sắp xếp theo chữ cái, phần phân biệt nằm ở đầu
+        # (antisymmetry_penalty, ligand_features, no_protein, twin...), còn đuôi là
+        # residual_*/selection_*/weight_decay. Giữ đầu, bỏ đuôi.
+        shown = rest if len(rest) <= width else rest[:width - 1] + "…"
         sd_text = "" if sd is None else f"{sd:.4f}"
         print(f"{mean:>11.4f}{sd_text:>9}{count:>4}  {each:<26}{shown}")
     print()

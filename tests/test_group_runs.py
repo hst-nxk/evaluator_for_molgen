@@ -133,3 +133,45 @@ def test_runs_without_the_ruler_key_do_not_warn(capsys) -> None:
                     "--runs-dir", folder]
         assert group_runs.main() == 0
     assert "CẢNH BÁO" not in capsys.readouterr().err
+
+
+def write_runs(folder, runs) -> None:
+    """Ghi các manifest ra thư mục tạm để gọi main()."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    for index, run in enumerate(runs):
+        (_Path(folder) / f"train_{index}.json").write_text(
+            _json.dumps(run), encoding="utf-8")
+
+
+def score(value: float) -> dict:
+    return {"strict": {"ranking": {"pairwise_accuracy_macro": value}}}
+
+
+def test_the_table_shows_what_actually_differs(capsys) -> None:
+    """Mảnh phân biệt nằm ở ĐẦU nhãn sau khi sắp xếp, không được bị cắt mất.
+
+    Lỗi thật đêm 13/11/2026: năm nhóm mới in ra cùng một cái đuôi
+    `residual_* selection_* weight_decay=0.0`, không phân biệt được MoLFormer với Morgan,
+    không thấy `no_protein` hay `twin`. Số đo tốt mà bảng không đọc được thì như không có.
+    """
+    import tempfile
+
+    long_tail = {f"model.residual_width_{index}": 102 for index in range(12)}
+    runs = []
+    for seed in (20261023, 20261024):
+        runs.append(manifest({**long_tail, "model.ligand_features": "embedding"},
+                             seed=seed, validation_metrics=score(0.5588)))
+        runs.append(manifest({**long_tail, "antisymmetry_penalty": 3.0}, seed=seed,
+                             antisymmetry_penalty=3.0, validation_metrics=score(0.5532)))
+    with tempfile.TemporaryDirectory() as folder:
+        write_runs(folder, runs)
+        sys.argv = ["group_runs.py", "--slice", "strict", "--min-seeds", "2",
+                    "--runs-dir", folder, "--width", "40"]
+        assert group_runs.main() == 0
+    out = capsys.readouterr().out
+    assert "ligand_features=embedding" in out
+    assert "antisymmetry_penalty=3.0" in out
+    # Phần chung phải được in MỘT lần ở dòng đầu, không lặp lại trên từng dòng.
+    assert out.count("residual_width_11=102") == 1
