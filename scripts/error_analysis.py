@@ -4,6 +4,7 @@ Năm lệnh con, tất cả đều đọc thư mục `rows.parquet` do `--mode e
 
     python scripts/error_analysis.py gap     --train <dir_train> --validation <dir_val>
     python scripts/error_analysis.py hist    --train <dir_train> --validation <dir_val>
+    python scripts/error_analysis.py classes --train <dir_train> --validation <dir_val>
     python scripts/error_analysis.py flip    --validation <dir_val> [--train <dir_train>]
     python scripts/error_analysis.py context --rows <dir> [--worst 200]
     python scripts/error_analysis.py scale   --rows <dir>
@@ -21,6 +22,13 @@ VÌ SAO TỪNG LỆNH, và nó trả lời câu nào của ai:
     hist  — dòng 73 và 139: vẽ phân phối nhãn thật và nhãn dự đoán ĐÈ LÊN NHAU, cả train
             lẫn validation, "để biết model thực sự học tốt trên bài toán Regression hay là
             nó đang tệ trên cả Regression luôn".
+    classes — NỬA CÒN LẠI của dòng 73 và 139. Biên bản đòi xem mô hình tệ "trên cả
+            Regression luôn" hay không, tức CẢ hai góc: `hist` làm góc hồi quy, lệnh này
+            làm góc phân loại. Nó vẽ ma trận nhầm lẫn ba lớp kém hơn / ngang / tốt hơn,
+            chuẩn hóa theo HÀNG, cạnh đó là tỉ lệ ba lớp của nhãn thật so với tỉ lệ ba
+            lớp của dự đoán. Hai hình này trả lời câu mà accuracy và macro-F1 trong
+            report.json KHÔNG trả lời được: mô hình sai theo KIỂU gì — cụ thể có phải nó
+            dồn gần hết dự đoán vào lớp "ngang" không.
     flip  — dòng 189, anh Tiến: nếu cùng cặp (A, B) mà Context P khác nhau cho Δp TRÁI DẤU,
             và mô hình chỉ học vẹt theo cặp (A, B) chứ không học vai trò của P, thì nó sẽ
             sai hoàn toàn trên validation. Lệnh này đo đúng điều đó: nó tách các cặp có đổi
@@ -90,6 +98,37 @@ def read_rows(folder: Path) -> pa.Table:
     return table
 
 
+SLICE_NAMES = ("all", "strict")
+
+
+def select_slice(table: pa.Table, name: str) -> pa.Table:
+    """Lọc bảng theo lát cắt của dự án: 'all' giữ nguyên, 'strict' giữ unseen_pair = True.
+
+    VÌ SAO CẦN: đến 14/11/2026 các lệnh con ở đây không có tham số lát, nên cột validation
+    của chúng luôn là lát `all` — gồm cả những cặp (A, B) đã xuất hiện trong train. Số ở
+    lát `all` KHÔNG dùng để so hai mô hình với nhau (mục 5 nhật ký 13/11: lát strict đảo
+    cả thứ tự xếp hạng). Tên lát và điều kiện lấy đúng stage3.metrics.slices của
+    config.json, không định nghĩa lại ở đây.
+    """
+    if name == "all":
+        return table
+    if name not in SLICE_NAMES:
+        raise ValueError(f"lát '{name}' chưa hỗ trợ ở lệnh này; chọn một trong {SLICE_NAMES}")
+    if "unseen_pair" not in table.column_names:
+        raise ValueError("rows.parquet không có cột unseen_pair (dump ghi trước 10/11/2026) "
+                         "nên không dựng được lát strict; chạy lại --mode errors")
+    kept = table.filter(pc.equal(table.column("unseen_pair"), True))
+    if kept.num_rows == 0:
+        raise ValueError("lát strict không còn dòng nào trong dump này")
+    return kept
+
+
+def config_threshold() -> float:
+    """Ngưỡng ba lớp mặc định, ĐỌC từ config.json chứ không chép số vào script."""
+    data = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    return float(data["stage3"]["metrics"]["change_class_threshold"])
+
+
 def columns(table: pa.Table, *names: str) -> tuple[np.ndarray, ...]:
     """Lấy nhiều cột thành mảng numpy float64 hoặc bool, theo kiểu của cột."""
     out = []
@@ -150,9 +189,12 @@ def run_gap(args: argparse.Namespace) -> int:
     for label, folder in (("train", args.train), ("validation", args.validation)):
         if not folder:
             continue
-        blocks[label] = row_summary(read_rows(Path(folder)))
+        blocks[label] = row_summary(select_slice(read_rows(Path(folder)), args.slice))
     if not blocks:
         raise ValueError("cần ít nhất một trong --train hoặc --validation")
+    print(f"lát cắt: {args.slice}"
+          + ("  (gồm cả cặp (A, B) đã thấy trong train — KHÔNG dùng để so hai mô hình)"
+             if args.slice == "all" else ""))
     keys = ("rows", "mse", "mae", "rmse", "r2", "spearman", "sign_accuracy",
             "sign_pairs_counted", "truth_sd", "prediction_sd", "spread_ratio")
     # Hiệu của hai SỐ ĐẾM không có nghĩa gì (train nhiều dòng hơn validation là chuyện
@@ -203,14 +245,14 @@ def run_hist(args: argparse.Namespace) -> int:
     edges = np.linspace(-args.range, args.range, args.bins + 1)
     report: dict[str, Any] = {}
     for index, (label, folder) in enumerate(picked):
-        table = read_rows(folder)
+        table = select_slice(read_rows(folder), args.slice)
         truth, prediction = columns(table, "delta_p", "prediction")
         top = axes[0][index]
         top.hist(truth, bins=edges, histtype="step", linewidth=1.6, density=True,
                  label=f"nhãn thật (sd {truth.std():.3f})")
         top.hist(prediction, bins=edges, histtype="step", linewidth=1.6, density=True,
                  label=f"dự đoán (sd {prediction.std():.3f})")
-        top.set_title(f"{label}: {table.num_rows:,} dòng")
+        top.set_title(f"{label} · lát {args.slice}: {table.num_rows:,} dòng")
         top.set_xlabel("Δp")
         top.set_ylabel("mật độ")
         top.legend(fontsize=8)
@@ -225,6 +267,7 @@ def run_hist(args: argparse.Namespace) -> int:
         bottom.set_ylabel("Δp dự đoán")
         bottom.legend(fontsize=8)
         report[label] = {
+            "slice": args.slice,
             "rows": table.num_rows,
             "truth": {"mean": float(truth.mean()), "sd": float(truth.std()),
                       "min": float(truth.min()), "max": float(truth.max())},
@@ -645,6 +688,121 @@ def run_scale(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_classes(args: argparse.Namespace) -> int:
+    """Góc classification của việc 8: ma trận nhầm ba lớp kém hơn / ngang / tốt hơn.
+
+    Gọi lại metrics.change_class_metrics của dự án nên mọi con số khớp report.json từng
+    chữ số; ngưỡng mặc định đọc từ stage3.metrics.change_class_threshold (0,3 log, nguồn
+    Landrum & Riniker 2024 ghi trong config.json), không chép tay vào đây.
+
+    Hình trên: ma trận nhầm lẫn [thật][dự đoán] chuẩn hóa theo HÀNG — mỗi hàng cộng 100 %,
+    nên đọc được "trong các cặp THẬT SỰ tốt hơn, mô hình gọi đúng bao nhiêu phần". Hình
+    dưới: tỉ lệ ba lớp của nhãn thật đặt cạnh tỉ lệ ba lớp của dự đoán — nếu cột "ngang"
+    của dự đoán cao hơn hẳn của nhãn thật thì mô hình đang dồn về giữa.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    picked = [(label, Path(folder)) for label, folder in
+              (("train", args.train), ("validation", args.validation)) if folder]
+    if not picked:
+        raise ValueError("cần ít nhất một trong --train hoặc --validation")
+    threshold = args.threshold if args.threshold is not None else config_threshold()
+    names = metric_module.CHANGE_CLASSES
+    vietnamese = {"worse": "kém hơn", "neutral": "ngang", "better": "tốt hơn"}
+    ticks = [vietnamese[name] for name in names]
+    size = len(names)
+    figure, axes = plt.subplots(2, len(picked), figsize=(5.6 * len(picked), 9.4),
+                               squeeze=False)
+    report: dict[str, Any] = {}
+    for index, (label, folder) in enumerate(picked):
+        table = select_slice(read_rows(folder), args.slice)
+        truth, prediction = columns(table, "delta_p", "prediction")
+        scores = metric_module.change_class_metrics(truth.astype(np.float64),
+                                                    prediction.astype(np.float64),
+                                                    threshold)
+        confusion = np.asarray(scores["confusion"], dtype=np.float64)
+        total = float(confusion.sum())
+        per_row = confusion.sum(axis=1, keepdims=True)
+        shares = np.divide(confusion, per_row, out=np.zeros_like(confusion),
+                           where=per_row > 0)
+        top = axes[0][index]
+        image = top.imshow(shares, cmap="Blues", vmin=0.0, vmax=1.0)
+        for i in range(size):
+            for j in range(size):
+                top.text(j, i, f"{shares[i, j] * 100:.1f}%\n{int(confusion[i, j]):,}",
+                         ha="center", va="center", fontsize=8,
+                         color="white" if shares[i, j] > 0.55 else "black")
+        top.set_xticks(range(size), ticks)
+        top.set_yticks(range(size), ticks)
+        top.set_xlabel("dự đoán")
+        top.set_ylabel("nhãn thật")
+        top.set_title(f"{label} · lát {args.slice} · {int(total):,} dòng\n"
+                      f"accuracy {show(scores.get('accuracy'))} · "
+                      f"macro-F1 {show(scores.get('macro_f1'))} · mỗi hàng cộng 100 %",
+                      fontsize=9)
+        bar = figure.colorbar(image, ax=top, fraction=0.046)
+        bar.set_label("tỉ lệ trong hàng", fontsize=8)
+        truth_share = (per_row.ravel() / total) if total else np.zeros(size)
+        guess_share = (confusion.sum(axis=0) / total) if total else np.zeros(size)
+        bottom = axes[1][index]
+        positions = np.arange(size, dtype=np.float64)
+        for offset, values, name in ((-0.19, truth_share, "nhãn thật"),
+                                     (0.19, guess_share, "dự đoán")):
+            bars = bottom.bar(positions + offset, values, width=0.38, label=name)
+            for rectangle, value in zip(bars, values):
+                bottom.text(rectangle.get_x() + rectangle.get_width() / 2.0, value,
+                            f"{value * 100:.1f}%", ha="center", va="bottom", fontsize=8)
+        bottom.set_xticks(positions, ticks)
+        bottom.set_ylabel("tỉ lệ dòng")
+        bottom.set_ylim(0.0, max(1.0, float(max(truth_share.max(), guess_share.max())) * 1.2))
+        bottom.set_title(f"ngưỡng ±{threshold:g} log · lớp 'ngang' là |Δp| ≤ {threshold:g}",
+                         fontsize=9)
+        bottom.legend(fontsize=8)
+        report[label] = dict(scores)
+        report[label].update({
+            "slice": args.slice,
+            "rows": int(total),
+            "truth_share": {name: float(value)
+                            for name, value in zip(names, truth_share)},
+            "prediction_share": {name: float(value)
+                                 for name, value in zip(names, guess_share)},
+        })
+    figure.tight_layout()
+    target = Path(args.out) if args.out else picked[0][1] / "classes.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(target, dpi=150)
+    plt.close(figure)
+    target.with_suffix(".json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    for label, block in report.items():
+        print(f"\n=== {label} · lát {block['slice']} · {block['rows']:,} dòng · "
+              f"ngưỡng ±{threshold:g}")
+        print(f"{'lớp':<10}{'dòng thật':>12}{'tỉ lệ thật':>12}{'tỉ lệ đoán':>12}"
+              f"{'recall':>10}{'F1':>10}")
+        print("-" * 66)
+        for name in names:
+            print(f"{vietnamese[name]:<10}"
+                  f"{block.get(f'{name}_rows', 0):>12,}"
+                  f"{block['truth_share'][name] * 100:>11.1f}%"
+                  f"{block['prediction_share'][name] * 100:>11.1f}%"
+                  f"{show(block.get(f'{name}_recall')):>10}"
+                  f"{show(block.get(f'{name}_f1')):>10}")
+        print(f"{'tổng':<10}{block['rows']:>12,}"
+              f"{'100.0%':>12}{'100.0%':>12}"
+              f"{show(block.get('accuracy')):>10}"
+              f"{show(block.get('macro_f1')):>10}")
+    print("\nĐọc bảng này: so cột 'tỉ lệ thật' với cột 'tỉ lệ đoán' cho lớp 'ngang'. Nếu")
+    print("tỉ lệ đoán cao hơn hẳn tỉ lệ thật thì mô hình dồn dự đoán về giữa, và recall của")
+    print("hai lớp 'kém hơn'/'tốt hơn' sẽ thấp — cùng một hiện tượng với spread_ratio < 1")
+    print("ở lệnh `gap` và với dải dự đoán hẹp ở lệnh `hist`, chỉ nhìn bằng đơn vị phân loại.")
+    print(f"\nđã ghi {target}")
+    print(f"       {target.with_suffix('.json')}")
+    return 0
+
+
 def main() -> int:
     """Phân tích tham số và gọi lệnh con. Trả về mã thoát (0 = xong)."""
     if hasattr(sys.stdout, "reconfigure"):
@@ -656,6 +814,8 @@ def main() -> int:
     gap = subparsers.add_parser("gap", help="bảng MSE/MAE/R² train vs validation")
     gap.add_argument("--train", default="", help="thư mục errors_*_train_*")
     gap.add_argument("--validation", default="", help="thư mục errors_*_validation_*")
+    gap.add_argument("--slice", default="all", choices=SLICE_NAMES,
+                     help="lát cắt; 'strict' = chỉ cặp (A, B) chưa thấy trong train")
     gap.add_argument("--out", default="", help="file .json để ghi; mặc định chỉ in")
     gap.set_defaults(handler=run_gap)
 
@@ -663,10 +823,23 @@ def main() -> int:
     hist.add_argument("--train", default="")
     hist.add_argument("--validation", default="")
     hist.add_argument("--bins", type=int, default=120)
+    hist.add_argument("--slice", default="all", choices=SLICE_NAMES,
+                      help="lát cắt; 'strict' = chỉ cặp (A, B) chưa thấy trong train")
     hist.add_argument("--range", type=float, default=4.0,
                       help="trục Δp vẽ trong [-range, range] (mặc định 4,0)")
     hist.add_argument("--out", default="", help="file .png; mặc định distributions.png")
     hist.set_defaults(handler=run_hist)
+
+    classes = subparsers.add_parser("classes", help="ma trận nhầm ba lớp kém/ngang/tốt")
+    classes.add_argument("--train", default="")
+    classes.add_argument("--validation", default="")
+    classes.add_argument("--slice", default="strict", choices=SLICE_NAMES,
+                         help="lát cắt; mặc định 'strict' vì đây là số để so hai mô hình")
+    classes.add_argument("--threshold", type=float, default=None,
+                         help="ngưỡng lớp 'ngang'; mặc định lấy "
+                              "stage3.metrics.change_class_threshold của config.json")
+    classes.add_argument("--out", default="", help="file .png; mặc định classes.png")
+    classes.set_defaults(handler=run_classes)
 
     flip = subparsers.add_parser("flip", help="cùng cặp (A, B) khác Context P")
     flip.add_argument("--validation", required=True)
