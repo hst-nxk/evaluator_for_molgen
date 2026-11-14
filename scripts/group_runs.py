@@ -43,6 +43,7 @@ from summarize_runs import best_block, label  # noqa: E402
 IDENTITY_KEYS = ("configuration", "head", "protein_mode", "model", "batch_size",
                  "learning_rate", "weight_decay", "loss", "huber_delta", "label_scaler",
                  "augment_reverse", "train_subset", "partition_override",
+                 "partition_override_pairs",
                  "selection_metric", "selection_slice", "edit_filter",
                  "branch_learning_rate_scale", "sharpness_penalty", "accumulate_steps",
                  "group_by_protein", "antisymmetry_penalty")

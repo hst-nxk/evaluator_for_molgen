@@ -53,6 +53,11 @@ MINIMUM_KEYS = {"min_n_assays": "n_assays", "min_n_documents": "n_documents",
 
 # Cột khóa và cột giá trị của bảng đổi partition (xem load_partition_override).
 OVERRIDE_COLUMNS = ("protein_hash", "partition")
+# Cột của bảng đổi partition khóa theo CẶP (xem load_pair_partition_override). Khác bảng
+# khóa theo protein ở hai chỗ: khóa là pair_id, và nó ghi đè CẢ cột unseen_pair.
+PAIR_OVERRIDE_COLUMNS = ("pair_id", "partition", "unseen_pair")
+# Bảng đổi partition theo cặp đã đọc, theo đường dẫn tuyệt đối. Cùng lý do có cache.
+_PAIR_OVERRIDE_CACHE: dict[Path, tuple[pa.Array, pa.Array, pa.Array]] = {}
 # Cột khóa của bảng subset train (xem load_train_subset). Một cột duy nhất: pair_id.
 SUBSET_COLUMN = "pair_id"
 # Bảng subset đã đọc, theo đường dẫn tuyệt đối; cùng lý do có cache như _OVERRIDE_CACHE.
@@ -96,6 +101,86 @@ def load_partition_override(config: Mapping[str, Any], root: Path
         raise ValueError(f"{path} có protein_hash trùng; mỗi protein chỉ được một partition")
     _OVERRIDE_CACHE[path] = (keys, values)
     return keys, values
+
+
+def _flat(column: pa.ChunkedArray | pa.Array) -> pa.Array:
+    """Một cột parquet thành MỘT mảng liền, để pc.take và pc.index_in dùng được."""
+    column = column.combine_chunks()
+    if isinstance(column, pa.ChunkedArray):
+        return column.chunk(0) if column.num_chunks == 1 else pa.concat_arrays(column.chunks)
+    return column
+
+
+def load_pair_partition_override(config: Mapping[str, Any], root: Path
+                                 ) -> tuple[pa.Array, pa.Array, pa.Array] | None:
+    """Đọc bảng đổi partition khóa theo CẶP nếu config khai báo; không thì None.
+
+    Nhận: config, thư mục gốc. Trả về: (mảng pair_id, mảng partition, mảng unseen_pair).
+
+    VÌ SAO CÓ ĐƯỜNG NÀY (việc 13 họp 09/11/2026): biên bản yêu cầu thử cách chia NGƯỢC
+    lại — cho phép TRÙNG protein P, nhưng cặp (A, B) ở validation không được trùng train.
+    Bảng `partition_override` sẵn có khóa theo protein_hash nên không diễn đạt được điều
+    kiện đó: nó chỉ nói được "protein này thuộc partition nào". Bảng ở đây khóa theo
+    pair_id, nên chia được ở mức cặp và để protein xuất hiện ở cả hai bên.
+
+    Không cho bật cùng lúc với hai đường kia: chồng hai bảng đổi lên nhau thì thứ tự áp
+    quyết định kết quả, và bảng subset train được dựng theo cách chia CŨ nên dưới cách
+    chia mới nó không còn khớp. Thà báo lỗi còn hơn để ra một cách chia không ai tả được.
+    """
+    setting = str(config["stage3"]["inputs"].get("partition_override_pairs") or "").strip()
+    if not setting:
+        return None
+    for other, name in ((config["stage3"]["inputs"].get("partition_override"),
+                         "partition_override"),
+                        (config["stage3"]["inputs"].get("train_subset"), "train_subset")):
+        if str(other or "").strip():
+            raise ValueError(f"không được bật cùng lúc partition_override_pairs (khóa cặp) "
+                             f"và {name}: hai bảng ghi đè lẫn nhau, cách chia ra sẽ phụ "
+                             f"thuộc thứ tự áp bảng")
+    path = (root / setting).resolve()
+    cached = _PAIR_OVERRIDE_CACHE.get(path)
+    if cached is not None:
+        return cached
+    if not path.is_file():
+        raise FileNotFoundError(f"chưa có bảng đổi partition theo cặp {path}; dựng bằng "
+                                f"scripts/build_pair_split.py")
+    table = pq.read_table(path, columns=list(PAIR_OVERRIDE_COLUMNS))
+    keys = _flat(table.column("pair_id"))
+    values = _flat(table.column("partition"))
+    unseen = _flat(table.column("unseen_pair"))
+    if len(set(keys.to_pylist())) != len(keys):
+        raise ValueError(f"{path} có pair_id trùng; mỗi cặp chỉ được một partition")
+    _PAIR_OVERRIDE_CACHE[path] = (keys, values, unseen)
+    return keys, values, unseen
+
+
+def apply_pair_partition_override(table: pa.Table,
+                                  override: tuple[pa.Array, pa.Array, pa.Array]
+                                  ) -> pa.Table:
+    """Thay 'partition' VÀ 'unseen_pair' theo pair_id; cặp không có trong bảng -> 'test'.
+
+    Khác hẳn bảng khóa theo protein ở hai điểm, cả hai đều cố ý:
+
+    1. Thiếu khóa KHÔNG phải lỗi. Bảng khóa theo protein phải phủ kín dữ liệu, thiếu một
+       protein nghĩa là bảng dựng từ lần export khác. Bảng theo cặp thì chỉ liệt kê những
+       cặp thuộc thí nghiệm, và mọi cặp không được liệt kê bị đẩy sang 'test' — tức loại
+       hẳn khỏi cả train lẫn validation, chứ KHÔNG bị bỏ lại theo cách chia cũ. Nhờ vậy
+       không có chuyện nửa dữ liệu chia kiểu mới nửa kia chia kiểu cũ mà không ai thấy.
+    2. Ghi đè luôn unseen_pair. Cột đó trong dataset được tính theo cách chia CŨ (cặp này
+       có xuất hiện trong train CŨ không), nên dưới cách chia mới nó sai. Lát `strict` của
+       Stage 3 đọc đúng cột này, nên không ghi đè là mọi số lát strict đo nhầm tập.
+    """
+    keys, values, unseen = override
+    position = pc.index_in(table.column("pair_id"), value_set=keys)
+    found = pc.is_valid(position)
+    partition = pc.if_else(found, pc.take(values, position), pa.scalar(TEST))
+    table = table.set_column(table.schema.get_field_index("partition"),
+                             "partition", partition)
+    if "unseen_pair" in table.column_names:
+        flag = pc.if_else(found, pc.take(unseen, position), pa.scalar(False))
+        table = table.set_column(table.schema.get_field_index("unseen_pair"),
+                                 "unseen_pair", flag)
+    return table
 
 
 def apply_partition_override(table: pa.Table, override: tuple[pa.Array, pa.Array]
@@ -247,6 +332,10 @@ def read_columns(config: Mapping[str, Any], root: Path, partition: str,
     path = root / config["stage3"]["inputs"]["evaluator"]
     if not path.is_file():
         raise FileNotFoundError(f"chưa có {path}; chạy Stage 2b --mode export trước")
+    # Bảng theo CẶP đọc trước: chính nó mang phép kiểm "không được bật cùng lúc", nên
+    # đọc nó sau thì một bảng protein khai sai đường dẫn sẽ báo lỗi thiếu file trước khi
+    # ai kịp biết là đã bật nhầm hai đường chia cùng lúc.
+    pair_override = load_pair_partition_override(config, root)
     override = load_partition_override(config, root)
     # Subset CHỈ áp cho train (xem load_train_subset): đọc validation hay test thì bỏ qua.
     subset = load_train_subset(config, root) if partition == TRAIN else None
@@ -256,6 +345,8 @@ def read_columns(config: Mapping[str, Any], root: Path, partition: str,
     extra: list[str] = []
     if override is not None and "protein_hash" not in wanted:
         extra.append("protein_hash")
+    if pair_override is not None and "pair_id" not in wanted:
+        extra.append("pair_id")
     if subset is not None and SUBSET_COLUMN not in wanted:
         extra.append(SUBSET_COLUMN)
     wanted.extend(extra)
@@ -266,6 +357,8 @@ def read_columns(config: Mapping[str, Any], root: Path, partition: str,
         table = pa.Table.from_batches([batch])
         if override is not None:
             table = apply_partition_override(table, override)
+        if pair_override is not None:
+            table = apply_pair_partition_override(table, pair_override)
         table = table.filter(pc.equal(table.column("partition"), partition))
         if subset is not None and table.num_rows:
             table = table.filter(pc.is_in(table.column(SUBSET_COLUMN), value_set=subset))

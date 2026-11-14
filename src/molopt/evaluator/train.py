@@ -1539,6 +1539,10 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "train_subset": str(config["stage3"]["inputs"].get("train_subset") or ""),
         "partition_override": str(
             config["stage3"]["inputs"].get("partition_override") or ""),
+        # Việc 13: cách chia theo cặp. PHẢI nằm trong IDENTITY_KEYS của group_runs.py —
+        # cùng cấu hình mà khác cách chia thì không phải cùng một thí nghiệm.
+        "partition_override_pairs": str(
+            config["stage3"]["inputs"].get("partition_override_pairs") or ""),
         "rows": {"train": len(train_arrays), "validation": len(validation_arrays)},
         "protein_embedding_dim": protein_dim,
         "parameters": models.count_parameters(model),
