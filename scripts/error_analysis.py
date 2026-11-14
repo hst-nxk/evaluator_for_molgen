@@ -740,7 +740,7 @@ def run_classes(args: argparse.Namespace) -> int:
     vietnamese = {"worse": "kém hơn", "neutral": "ngang", "better": "tốt hơn"}
     ticks = [vietnamese[name] for name in names]
     size = len(names)
-    figure, axes = plt.subplots(2, len(picked), figsize=(5.6 * len(picked), 9.4),
+    figure, axes = plt.subplots(2, len(picked), figsize=(6.2 * len(picked), 9.4),
                                squeeze=False)
     report: dict[str, Any] = {}
     for index, (label, folder) in enumerate(picked):
@@ -770,7 +770,10 @@ def run_classes(args: argparse.Namespace) -> int:
                       f"macro-F1 {show(scores.get('macro_f1'))} · mỗi hàng cộng 100 %",
                       fontsize=9)
         bar = figure.colorbar(image, ax=top, fraction=0.046)
-        bar.set_label("tỉ lệ trong hàng", fontsize=8)
+        # Chỉ panel cuối mới gắn nhãn colorbar: gắn mọi panel thì nhãn của panel
+        # này đè lên nhãn trục y của panel bên cạnh.
+        if index == len(picked) - 1:
+            bar.set_label("tỉ lệ trong hàng", fontsize=8)
         truth_share = (per_row.ravel() / total) if total else np.zeros(size)
         guess_share = (confusion.sum(axis=0) / total) if total else np.zeros(size)
         bottom = axes[1][index]
