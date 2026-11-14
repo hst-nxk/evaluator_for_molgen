@@ -16,6 +16,14 @@ script reports how many more queries they would add.
 
 Source files are only read. Output goes to a new directory with a manifest.
 
+Options (before the positional arguments or after, any order):
+  --rule=query        default: drop every row of a mixed query (5,732 queries, 41,163 rows on v4)
+  --rule=row          drop only rows carrying both a B and an F assay (19,174 rows on v4); rows of
+                      queries that stay mixed are KEPT and listed in under_review_pair_ids.parquet
+  --salt-review=PATH  salt_mass_exceptions.json from the desalting audit; evaluator rows touching a
+                      parent whose removed salt outweighs what was kept are KEPT and listed as under review
+Salt stripping itself is not changed here.
+
 Usage: python -I build_v4_no_bf_mixed_queries_20261104.py <dataset_dir> <audit_dir> <out_dir>
        python -I build_v4_no_bf_mixed_queries_20261104.py <dataset_dir> <audit_dir> --check <final_dir>
        (--check: count mixed queries in <final_dir>/evaluator_training.parquet, write nothing)
@@ -33,6 +41,17 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+
+RULE, SALT_REVIEW = "query", None
+for _a in list(sys.argv[1:]):
+    if _a.startswith("--rule="):
+        RULE = _a.split("=", 1)[1]
+        sys.argv.remove(_a)
+    elif _a.startswith("--salt-review="):
+        SALT_REVIEW = Path(_a.split("=", 1)[1])
+        sys.argv.remove(_a)
+if RULE not in ("query", "row"):
+    raise SystemExit("--rule must be 'query' (drop whole mixed queries) or 'row' (drop only rows carrying both labels)")
 
 DATA, AUDIT = Path(sys.argv[1]), Path(sys.argv[2])
 CHECK = sys.argv[3] == "--check"
@@ -134,13 +153,36 @@ def mixed_queries(row_b, row_f):
 
 mixed = mixed_queries(has_b, has_f)
 mixed2 = mixed_queries(has_b2, has_f2)
-drop = mixed[q_a] | mixed[q_b]
-drop2 = mixed2[q_a] | mixed2[q_b]
-log("mixed queries", int(mixed.sum()), "rows to drop", int(drop.sum()))
+if RULE == "row":      # only rows whose own record carries both a B and an F assay
+    drop, drop2 = has_b & has_f, has_b2 & has_f2
+else:                   # every row of a mixed query
+    drop, drop2 = mixed[q_a] | mixed[q_b], mixed2[q_a] | mixed2[q_b]
+log("rule", RULE, "| mixed queries", int(mixed.sum()), "rows to drop", int(drop.sum()))
+
+# Rows kept but under review: still-mixed queries after the cut, and rows touching a parent whose
+# removed salt weighs more than what was kept (audit_20261103/salt_mass_exceptions.json).
+mixed_left = mixed_queries(has_b & ~drop, has_f & ~drop)
+review_bf = ~drop & (mixed_left[q_a] | mixed_left[q_b])
+review_salt_total = np.zeros(n, bool)
+review_salt_largest = np.zeros(n, bool)
+if SALT_REVIEW is not None:
+    exc = json.loads(SALT_REVIEW.read_text(encoding="utf-8"))
+    for label, field in ((review_salt_total, "removed_total_heavier"), (review_salt_largest, "largest_removed_heavier")):
+        parents = pa.array(sorted({r["parent"] for r in exc if r.get(field)}), pa.string())
+        label[:] = (pc.is_in(ev["smiles_a"].combine_chunks(), value_set=parents).to_numpy(zero_copy_only=False)
+                    | pc.is_in(ev["smiles_b"].combine_chunks(), value_set=parents).to_numpy(zero_copy_only=False))
+    review_salt_total &= ~drop
+    review_salt_largest &= ~drop
+log("kept under review:", {"mixed_B_F": int(review_bf.sum()), "salt_total_heavier": int(review_salt_total.sum()),
+                           "salt_largest_heavier": int(review_salt_largest.sum())})
 if CHECK:
-    print(json.dumps({"file": str(FINAL / "evaluator_training.parquet"), "rows": n,
+    print(json.dumps({"file": str(FINAL / "evaluator_training.parquet"), "rule": RULE, "rows": n,
                       "rows_with_B_and_F_record": int((has_b & has_f).sum()),
-                      "mixed_queries": int(mixed.sum()), "rows_in_mixed_queries": int(drop.sum())}))
+                      "mixed_queries": int(mixed.sum()), "rows_dropped": int(drop.sum()),
+                      "rows_after": int((~drop).sum()), "mixed_queries_remaining": int(mixed_left.sum()),
+                      "under_review_rows": {"mixed_B_F": int(review_bf.sum()),
+                                            "salt_total_heavier": int(review_salt_total.sum()),
+                                            "salt_largest_heavier": int(review_salt_largest.sum())}}))
     raise SystemExit(0)
 
 part = np.asarray(ev["partition"].to_pylist())
@@ -169,8 +211,15 @@ first[q_b] = np.arange(n)
 q_part = part[first]
 
 report = {
-    "rule": "drop every evaluator row that belongs (either side) to a query whose candidates include "
-            "both a B-assay row and an F-assay row; query = (reference SMILES, protein, endpoint), both directions",
+    "rule_name": RULE,
+    "rule": ("drop every evaluator row that belongs (either side) to a query whose candidates include "
+             "both a B-assay row and an F-assay row; query = (reference SMILES, protein, endpoint), both directions"
+             if RULE == "query" else
+             "drop only the evaluator rows whose own record carries both a B and an F assay; rows that are B-only "
+             "or F-only stay even when their query still mixes the two (those rows are listed in under_review_pair_ids)"),
+    "mixed_queries_remaining": query_partition_counts(mixed_left),
+    "under_review_rows_kept": {"mixed_B_F": int(review_bf.sum()), "salt_total_heavier": int(review_salt_total.sum()),
+                               "salt_largest_heavier": int(review_salt_largest.sum())},
     "type_sources": "ChEMBL ASSAYS.ASSAY_TYPE; BindingDB via the ChEMBL assay id in ASSAY_NAME",
     "source_dataset": str(FINAL),
     "queries_total": {p: int((q_part == p).sum()) for p in PARTS},
@@ -195,6 +244,12 @@ log(json.dumps(report["rows"]))
 
 # ------------------------------------------------------------------ write new files
 dropped_ids = pa.array(sorted(pc.filter(ev["pair_id"], pa.array(drop)).to_pylist()), pa.string())
+review_rows = []
+for mask, reason in ((review_bf, "mixed_B_F_query_remaining"), (review_salt_total, "salt_total_removed_heavier"),
+                     (review_salt_largest, "salt_largest_removed_heavier")):
+    ids = pc.filter(ev["pair_id"], pa.array(mask))
+    review_rows.append(pa.table({"pair_id": ids, "reason": pa.array([reason] * len(ids), pa.string())}))
+review_table = pa.concat_tables(review_rows)
 del ev, smiles, smiles_code
 (OUT / "final_dataset").mkdir(parents=True)
 written = {}
@@ -219,6 +274,7 @@ for extra in ("protein_split.parquet", "protein_split_manifest.json", "protein_s
               "export_manifest.json"):
     shutil.copy2(FINAL / extra, OUT / "final_dataset" / extra)
 pq.write_table(pa.table({"pair_id": dropped_ids}), OUT / "final_dataset" / "dropped_pair_ids.parquet")
+pq.write_table(review_table, OUT / "final_dataset" / "under_review_pair_ids.parquet")  # kept in the data, listed here
 report["files"] = written
 report["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
 report["script"] = "scripts/build_v4_no_bf_mixed_queries_20261104.py"
