@@ -20,8 +20,8 @@ Options (before the positional arguments or after, any order):
   --rule=query        default: drop every row of a mixed query (5,732 queries, 41,163 rows on v4)
   --rule=row          drop only rows carrying both a B and an F assay (19,174 rows on v4); rows of
                       queries that stay mixed are KEPT and listed in under_review_pair_ids.parquet
-  --salt-review=PATH  salt_mass_exceptions.json from the desalting audit; evaluator rows touching a
-                      parent whose removed salt outweighs what was kept are KEPT and listed as under review
+  --salt-review=PATH  deprecated compatibility option; mass-based salt review is disabled.
+                      ChEMBL parent selection determines the retained structure.
 Salt stripping itself is not changed here.
 
 Usage: python -I build_v4_no_bf_mixed_queries_20261104.py <dataset_dir> <audit_dir> <out_dir>
@@ -159,20 +159,14 @@ else:                   # every row of a mixed query
     drop, drop2 = mixed[q_a] | mixed[q_b], mixed2[q_a] | mixed2[q_b]
 log("rule", RULE, "| mixed queries", int(mixed.sum()), "rows to drop", int(drop.sum()))
 
-# Rows kept but under review: still-mixed queries after the cut, and rows touching a parent whose
-# removed salt weighs more than what was kept (audit_20261103/salt_mass_exceptions.json).
+# Remaining mixed B/F queries are reported for review. Salt mass contributes no review flags.
+# Zero-valued salt fields preserve the existing report schema for downstream readers.
 mixed_left = mixed_queries(has_b & ~drop, has_f & ~drop)
 review_bf = ~drop & (mixed_left[q_a] | mixed_left[q_b])
 review_salt_total = np.zeros(n, bool)
 review_salt_largest = np.zeros(n, bool)
 if SALT_REVIEW is not None:
-    exc = json.loads(SALT_REVIEW.read_text(encoding="utf-8"))
-    for label, field in ((review_salt_total, "removed_total_heavier"), (review_salt_largest, "largest_removed_heavier")):
-        parents = pa.array(sorted({r["parent"] for r in exc if r.get(field)}), pa.string())
-        label[:] = (pc.is_in(ev["smiles_a"].combine_chunks(), value_set=parents).to_numpy(zero_copy_only=False)
-                    | pc.is_in(ev["smiles_b"].combine_chunks(), value_set=parents).to_numpy(zero_copy_only=False))
-    review_salt_total &= ~drop
-    review_salt_largest &= ~drop
+    log("--salt-review accepted for compatibility; ChEMBL parent selection is authoritative.")
 log("kept under review:", {"mixed_B_F": int(review_bf.sum()), "salt_total_heavier": int(review_salt_total.sum()),
                            "salt_largest_heavier": int(review_salt_largest.sum())})
 if CHECK:
@@ -211,6 +205,7 @@ first[q_b] = np.arange(n)
 q_part = part[first]
 
 report = {
+    "salt_policy": "ChEMBL Structure Pipeline parent selection; no mass-based exclusion or review",
     "rule_name": RULE,
     "rule": ("drop every evaluator row that belongs (either side) to a query whose candidates include "
              "both a B-assay row and an F-assay row; query = (reference SMILES, protein, endpoint), both directions"
