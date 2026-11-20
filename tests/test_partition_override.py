@@ -94,7 +94,7 @@ def test_a_protein_missing_from_the_override_is_an_error(tmp_path: Path) -> None
     config = write_dataset(tmp_path)
     config["stage3"]["inputs"]["partition_override"] = write_override(
         tmp_path, {"ha": "train", "hb": "train"})
-    with pytest.raises(ValueError, match="không nằm trong bảng đổi partition"):
+    with pytest.raises(ValueError, match="not in the partition override table"):
         data.read_columns(config, tmp_path, "train", ["protein_hash"])
 
 
@@ -105,7 +105,7 @@ def test_a_duplicated_protein_in_the_override_is_an_error(tmp_path: Path) -> Non
                                             pa.string())})
     pq.write_table(table, tmp_path / "dup.parquet")
     config["stage3"]["inputs"]["partition_override"] = "dup.parquet"
-    with pytest.raises(ValueError, match="trùng"):
+    with pytest.raises(ValueError, match="repeated protein_hash"):
         data.read_columns(config, tmp_path, "train", ["protein_hash"])
 
 

@@ -135,7 +135,7 @@ def test_ranking_metrics_refuses_a_min_candidates_below_two() -> None:
 
 
 def test_ranking_metrics_refuses_mismatched_lengths() -> None:
-    with pytest.raises(ValueError, match="cùng độ dài"):
+    with pytest.raises(ValueError, match="the same length"):
         metrics.ranking_metrics(np.array([0, 0]), np.array([1.0]), np.array([1.0]),
                                 top_k=[1], min_candidates=2)
 
@@ -190,7 +190,7 @@ def test_format_metrics_prints_the_three_class_line() -> None:
     classes = metrics.change_class_metrics(np.array([-1.0, 1.0]), np.array([-1.0, 1.0]), 0.3)
     lines = metrics.format_metrics("thử", {"n": 2, "mae": 0.0, "rmse": 0.0, "r2": 1.0,
                                            "spearman": 1.0}, classes=classes)
-    assert "ba lớp (±0.30)" in lines[-1] and "macro-F1 1.0000" in lines[-1]
+    assert "three classes (+/-0.30)" in lines[-1] and "macro-F1 1.0000" in lines[-1]
 
 
 def test_asymmetry_metrics_is_zero_for_a_perfectly_antisymmetric_model() -> None:
@@ -238,7 +238,7 @@ def test_asymmetry_metrics_on_an_empty_sample() -> None:
 
 
 def test_asymmetry_metrics_refuses_arrays_of_different_length() -> None:
-    with pytest.raises(ValueError, match="cùng số dòng"):
+    with pytest.raises(ValueError, match="the same number of rows"):
         metrics.asymmetry_metrics(np.zeros(2), np.zeros(3), np.zeros(2), 1.0)
 
 

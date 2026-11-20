@@ -110,7 +110,7 @@ def test_a_group_that_mixes_two_rulers_is_called_out(capsys) -> None:
         sys.argv = ["group_runs.py", "--slice", "strict", "--min-seeds", "2",
                     "--runs-dir", folder]
         assert group_runs.main() == 0
-    assert "CẢNH BÁO" in capsys.readouterr().err
+    assert "WARNING" in capsys.readouterr().err
 
 
 def test_runs_without_the_ruler_key_do_not_warn(capsys) -> None:
@@ -132,7 +132,7 @@ def test_runs_without_the_ruler_key_do_not_warn(capsys) -> None:
         sys.argv = ["group_runs.py", "--slice", "strict", "--min-seeds", "2",
                     "--runs-dir", folder]
         assert group_runs.main() == 0
-    assert "CẢNH BÁO" not in capsys.readouterr().err
+    assert "WARNING" not in capsys.readouterr().err
 
 
 def write_runs(folder, runs) -> None:

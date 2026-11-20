@@ -56,6 +56,15 @@ partition là `test`. Đường duy nhất để đọc test là truyền `allow
 chỗ nào trong dự án truyền giá trị đó. Một lời nhắc trong tài liệu dễ bị bỏ qua hơn một
 ngoại lệ.
 
+**Nhưng điều đó KHÔNG có nghĩa là tập test của split 50 % còn nguyên.** `check_partition`
+chỉ chặn việc *gọi tên* partition `test`. `data.read_columns` áp bảng đổi partition
+**trước** bước lọc, nên các thí nghiệm đổi ngưỡng 30 %/80 % đã gán một phần dòng test của
+split 50 % sang train và validation của chính chúng — những dòng đó đã tham gia huấn
+luyện. Cách nói đúng: chưa có checkpoint nào được chấm trên partition test của split 50 %,
+nhưng một phần tập đó đã bị dùng trong các thí nghiệm độ nhạy, nên nó không còn là tập
+đánh giá độc lập hoàn toàn. Muốn một ước lượng độc lập cho cấu hình được chọn trên
+validation thì phải tách một tập mới, chưa chạm bởi bất kỳ bảng đổi partition nào.
+
 ## 3. Kiến trúc
 
 ```
@@ -415,6 +424,376 @@ vì một chữ sai sẽ lặng lẽ thành "không đổi gì".
 Hệ số đã dùng được ghi vào khóa `branch_learning_rate_scale` của manifest, và learning
 rate từng nhóm được ghi vào log khi có nhánh nào khác 1,0.
 
+## 4.9 The three diagnostics of the 2026-11-18 meeting
+
+The three modes below are **not** meant to report results, but to answer three questions
+raised at the meeting. Each one reuses the data reading, the splitting and the metric set
+of `--mode train` untouched, so their numbers compare directly with the batches already
+run.
+
+### 4.9.1 Classical baselines — `--mode classical`
+
+From the meeting: *"if this complicated 3.7-million-parameter deep learning model of yours
+cannot even beat a linear regression, then it is not solving anything."*
+
+```powershell
+python run_evaluator.py --mode classical --config frozen --baseline all `
+  --set inputs.train_subset=work/splits/train_subset_c200_r500.parquet
+```
+
+* Features: fingerprint A, fingerprint B, substituent A, substituent B, protein embedding,
+  one-hot endpoint — **exactly** the five inputs of the MLP, read from the very caches it
+  uses. Each block's column range is recorded in the manifest (`feature_blocks`).
+* `--config no_protein` drops the protein block; that is also a feature control.
+* Models: `linear` (`LinearRegression`), `ridge`, `lasso`, `xgboost`. Every
+  regularisation level is a separate fit, reported separately.
+* **The alpha grid is per model.** `stage3.classical.alphas` is the default grid and
+  `alphas_by_model` overrides it for one model (currently ridge `[0.1, 1, 10, 100]`, lasso
+  `[0.0001, 0.001, 0.01]`). One shared grid cannot serve both: the features are not
+  standardised and the two penalties are on different scales, so a level that barely
+  regularises ridge drives every lasso coefficient to zero. Until 2026-11-20 the grid held
+  the single value `1.0`, which for lasso is almost certainly that degenerate case.
+* **The level that gets quoted is chosen by the run, not by hand.** The manifest's
+  `selected_alpha[model]` holds `{alpha, label, value, alphas_compared}`, picked on
+  **validation** through `train.selection_score` with `stage3.train.selection_metric` and
+  `selection_slice` — the same code path `--mode train` uses to choose a checkpoint, which
+  is the only way the two sides compare. A tie goes to the smaller alpha. The manifest also
+  records `selection_metric` and `selection_slice` at the top level, so a table never has
+  to guess which number was compared.
+* **Two flags per fit, so a non-baseline cannot be quoted as one.**
+  `results[label].coefficients` = `{total, nonzero, constant_predictor}`: a fit whose alpha
+  zeroed the whole vector predicts its intercept for every row, which gives an MAE equal to
+  the labels' mean absolute deviation and a direction accuracy decided by the tie-breaking
+  rule — numbers that look like a baseline and are not one. `results[label].convergence` =
+  `{iterations, max_iter, hit_the_cap}`: lasso's coordinate descent and ridge's `sparse_cg`
+  both stop at `max_iter` whatever state the solution is in, and scikit-learn says so only
+  through a warning that no batch log keeps. Both are `null` for a model that reports
+  neither (xgboost) — `null` and not a zero, because "not reported" is not "none".
+  **Both flags only work in one direction.** All-zero coefficients prove a constant
+  prediction; non-zero coefficients do not prove the opposite, since a fit can still be
+  (near-)constant on a particular set of rows. `hit_the_cap` says the iteration budget was
+  spent, not that the answer is bad; not hitting it does not prove the answer is good.
+* **Both sides have to select the same way.** The alpha is chosen on validation, and so is
+  the MLP's checkpoint, so `selection_metric` and `selection_slice` have to match across
+  `--mode classical` and `--mode train`, or the table compares two different questions.
+  `scripts/server_run_diagnostics_1911.sh` keeps the two flags in one variable
+  (`$SELECTION`) that both kinds of task pass, and
+  `tests/test_diagnostics_script.py::test_the_alpha_and_the_checkpoint_are_chosen_by_the_same_metric`
+  fails if any command loses them. Note what the resulting number then is: the validation
+  score of a configuration that was CHOSEN on validation. An independent estimate of that
+  configuration needs a separate held-out set.
+* The selection slice is resolved **before** the feature matrix is built, with the
+  validation row count of every slice, exactly as `--mode train` does it: a slice with no
+  validation rows stops the run immediately instead of paying for nine fits and then
+  writing a manifest with no winner in it. If a slice does have rows but the metric is
+  still undefined for every level (no query in it reaches `min_candidates`), the model is
+  named in `selected_alpha_unavailable` and logged as a warning — an absent key would read
+  as "not implemented".
+* Cost: `--baseline all` is now 9 fits (1 linear + 4 ridge + 3 lasso + 1 xgboost) instead
+  of 4, and the lasso levels are the slow part. To trim them without editing the config:
+  `--set classical.alphas_by_model.lasso=[0.001]`.
+* Scored on **both train (the very rows that were fitted) and validation**, slice by slice
+  — exactly the "you have to look at the metrics on the training set as well" requirement.
+* Features are **not** standardised: fingerprints are 0/1 bits while protein embeddings are
+  real numbers, so one `alpha` lands on the two blocks with two different effective
+  strengths. The reason: the usual standardisation **subtracts the mean**, and subtracting
+  the mean turns every zero into a non-zero, destroying sparsity and making the matrix
+  fully dense. **Scaling alone** (`with_mean=False`, or scaling the protein block
+  separately) does keep sparsity — a legitimate option the project has **not tried**, not
+  something that cannot be done. This has to be stated when reporting.
+* Needs `scikit-learn`, `scipy`, `xgboost` (see `requirements.txt`); all three are imported
+  inside function bodies, so the other modes keep working without them.
+* Manifest: `runs/evaluator/classical_<configuration>_<stamp>.json`.
+
+### 4.9.2 The capacity check — `--mode capacity`
+
+One reading at the meeting: *"an architecture this size, with the tiny amount of data you
+feed it, cannot possibly train to a good result."* The other: *"but the point is that it is
+not even overfitting."* Only a direct check can reconcile the two.
+
+```powershell
+# The pair that isolates dropout: SAME hyper-parameters, one keeps dropout.
+python run_evaluator.py --mode capacity --config frozen --head direct `
+  --set learning_rate=9.86e-05 --set weight_decay=0.0
+python run_evaluator.py --mode capacity --config frozen --head direct --regularized `
+  --set learning_rate=9.86e-05 --set weight_decay=0.0
+# The 100k question: fit the WHOLE SUB100 subset, no sampling window left.
+python run_evaluator.py --mode capacity --config frozen --head direct `
+  --set inputs.train_subset=work/splits/train_subset_c200_r500.parquet `
+  --set capacity.rows=100000 --set capacity.read_rows=100000
+```
+
+**The two runs of a pair must differ in ONE thing.** Until 2026-11-19 the batch script
+gave the plain run the config default learning rate (1e-3) and the `--regularized` run the
+reference 9.86e-05, so their difference measured dropout *and* a tenfold change of learning
+rate at once, which is to say it measured nothing. Both now take the same `--set` flags.
+
+Hand the model `stage3.capacity.rows` rows (1,024 by default), **switch off** dropout and
+weight decay, run up to `epochs` (200 by default) with no early stopping on validation,
+then measure on **that same sample**. `--regularized` keeps the configured dropout and
+weight decay, to separate "the model lacks capacity" from "those two anti-overfitting knobs
+are blocking it".
+
+* `verdict` in the manifest: `fits` when train R² ≥ `fit_train_r2` (0.95);
+  `does_not_fit` when it is lower; `undecided` when the labels have no variance. `fits`
+  establishes exactly one thing — that for **this** architecture, **these** hyper-parameters
+  and **that** sample the fit is attainable within the epoch budget — and `verdict_note`
+  says so, printing the dropout and weight-decay VALUES actually used rather than a word
+  like "on" or "off" (the 2026-11-19 batch passes `weight_decay=0.0` to its `--regularized`
+  run as well, so that pair isolates dropout alone and "the knobs are on" would be false).
+  This is
+  also the **early-stopping condition** — deliberately one threshold for both jobs, because
+  two different thresholds once produced a run that both logged "sample fitted" and
+  recorded `does_not_fit`.
+* Fits ⇒ **a lack of capacity is not the explanation** for the model failing to overfit
+  real data; what is left to examine is the input representation and the noise in the
+  labels. This check does **not** inspect per-branch gradients, so it does not prove that
+  every branch learns — for that, use `--mode diagnose`.
+* Does not fit ⇒ what the check measured is that the target R² was **not reached on this
+  sample within the epochs that ran**, and nothing more. Why is a separate question with at
+  least four candidate answers, to be told apart afterwards: the gradient path (`--mode
+  diagnose --partition train`), a representation that cannot tell two rows with different
+  labels apart, self-contradictory labels, and the optimisation schedule plus the number of
+  update steps.
+* **Every** dropout key of the `stage3.model` block goes off, not just `model.dropout`: the
+  residual block has its own `residual_hidden_dropout` and `residual_dropout`, and the
+  `attention` fusion has `attention_dropout`. The manifest records the whole set in
+  `dropout_keys`.
+* The verdict applies only to the **exact architecture of that run**. The config default is
+  the `plain` 512-256 head; a conclusion about the reference batches' residual 7x102
+  requires passing that batch's `--set` flags (see
+  `scripts/server_run_diagnostics_1911.sh`).
+* Under the `finetune` configuration, the batch size and batch grouping come through
+  `--mode train`'s own path (`finetune_overrides`, grouping by protein); otherwise VRAM
+  runs out on the first batch.
+* This mode saves **no** checkpoint and touches **no** validation data. It says nothing
+  about prediction quality on unseen data.
+* The small sample is drawn at random from the first `read_rows` rows of train. **Measured
+  on 2026-11-19: the first 200,000 train rows of dataset_v4 are all `Ki`.** The default
+  window therefore holds a single endpoint and only part of the proteins, so the verdict of
+  a default run reads "this configuration can (or cannot) fit 1,024 Ki rows" — the question
+  "can it fit **some** small sample", and nothing wider. The manifest's `sample` block
+  records `distinct_endpoints` and `distinct_proteins`, and `verdict_note` repeats them, so
+  the scope travels with the number.
+* To ask the **100k** question instead, point the run at SUB100 with
+  `--set inputs.train_subset=... --set capacity.rows=100000 --set capacity.read_rows=100000`:
+  it then fits every row it reads and no sampling window is left to skew it. This is task 2d
+  of `scripts/server_run_diagnostics_1911.sh`.
+* `does_not_fit` after a fixed epoch budget leaves the **optimisation schedule and the
+  number of update steps** among the candidate causes, next to the gradient path, the
+  representation and the labels. `verdict_note` says so.
+
+### 4.9.3 The protein control — `stage3.train.protein_permute_seed`
+
+From the meeting: *"why would you think that feeding in the protein branch does not make
+sense when we are not splitting by protein?"* The old evidence was "dropping the protein
+branch barely changes the result", but dropping the branch **changes** the model (fewer
+parameters, fewer inputs), so it cannot separate "the model does not use the protein" from
+"the model compensates for what is missing".
+
+```powershell
+python run_evaluator.py --mode train --config frozen --head direct `
+  --set inputs.partition_override_pairs=work/splits/pair_split_1411.parquet `
+  --set protein_permute_seed=20261119
+```
+
+**The scope has to be the right one.** The meeting's question is about the case where the
+split is *not* by protein, i.e. the PAIR75 scope (`inputs.partition_override_pairs`:
+proteins seen, pairs unseen). A run that only sets `inputs.train_subset` is still split by
+protein cluster, so it does **not** answer that question — it answers the corresponding
+question for the SUB100 scope. The 2026-11-19 batch runs both and labels each one.
+
+The model, the parameter count, the input size and even the **multiset** of proteins all
+stay as they are; only the row → protein link is shuffled (a permutation of that very
+column, with its own permutation per partition). The query key columns are **not** shuffled,
+so queries are still grouped by the real protein and the denominator matches the control run
+exactly.
+
+* The result drops ⇒ the real protein link **does** help under the conditions being tested.
+* The result does not move ⇒ under those conditions, the link does not help. Note: this is
+  **not yet** proof that the original model ignores the protein entirely — the model in the
+  shuffled run is retrained, so it can learn to compensate for what it lost. A stronger
+  conclusion needs `--mode diagnose` (per-input sensitivity) on the checkpoint of the
+  **unshuffled** run.
+* Read it as a **difference** against a run on the same seed without the shuffle; this
+  project's seed-noise floor is 0.0021 on macro direction accuracy, and one seed is not
+  enough to conclude anything when the difference is small.
+* The two runs share `queries_ranked`, the number of counted pairs and the denominator of
+  `pairwise_accuracy_macro`, because the labels, the slices and the query key columns are
+  all left unshuffled. One exception: `spearman_queries` can change, since it drops queries
+  where the model predicts a constant.
+* The shuffle lives in `train.prepare_arrays`, the single chokepoint every mode goes
+  through, so `eval`, `errors`, `features` and `diagnose` obey the same setting. The seed is
+  written **into the `.pt` checkpoint as well**, and `load_checkpoint` **refuses** to
+  re-score when the current setting differs (otherwise "train shuffled, score clean"
+  produces an ordinary-looking table of numbers that is higher than the truth).
+  `scripts/group_runs.py` warns when a group mixes the two kinds of run.
+* **The split is locked the same way, since 2026-11-19** (`train.check_input_split`). The
+  shuffle seed alone was not enough: a PAIR75 run re-scored with the right
+  `protein_permute_seed` but *without* `--set inputs.partition_override_pairs=...` passed
+  every check and then read the default validation partition (493,852 rows) instead of the
+  split's own 24,946 — a different experiment on different rows. The checkpoint now carries
+  `train_subset`, `partition_override` and `partition_override_pairs`, and the loader
+  refuses a mismatch and prints the `--set` flags that fix it. Checkpoints from before that
+  date carry no split; for those the loader **warns every time**, including when the
+  command sets no flag at all — that is the dangerous case, not the safe one (an old PAIR75
+  checkpoint scored by a bare command reads the default validation partition), so silence
+  there would clear exactly what nobody can catch by eye.
+* The validation column of a table comes from the training run itself (the selection
+  point), but the **train column does not**: it needs
+  `--mode eval --checkpoint <file> --partition train` with the same split and shuffle
+  flags. Tasks 3a'–3d' of the batch script do exactly that, which is what makes the
+  train-and-validation comparison the meeting asked for possible for the MLP as well as for
+  the classical baselines.
+* **Which checkpoint those steps use** is decided by a **run id**, not by a timestamp or
+  by file age. Three ways of naming it were tried and are wrong:
+  * *the newest `.pt`* — belongs to the previous task when this one died before writing
+    anything, or to an unfinished run, since `--mode train` saves its best checkpoint
+    DURING the run;
+  * *the newest manifest written since I started* — loses a race between two batches
+    sharing `runs/evaluator/`: job A writes its manifest and exits 0, job B writes its own
+    a moment later, and A's next step then opens B's manifest. With the same split and
+    shuffle seed every check inside the loader passes, so nothing announces it;
+  * *the timestamp in the file name* — accurate only to the second, so two runs started in
+    the same second write the SAME paths and one overwrites the other.
+
+  So `--run-id` (see `run_stamp` in `run_evaluator.py`) is added to the name of every file
+  a run writes — its checkpoint **and** its manifest — the batch gives EVERY command an id
+  of `<task>-<pid>` (not only the train commands: a `classical`, `capacity`, `eval` or
+  `diagnose` manifest is named the same way, so two batches could overwrite each other's
+  results although each command had loaded the right checkpoint), and
+  `scripts/pick_train_checkpoint.py` opens the manifest carrying that id — refusing, rather
+  than guessing, when none or more than one matches. A manifest is
+  written only when the run reaches the end, so its existence is also the proof that the
+  run finished; the batch still checks the train command's exit code first
+  (`LAST_STATUS`), because `run` returns 0 on purpose so one dead task cannot stop the
+  batch.
+
+### 4.9.5 Per-block gradient norms — `--mode diagnose --partition train`
+
+From the meeting: does every one of the 7 residual blocks actually learn? `--mode diagnose`
+already counted ReLU units that never fire and measured how much the prediction moves when
+one input is shuffled, but **both of those run under `torch.no_grad()`**, and a block with
+perfectly ordinary activations can still receive a gradient of exactly zero (a detached
+path, a gate stuck at zero, a head that ignores the branch). Since 2026-11-19 the mode also
+reports, per block, the norm of the gradient of that block's own parameters after
+`loss.backward()` on train rows:
+
+```powershell
+python run_evaluator.py --mode diagnose --checkpoint runs/evaluator/<file>.pt `
+  --partition train --set inputs.partition_override_pairs=work/splits/pair_split_1411.parquet
+```
+
+* Groups are cut at the first numbered component of the parameter name
+  (`head.blocks.3.linear.weight` → `head.blocks.3`), so an `nn.Sequential` of residual
+  blocks gives one group per block — the granularity the question is asked at.
+* Per group: `parameters`, `grad_norm`, `grad_norm_per_parameter` (divided by the square
+  root of the parameter count, so a 7,000-parameter block can be compared with a
+  600,000-parameter one), `share_of_total` and `zero_fraction`.
+* Averaged over `stage3.analysis.gradient_batches` batches (5 by default) and measured in
+  **eval mode**, so repeating the command gives the same numbers. Report it as what it is:
+  *the gradient measured on train batches, at this checkpoint, with dropout off*. A zero is
+  strong evidence that nothing reaches the block, but eval-mode gradients are **not** the
+  training gradients in general — with dropout active the expectation is taken over masks,
+  and the two need not agree.
+* The labels are put back into the space the checkpoint was **trained** in, using the
+  `LabelScaler` stored in the checkpoint itself: `run_train` fits on
+  `LabelScaler.forward(target)`, so a model trained with `zscore`/`minmax` learned on z,
+  and feeding raw Δp here would be the gradient of a different loss — wrong scale, and with
+  a non-zero shift the wrong sign too. The manifest records `loss`, `huber_delta` and
+  `labels` so a number is never read without them. The loss comes from the **current**
+  command's config (a checkpoint does not store it), so reproducing the gradients of an
+  older train run means passing that run's `loss` and `huber_delta` — both are in its own
+  manifest — with `--set`.
+* Only the evaluator's own parameters, not ESM2's under `finetune` — and for that reason
+  the batch is built inside `torch.no_grad()`, which keeps ESM2 out of the graph. Otherwise
+  the backward pass would run through it and hold its activations for every batch, spending
+  VRAM on numbers this report never shows. Nothing is updated: the gradients are cleared
+  again and no optimizer is involved, so the checkpoint on disk is untouched.
+* `--partition train` is the meaningful one: a gradient measured on validation rows is not
+  the gradient the model was trained by.
+
+### 4.9.4 Hyper-parameters, and why not the config defaults
+
+The `config.json` defaults are the `plain` 512-256 head, learning rate 1e-3, and checkpoint
+selection on MAE over the `all` slice. Every result table this project has reported was
+measured with the 2026-11-14 batch's configuration: residual 7x102 with factor 1.849,
+dropout 0.5 / hidden 0.3936, learning rate 9.86e-05, weight decay 0, selection on
+`pairwise_accuracy_macro` over the `strict` slice. Running the three diagnostics on the
+defaults would produce numbers that compare with **no existing table**, so
+`scripts/server_run_diagnostics_1911.sh` passes the reference batch's `--set` flags and
+keeps the defaults for a single, clearly labelled capacity run.
+
+#### Before a table is built: `scripts/check_diagnostics_manifests.py`
+
+```bash
+python scripts/check_diagnostics_manifests.py runs/evaluator runs/diagnostics_1911_gpu1.log
+```
+
+Exit 0 means the seven manifests the three tables need are there and were all selected the
+same way; exit 1 prints one `FAIL` line per task and means the output is **not fit to
+quote**. The script reads the batch's pid back out of its own log (the pid file is gone by
+then, removed by the trap) and looks up each task by the run-id suffix of its filename,
+`_<task>-<pid>.json`. It checks that each of `t1a`–`t1c` and `t3a`–`t3d` wrote **exactly
+one** manifest, that all seven carry `pairwise_accuracy_macro` / `strict`, that the three
+classical manifests have `complete: true` and a winner for **both** ridge and lasso, and
+that the four train manifests name a checkpoint that is on disk.
+
+It exists because the obvious check — glob `runs/evaluator/*.json` and print the two
+selection fields — is wrong in three ways, each of which lets a bad batch look fine: a glob
+sees the whole history (two train manifests from 2026-10-31 predate the selection fields
+and print `None None`, which reads as a broken new batch, or makes a directory look
+populated when this batch wrote nothing); a task that died leaves **no file**, and a glob
+says nothing about it; and `--mode classical` rewrites its manifest after every fit, so a
+run that died mid-grid already carries both selection fields and a provisional winner with
+`complete: false`.
+
+All of them run in one go with `scripts/server_run_diagnostics_1911.sh <GPU index>`,
+whose log, pid file and every run id are named after that GPU index so two batches on
+two GPUs can run side by side without overwriting each other's files. One batch per GPU is
+enforced with a `flock` lock (`scripts/gpu_batch_lock.sh`), not by reading a pid file:
+reading and then writing is two steps, so two batches launched in the same second would both
+read "nobody there" before either wrote. The lock lives on a descriptor the batch keeps
+open, so the kernel releases it however the batch ends — `kill -9` included — and it also
+owns the pid file, which is written under the lock and removed by a trap on EXIT (the early
+exit for a missing split file used to leave it behind, and a leftover pid eventually names
+an unrelated process). To stop a batch, use `scripts/stop_gpu_batch.sh <GPU index>`, never a `kill` one-liner: a
+pid alone cannot be checked, and a pid left behind by a SIGKILLed batch can later belong to
+a batch of the SAME script on another GPU, where even `ps | grep
+server_run_diagnostics_1911` matches. The record `claim_gpu` writes therefore holds the GPU,
+the process group and the process start time (which a reused pid cannot inherit), and the
+stop script compares all three before it signals anything. It does not trust the group
+number either: the record can be out of date (a newer batch takes the lock a moment before it
+replaces the record), so before signalling it requires that the process leads its own group
+(`pgid == pid`, which is what `setsid` gives) and that **some member of that group is holding
+this GPU's lock file open**, checked through `/proc/<pid>/fd`. That last fact is the only one
+that ties a process group to a GPU; pid, group number and start time can all go stale. The
+same check covers the case where only the shell died while the python run still holds the
+lock: the script lists what is alive in the group, stops it, and then waits to confirm the
+group is really gone — it returns 5, not 0, if the signal was refused or the group survives.
+"Alive" excludes zombies: a process that has exited but whose parent has not reaped it is
+still listed by `ps`, and counting it would make a correctly stopped batch report failure
+(tasks 1a–1c classical, 2a–2d capacity, 3a–3d' the protein control with both halves of the
+table, 4 the gradient norms). The
+script counts failed commands and **exits non-zero** if there were any, so it cannot finish
+with the word "DONE" while one task died part-way.
+
+### 4.9.6 The sequence window of a finetune checkpoint
+
+`--mode train` narrows the protein window through `stage3.train.finetune_overrides`
+(`max_residues` 512 instead of the shared 1022), because finetune keeps ESM2 in the backward
+graph and its memory grows with the number of residues. Until 2026-11-19 the re-scoring path
+rebuilt the encoder from the shared config instead, so for every protein longer than 512
+residues the same weights were handed a longer sequence: the same model, a different input,
+and therefore predictions that differ from the ones that selected the checkpoint — with
+nothing in the output to announce it.
+
+A finetune checkpoint now records the encoder settings its own run used
+(`protein_encoder_settings`), and `finetune_encoder_settings` prefers them over the config.
+Checkpoints trained before 2026-11-19 do not carry them; for those the window **cannot** be
+checked, so loading one logs a warning that names both numbers instead of letting the reader
+assume they matched. The frozen tasks of 2026-11-19 never go through this branch.
+
 ## 5. Ba cấu hình
 
 | cấu hình | nhánh protein | mục đích |
@@ -639,6 +1018,29 @@ lớp đó. Dự án không bao giờ đọc `pooler_output`: cả `features.emb
 token acid amin (mục 8). Nếu code dùng `pooler_output` thì toàn bộ 6.313 embedding sẽ là
 nhiễu ngẫu nhiên — và không có gì trong log báo cho ta biết. Đây là chỗ im lặng nguy hiểm
 nhất của cả Stage 3, nên ghi lại rõ.
+
+### 7.1 Swapping an encoder: the flags that are actually required (2026-11-19)
+
+Two items of the post-2026-11-18 list are "try ESM-2 150M" and "try ChemBERTa". Neither
+needs new code, but neither is a single flag either:
+
+| item | the complete command |
+|---|---|
+| ESM-2 150M | `--set protein_encoder.model=facebook/esm2_t30_150M_UR50D --set protein_encoder.embedding_dim=640 --set paths.cache_dir=work/evaluator_cache_esm150` |
+| ESM-2 650M | the same with `embedding_dim=1280` and `batch_sequences=4` (see `scripts/server_run_esm650.sh`) |
+| ChemBERTa | `--set molecule_encoder.model=DeepChem/ChemBERTa-77M-MLM --set paths.cache_dir=work/evaluator_cache_chemberta --set model.ligand_features=embedding`, after `--mode prepare --molecule-embeddings` |
+
+**Leaving out `embedding_dim` stops the program**, exactly as section 7 describes:
+`features.load_protein_encoder` compares the model's real dimension with the one declared
+in the config. That is the brake working as intended — but it does mean "just change
+`protein_encoder.model` and run" is wrong.
+
+`molecule_encoder` has only been routed through `--set` **since 2026-11-19**. ChemBERTa was
+already in `molecule_encoder.allowed_models` before that, but reaching it meant editing
+`config.json` by hand — and a hand edit changes **every** run of a batch script at once, so
+the ChemBERTa experiment could not be separated from the run beside it. The same reason
+`antisymmetric_hidden` got a route on 2026-11-11 (see `parse_number_list` in
+`run_evaluator.py`).
 
 ## 8. Thực tế tài nguyên
 

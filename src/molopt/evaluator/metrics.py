@@ -1,15 +1,15 @@
-"""Stage 3: chỉ số regression và chỉ số ranking trong từng query.
+"""Stage 3: regression metrics, and ranking metrics WITHIN one query.
 
-Hai nhóm chỉ số, cố ý tách rời:
+Two groups of metrics, deliberately kept apart:
 
-Regression — trên từng dòng, không cần nhóm: MAE, RMSE, R², Spearman toàn cục.
-Ranking    — CHỈ trong cùng một query. Một query là (phân tử tham chiếu, protein,
-             endpoint) với nhiều ứng viên. Không bao giờ xếp chung ứng viên của hai
-             query khác nhau vào một bảng.
+Regression - per row, no grouping needed: MAE, RMSE, R2, Spearman over everything.
+Ranking    - ONLY within one query. A query is (reference molecule, protein, endpoint)
+             with several candidates. Candidates of two different queries are never
+             ranked against each other in one table.
 
-Mọi hàm ở đây làm việc trên mảng numpy và không import torch, nên test được trên máy
-chưa cài thư viện học sâu. Không dùng scipy: hệ số Spearman được tính tại chỗ (scipy
-không nằm trong requirements của dự án).
+Every function here works on numpy arrays and imports no torch, so it is testable on a
+machine with no deep-learning library installed. No scipy either: the Spearman
+coefficient is computed here (scipy is not among the project's requirements).
 """
 
 from __future__ import annotations
@@ -19,19 +19,20 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-# Giá trị trả về khi một chỉ số không xác định được (ví dụ Spearman của một query mà mọi
-# nhãn bằng nhau). Dùng None chứ không dùng 0.0 để không bị cộng vào trung bình như thể
-# là một kết quả thật.
+# What a metric returns when it is undefined (the Spearman coefficient of a query whose
+# labels are all equal, for example). None, not 0.0: a zero would be averaged in as
+# though it were a measured result.
 UNDEFINED = None
 
 
 def average_ranks(values: np.ndarray) -> np.ndarray:
-    """Hạng của từng phần tử, giá trị bằng nhau nhận hạng trung bình.
+    """The rank of every element; equal values share their average rank.
 
-    Nhận: mảng 1 chiều.
-    Trả về: mảng float64 cùng độ dài, hạng bắt đầu từ 1.
-    Vì sao cần: Spearman trên dữ liệu có nhiều giá trị trùng (Δp hay trùng nhau sau khi
-    làm tròn) sẽ sai nếu phá thế hòa tuỳ ý; hạng trung bình là định nghĩa chuẩn.
+    Takes: a one-dimensional array.
+    Returns: a float64 array of the same length, ranks starting at 1.
+    WHY: a Spearman coefficient over data with many ties (rounded Δp values tie often)
+    comes out wrong if the ties are broken arbitrarily; the average rank is the standard
+    definition.
     """
     order = np.argsort(values, kind="stable")
     sorted_values = values[order]
@@ -39,14 +40,14 @@ def average_ranks(values: np.ndarray) -> np.ndarray:
     start = 0
     for index in range(1, values.size + 1):
         if index == values.size or sorted_values[index] != sorted_values[start]:
-            # Cả khối [start, index) cùng giá trị -> cùng hạng trung bình.
+            # The whole block [start, index) holds one value -> one average rank.
             ranks[order[start:index]] = 0.5 * (start + index - 1) + 1.0
             start = index
     return ranks
 
 
 def pearson(left: np.ndarray, right: np.ndarray) -> float | None:
-    """Hệ số tương quan Pearson; None nếu một phía không có phương sai."""
+    """The Pearson correlation coefficient; None when either side has no variance."""
     if left.size < 2:
         return UNDEFINED
     left_centered = left - left.mean()
@@ -59,22 +60,22 @@ def pearson(left: np.ndarray, right: np.ndarray) -> float | None:
 
 
 def spearman(truth: np.ndarray, prediction: np.ndarray) -> float | None:
-    """Spearman = Pearson trên hạng; None nếu một phía toàn giá trị bằng nhau."""
+    """Spearman = Pearson over ranks; None when either side is all one value."""
     if truth.size < 2:
         return UNDEFINED
     return pearson(average_ranks(truth), average_ranks(prediction))
 
 
 def regression_metrics(truth: np.ndarray, prediction: np.ndarray) -> dict[str, float | None]:
-    """MAE, RMSE, R², Spearman và số dòng.
+    """MAE, RMSE, R2, Spearman and the row count.
 
-    Nhận: nhãn thật và dự đoán, cùng độ dài.
-    Trả về: dict chỉ số; R² và Spearman là None khi nhãn không có phương sai.
-    R² tính quanh trung bình của nhãn thật (định nghĩa thông thường), nên có thể âm khi
-    mô hình tệ hơn việc đoán bằng trung bình.
+    Takes: the true labels and the predictions, of the same length.
+    Returns: a dict of metrics; R2 and Spearman are None when the labels have no variance.
+    R2 is taken around the mean of the TRUE labels (the usual definition), so it goes
+    negative when the model does worse than predicting that mean.
     """
     if truth.shape != prediction.shape:
-        raise ValueError(f"lệch độ dài: {truth.shape} và {prediction.shape}")
+        raise ValueError(f"length mismatch: {truth.shape} and {prediction.shape}")
     if truth.size == 0:
         return {"n": 0, "mae": UNDEFINED, "rmse": UNDEFINED, "r2": UNDEFINED,
                 "spearman": UNDEFINED}
@@ -95,24 +96,27 @@ CHANGE_CLASSES = ("worse", "neutral", "better")
 
 
 def change_class(values: np.ndarray, threshold: float) -> np.ndarray:
-    """Ba lớp của Δp: 0 = kém hơn (< −threshold), 1 = ngang (|Δp| ≤ threshold),
-    2 = tốt hơn (> threshold)."""
+    """The three classes of Δp: 0 = worse (< -threshold), 1 = neutral (|Δp| <= threshold),
+    2 = better (> threshold)."""
     return np.where(values > threshold, 2, np.where(values < -threshold, 0, 1)).astype(np.int8)
 
 
 def change_class_metrics(truth: np.ndarray, prediction: np.ndarray,
                          threshold: float) -> dict[str, object]:
-    """Đánh giá mô hình như bài toán ba lớp kém hơn / ngang / tốt hơn.
+    """Score the model as a three-class problem: worse / neutral / better.
 
-    Nhận: nhãn thật, dự đoán, ngưỡng coi là "ngang" (log). Trả về: accuracy, recall và F1
-    từng lớp, macro-F1, ma trận nhầm lẫn [thật][dự đoán] và số dòng mỗi lớp thật.
-    Vì sao cần: Δp lệch nhau ≤ 0,3 log nằm trong sai số thí nghiệm (Landrum & Riniker 2024,
-    J. Chem. Inf. Model. 64, 1560; Nelen et al. 2025, J. Cheminform. 17, 8), nên đoán sai
-    chiều trong vùng đó không có nghĩa; ba lớp tách rõ "kém hơn" khỏi "ngang" và "tốt hơn".
-    Lớp không có dòng nào (cả thật lẫn dự đoán) có F1 None và không vào macro-F1.
+    Takes: the true labels, the predictions, and the threshold below which a difference
+    counts as "neutral" (in log units). Returns: accuracy, per-class recall, precision and
+    F1, macro-F1, the confusion matrix [true][predicted], and the row count of every true
+    class.
+    WHY: a Δp difference of 0.3 log or less is inside experimental error (Landrum &
+    Riniker 2024, J. Chem. Inf. Model. 64, 1560; Nelen et al. 2025, J. Cheminform. 17, 8),
+    so getting the direction wrong inside that band means nothing; three classes separate
+    "worse" from "neutral" and "better". A class with no rows at all (neither true nor
+    predicted) has F1 None and does not enter the macro-F1.
     """
     if truth.shape != prediction.shape:
-        raise ValueError(f"lệch độ dài: {truth.shape} và {prediction.shape}")
+        raise ValueError(f"length mismatch: {truth.shape} and {prediction.shape}")
     size = len(CHANGE_CLASSES)
     result: dict[str, object] = {"n": int(truth.size), "threshold": float(threshold)}
     if truth.size == 0:
@@ -144,15 +148,15 @@ def change_class_metrics(truth: np.ndarray, prediction: np.ndarray,
 def expand_directions(reference: np.ndarray, candidate: np.ndarray, truth: np.ndarray,
                       prediction: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray,
                                                        np.ndarray]:
-    """Mỗi cặp (A, B, Δp) thành hai hướng: A->B giữ dấu, B->A đổi dấu.
+    """Every pair (A, B, Δp) becomes two directions: A->B keeps the sign, B->A flips it.
 
-    Nhận: mã phân tử A, mã phân tử B, Δp thật, Δp dự đoán.
-    Trả về: (mã phân tử tham chiếu, mã ứng viên, Δp thật, Δp dự đoán) đã nhân đôi.
-    Vì sao cần: dataset lưu cặp theo chiều khóa A < B (xem Stage 2b), nên nếu chỉ nhóm
-    theo phía A thì một query bị cắt vụn theo thứ tự khóa phân tử chứ không theo hóa học.
-    Với một phân tử tham chiếu cố định, xếp hạng ứng viên theo Δp đúng bằng xếp hạng theo
-    hoạt tính của ứng viên, nên đổi dấu là phép biến đổi hợp lệ, không phải bịa thêm dữ
-    liệu.
+    Takes: the molecule code of A, of B, the true Δp, the predicted Δp.
+    Returns: (reference molecule code, candidate code, true Δp, predicted Δp), doubled.
+    WHY: the dataset stores every pair in the key order A < B (see Stage 2b), so grouping
+    by the A side alone cuts a query up along molecule-key order rather than along
+    chemistry. For a fixed reference molecule, ranking candidates by Δp is exactly ranking
+    them by their own activity, so flipping the sign is a valid transformation and not
+    invented data.
     """
     return (np.concatenate([reference, candidate]),
             np.concatenate([candidate, reference]),
@@ -161,23 +165,23 @@ def expand_directions(reference: np.ndarray, candidate: np.ndarray, truth: np.nd
 
 
 def query_groups(columns: Sequence[np.ndarray]) -> np.ndarray:
-    """Mã nhóm (query) cho từng dòng, từ các cột khóa đã mã hóa thành số nguyên.
+    """The group (query) code of every row, from key columns already encoded as integers.
 
-    Nhận: danh sách mảng số nguyên cùng độ dài (ví dụ: phân tử tham chiếu, protein,
-    endpoint).
-    Trả về: mảng int64, cùng mã nghĩa là cùng query.
+    Takes: a list of integer arrays of the same length (reference molecule, protein,
+    endpoint, for example).
+    Returns: an int64 array; the same code means the same query.
     """
     if not columns:
-        raise ValueError("cần ít nhất một cột khóa")
+        raise ValueError("at least one key column is needed")
     stacked = np.stack([np.asarray(column, dtype=np.int64) for column in columns], axis=1)
     _, inverse = np.unique(stacked, axis=0, return_inverse=True)
     return inverse.astype(np.int64).ravel()
 
 
 def group_bounds(group_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Sắp xếp theo mã nhóm; trả về (thứ tự dòng, biên của từng nhóm).
+    """Sort by group code; returns (row order, the bounds of every group).
 
-    Biên có dạng [0, ..., n] nên nhóm thứ i là order[bounds[i]:bounds[i + 1]].
+    The bounds read [0, ..., n], so group i is order[bounds[i]:bounds[i + 1]].
     """
     order = np.argsort(group_ids, kind="stable")
     sorted_ids = group_ids[order]
@@ -188,12 +192,14 @@ def group_bounds(group_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 def pairwise_direction(truth: np.ndarray, prediction: np.ndarray,
                        tolerance: float) -> tuple[int, int]:
-    """Số cặp ứng viên đoán đúng chiều, và số cặp được tính.
+    """How many candidate pairs got the direction right, and how many were counted.
 
-    Nhận: nhãn và dự đoán của các ứng viên TRONG MỘT query; ngưỡng coi hai nhãn là bằng.
-    Trả về: (số cặp đúng chiều, số cặp được tính).
-    Cặp có hai nhãn lệch nhau không quá tolerance bị loại khỏi mẫu số: không có chiều
-    đúng để so. Cặp mà dự đoán bằng nhau tính là sai, vì mô hình không chọn được.
+    Takes: the labels and predictions of the candidates WITHIN ONE query; the threshold
+    below which two labels count as equal.
+    Returns: (pairs with the right direction, pairs counted).
+    A pair whose two labels differ by no more than `tolerance` is dropped from the
+    denominator: there is no right direction to compare against. A pair the model predicts
+    as a tie counts as wrong, because the model did not choose.
     """
     difference_truth = truth[:, None] - truth[None, :]
     difference_prediction = prediction[:, None] - prediction[None, :]
@@ -207,10 +213,10 @@ def pairwise_direction(truth: np.ndarray, prediction: np.ndarray,
 
 
 def top_k_hit(truth: np.ndarray, prediction: np.ndarray, k: int) -> bool:
-    """Ứng viên tốt nhất theo nhãn có nằm trong k ứng viên tốt nhất theo dự đoán không.
+    """Is the best candidate by label among the k best candidates by prediction?
 
-    Nhãn trùng ở đỉnh: tính là trúng nếu BẤT KỲ ứng viên đạt nhãn lớn nhất nằm trong
-    top-k dự đoán.
+    Ties at the top: it counts as a hit if ANY candidate holding the largest label is
+    inside the predicted top-k.
     """
     best = np.flatnonzero(truth >= truth.max())
     chosen = np.argsort(-prediction, kind="stable")[:k]
@@ -220,30 +226,33 @@ def top_k_hit(truth: np.ndarray, prediction: np.ndarray, k: int) -> bool:
 def ranking_metrics(group_ids: np.ndarray, truth: np.ndarray, prediction: np.ndarray,
                     top_k: Sequence[int], min_candidates: int,
                     tolerance: float = 0.0) -> dict[str, object]:
-    """Chỉ số ranking trong từng query, tổng hợp theo cả macro và micro.
+    """Ranking metrics within every query, summarised both macro and micro.
 
-    Nhận: mã query của từng dòng, nhãn, dự đoán, danh sách k, số ứng viên tối thiểu để
-    một query được xếp hạng, ngưỡng coi hai nhãn là bằng nhau.
-    Trả về: dict gồm
-        queries_total / queries_ranked / queries_skipped — mẫu số được ghi rõ;
-        spearman_macro, spearman_median — trung bình và trung vị Spearman THEO QUERY;
-        spearman_undefined — số query mọi nhãn bằng nhau nên không tính được;
-        pairwise_accuracy_macro — trung bình theo query của tỷ lệ đúng chiều;
-        pairwise_accuracy_micro — gộp mọi cặp ứng viên của mọi query rồi mới chia;
-        pairs_counted — mẫu số của micro;
-        top_{k} và top_{k}_queries — tỷ lệ trúng và mẫu số riêng của từng k.
+    Takes: the query code of every row, the labels, the predictions, the list of k values,
+    the minimum number of candidates for a query to be ranked at all, and the threshold
+    below which two labels count as equal.
+    Returns: a dict holding
+        queries_total / queries_ranked / queries_skipped - the denominators, stated;
+        spearman_macro, spearman_median - the mean and median Spearman PER QUERY;
+        spearman_undefined - how many queries had all labels equal, so it was undefined;
+        pairwise_accuracy_macro - the per-query direction accuracy, averaged over queries;
+        pairwise_accuracy_micro - every candidate pair of every query pooled, then divided;
+        pairs_counted - the denominator of the micro figure;
+        top_{k} and top_{k}_queries - the hit rate and its own denominator for every k.
 
-    Vì sao báo cáo cả macro và micro: query dài có nhiều cặp nên chi phối micro, còn
-    macro cho mỗi query một phiếu như nhau. Hai con số trả lời hai câu hỏi khác nhau và
-    buổi họp chưa chốt, nên không chọn một cái.
-    Vì sao KHÔNG có spearman_micro: Spearman chỉ có nghĩa trong một query; gộp hạng của
-    các query khác nhau vào một bảng chính là điều phải tránh. Với top-k, macro và micro
-    trùng nhau (chỉ số 0/1 trên mỗi query) nên chỉ báo cáo một con số kèm mẫu số.
+    WHY BOTH MACRO AND MICRO ARE REPORTED: a long query holds many pairs and therefore
+    dominates the micro figure, while the macro figure gives every query one equal vote.
+    The two numbers answer two different questions and the meeting did not settle which
+    one counts, so neither is dropped.
+    WHY THERE IS NO spearman_micro: a Spearman coefficient only means something within one
+    query; pooling the ranks of different queries into one table is the very thing to
+    avoid. For top-k, macro and micro coincide (the metric is 0/1 per query), so there is
+    one figure and its denominator.
     """
     if not (truth.shape == prediction.shape == group_ids.shape):
-        raise ValueError("group_ids, truth và prediction phải cùng độ dài")
+        raise ValueError("group_ids, truth and prediction must be the same length")
     if min_candidates < 2:
-        raise ValueError(f"min_candidates phải từ 2 trở lên, nhận {min_candidates}")
+        raise ValueError(f"min_candidates has to be 2 or more, got {min_candidates}")
     order, bounds = group_bounds(group_ids)
     spearman_values: list[float] = []
     accuracy_values: list[float] = []
@@ -271,7 +280,8 @@ def ranking_metrics(group_ids: np.ndarray, truth: np.ndarray, prediction: np.nda
             pairs_total += counted
             accuracy_values.append(agree / counted)
         for k in hits:
-            # top-k chỉ có nghĩa khi query có ít nhất k ứng viên; mẫu số riêng từng k.
+            # top-k only means something for a query with at least k candidates, so
+            # every k carries its own denominator.
             if rows.size >= k:
                 denominators[k] += 1
                 if top_k_hit(group_truth, group_prediction, k):
@@ -298,11 +308,12 @@ def ranking_metrics(group_ids: np.ndarray, truth: np.ndarray, prediction: np.nda
 
 def metrics_by_endpoint(endpoints: np.ndarray, truth: np.ndarray, prediction: np.ndarray,
                         names: Sequence[str]) -> dict[str, dict[str, float | None]]:
-    """Chỉ số regression tách riêng từng endpoint.
+    """Regression metrics, one block per endpoint.
 
-    Nhận: mã endpoint của từng dòng, nhãn, dự đoán, danh sách tên endpoint theo mã.
-    Trả về: {tên endpoint: chỉ số regression}; endpoint không có dòng nào vẫn xuất hiện
-    với n = 0, để bảng báo cáo không bị thiếu cột giữa các lần chạy.
+    Takes: the endpoint code of every row, the labels, the predictions, and the endpoint
+    names in code order.
+    Returns: {endpoint name: regression metrics}. An endpoint with no rows still appears,
+    with n = 0, so the report table does not lose a column between runs.
     """
     result = {}
     for code, name in enumerate(names):
@@ -313,23 +324,26 @@ def metrics_by_endpoint(endpoints: np.ndarray, truth: np.ndarray, prediction: np
 
 def asymmetry_metrics(forward: np.ndarray, backward: np.ndarray, identity: np.ndarray,
                       label_spread: float) -> dict[str, float | None]:
-    """Mức lệch khỏi hai tính chất mà kiến trúc `direct` KHÔNG bảo đảm.
+    """How far the predictions depart from two properties the `direct` head does NOT
+    guarantee.
 
-    Nhận:
-        forward      : f(A, B) trên một mẫu dòng validation
-        backward     : f(B, A) trên đúng các dòng đó, đã đổi chỗ hai phía
-        identity     : f(A, A) trên đúng các dòng đó, phía B thay bằng chính phía A
-        label_spread : độ lệch chuẩn của nhãn thật trên mẫu đó, dùng làm thước đo
-    Trả về: các số đo, kèm hai tỉ lệ đã chuẩn hóa.
+    Takes:
+        forward      : f(A, B) over a sample of validation rows
+        backward     : f(B, A) over exactly those rows, with the two sides swapped
+        identity     : f(A, A) over exactly those rows, with the B side replaced by A
+        label_spread : the standard deviation of the true labels over that sample, which
+                       serves as the yardstick
+    Returns: the measurements, plus two normalised ratios.
 
-    Phần đối xứng của dự đoán là r = (f(A,B) + f(B,A)) / 2. Mô hình đối xứng hoàn hảo có
-    r = 0 với mọi cặp; `twin` cho đúng 0 do xây dựng, `direct` thì không. Một con số tuyệt
-    đối không đọc được nếu không có thước đo, nên hàm trả về cả tỉ lệ so với biên độ dự
-    đoán và so với độ lệch chuẩn của nhãn: lệch 0,1 log là nhỏ khi nhãn trải 1,5 log và
-    lớn khi nhãn trải 0,2 log.
+    The symmetric part of a prediction is r = (f(A,B) + f(B,A)) / 2. A perfectly
+    antisymmetric model has r = 0 for every pair; `twin` gives exactly 0 by construction,
+    `direct` does not. An absolute number cannot be read without a yardstick, so this also
+    returns the ratio to the size of the predictions and to the spread of the labels: a
+    departure of 0.1 log is small when the labels span 1.5 log and large when they span
+    0.2 log.
     """
     if not (forward.size == backward.size == identity.size):
-        raise ValueError("ba mảng phải cùng số dòng")
+        raise ValueError("the three arrays must hold the same number of rows")
     if forward.size == 0:
         return {"n": 0, "antisymmetry_mean_abs": UNDEFINED, "antisymmetry_p90": UNDEFINED,
                 "antisymmetry_max": UNDEFINED, "antisymmetry_over_prediction": UNDEFINED,
@@ -360,12 +374,13 @@ def asymmetry_metrics(forward: np.ndarray, backward: np.ndarray, identity: np.nd
 
 
 def format_asymmetry(label: str, scores: Mapping[str, float | None]) -> list[str]:
-    """Hai dòng log cho số đo bất đối xứng; None in thành '-'.
+    """Two log lines for the asymmetry measurements; None prints as '-'.
 
-    Dòng thứ hai in giá trị LỚN NHẤT theo ký hiệu khoa học và đối chiếu với mốc 1e-8 của
-    anh Tiến (họp 09/11/2026, dòng 141). Phải dùng ký hiệu khoa học: ở kiến trúc phản đối
-    xứng đúng theo cấu tạo, con số này cỡ 1e-8 trở xuống, mà `%.4f` sẽ in thành 0,0000 —
-    tức không phân biệt được "đạt mốc" với "bằng 0 vì model đoán hằng số".
+    The second line prints the LARGEST value in scientific notation and compares it with
+    the 1e-8 target set at the 2026-11-09 meeting (line 141 of the minutes). Scientific
+    notation is required: on an architecture that is antisymmetric by construction this
+    number is around 1e-8 or below, which `%.4f` would print as 0.0000 - and that cannot
+    be told apart from "zero because the model predicts a constant".
     """
 
     def show(value: object) -> str:
@@ -378,25 +393,25 @@ def format_asymmetry(label: str, scores: Mapping[str, float | None]) -> list[str
 
     target = scores.get("antisymmetry_target")
     meets = scores.get("meets_target")
-    verdict = "-" if meets is None else ("ĐẠT" if meets else "CHƯA ĐẠT")
+    verdict = "-" if meets is None else ("MET" if meets else "NOT MET")
     lines = [f"{label}: n = {show(scores.get('n'))}"
-             f" | |f(A,B)+f(B,A)|/2 trung bình {show(scores.get('antisymmetry_mean_abs'))}"
-             f" (= {show(scores.get('antisymmetry_over_label_spread'))} lần sd nhãn)"
-             f" | |f(A,A)| trung bình {show(scores.get('identity_mean_abs'))}"
-             f" (= {show(scores.get('identity_over_label_spread'))} lần sd nhãn)"]
+             f" | mean |f(A,B)+f(B,A)|/2 {show(scores.get('antisymmetry_mean_abs'))}"
+             f" (= {show(scores.get('antisymmetry_over_label_spread'))} x label sd)"
+             f" | mean |f(A,A)| {show(scores.get('identity_mean_abs'))}"
+             f" (= {show(scores.get('identity_over_label_spread'))} x label sd)"]
     if target is not None:
         lines.append(
-            f"{label}: lớn nhất |f(A,B)+f(B,A)|/2 = "
-            f"{exact(scores.get('antisymmetry_max'))} so với mốc {exact(target)} -> "
-            f"{verdict} | phản đối xứng do cấu tạo: "
-            f"{'có' if scores.get('antisymmetric_by_construction') else 'không'}")
+            f"{label}: largest |f(A,B)+f(B,A)|/2 = "
+            f"{exact(scores.get('antisymmetry_max'))} against the target {exact(target)}"
+            f" -> {verdict} | antisymmetric by construction: "
+            f"{'yes' if scores.get('antisymmetric_by_construction') else 'no'}")
     return lines
 
 
 def format_metrics(label: str, regression: Mapping[str, float | None],
                    ranking: Mapping[str, object] | None = None,
                    classes: Mapping[str, object] | None = None) -> list[str]:
-    """Các dòng văn bản gọn để ghi log; None in thành '-' chứ không in thành 0."""
+    """Short text lines for the log; None prints as '-', never as 0."""
 
     def show(value: object, digits: int = 4) -> str:
         if value is None:
@@ -411,19 +426,20 @@ def format_metrics(label: str, regression: Mapping[str, float | None],
              f" | R2 {show(regression.get('r2'))}"
              f" | Spearman {show(regression.get('spearman'))}"]
     if ranking is not None:
-        lines.append(f"    ranking: query xếp hạng được {show(ranking.get('queries_ranked'))}"
+        lines.append(f"    ranking: queries ranked {show(ranking.get('queries_ranked'))}"
                      f"/{show(ranking.get('queries_total'))}"
                      f" | Spearman macro {show(ranking.get('spearman_macro'))}"
-                     f" | đúng chiều macro {show(ranking.get('pairwise_accuracy_macro'))}"
+                     f" | direction accuracy macro"
+                     f" {show(ranking.get('pairwise_accuracy_macro'))}"
                      f" micro {show(ranking.get('pairwise_accuracy_micro'))}")
         tops = [f"top-{k} {show(ranking.get(f'top_{k}'))}"
-                f" (trên {show(ranking.get(f'top_{k}_queries'))} query)"
+                f" (over {show(ranking.get(f'top_{k}_queries'))} queries)"
                 for k in sorted(int(name.split('_')[1]) for name in ranking
                                 if name.startswith('top_') and name.count('_') == 1)]
         if tops:
             lines.append("    " + " | ".join(tops))
     if classes is not None:
-        lines.append(f"    ba lớp (±{show(classes.get('threshold'), 2)}):"
+        lines.append(f"    three classes (+/-{show(classes.get('threshold'), 2)}):"
                      f" accuracy {show(classes.get('accuracy'))}"
                      f" | macro-F1 {show(classes.get('macro_f1'))} | "
                      + " | ".join(f"{name} F1 {show(classes.get(f'{name}_f1'))}"

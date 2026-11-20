@@ -48,7 +48,7 @@ def test_check_partition_allows_test_only_when_asked_explicitly() -> None:
 
 
 def test_check_partition_refuses_an_unknown_name() -> None:
-    with pytest.raises(ValueError, match="lạ"):
+    with pytest.raises(ValueError, match="unknown partition"):
         data.check_partition("holdout")
 
 
@@ -98,7 +98,7 @@ def test_config_slices_use_only_known_keys(config: dict[str, Any]) -> None:
 
 
 def test_slice_mask_refuses_an_unknown_filter_key() -> None:
-    with pytest.raises(ValueError, match="khóa lát cắt lạ"):
+    with pytest.raises(ValueError, match="unknown slice key"):
         data.slice_mask(pair_table([{}]), {"qc_status": "pass"})
 
 
@@ -110,7 +110,7 @@ def test_code_column_maps_values_to_their_row_in_the_cache() -> None:
 
 def test_code_column_reports_a_value_missing_from_the_cache() -> None:
     vocabulary = pa.array(["CC"], pa.string())
-    with pytest.raises(ValueError, match="không có trong cache"):
+    with pytest.raises(ValueError, match="are not in the cache"):
         data.code_column(pa.array(["CCO"], pa.string()), vocabulary, "smiles_a")
 
 
@@ -241,7 +241,7 @@ def test_concat_arrays_refuses_mismatched_slices() -> None:
         fragment_a=arrays.fragment_a, fragment_b=arrays.fragment_b,
         protein=arrays.protein, endpoint=arrays.endpoint, target=arrays.target,
         slices={"all": arrays.slices["all"]})
-    with pytest.raises(ValueError, match="lát cắt"):
+    with pytest.raises(ValueError, match="different slices"):
         data.concat_arrays(arrays, other)
 
 

@@ -1,23 +1,24 @@
-"""Stage 3: biểu diễn đầu vào — Morgan fingerprint và embedding ESM2, đều có cache.
+"""Stage 3: the input representations - Morgan fingerprints and ESM2 embeddings, cached.
 
-Hai nhóm hàm, cố ý tách rời:
+Two groups of functions, deliberately kept apart:
 
-Fingerprint (RDKit, không cần torch)
-    Dataset có 1,3 triệu phân tử phân biệt nhưng 10,5 triệu dòng, nên mỗi phân tử xuất
-    hiện trung bình 8 lần. Fingerprint được tính MỘT LẦN cho mỗi SMILES phân biệt rồi
-    cache ra đĩa; vòng train chỉ tra theo chỉ số. Bit được đóng gói bằng np.packbits
-    (2.048 bit -> 256 byte) để cả bảng vừa RAM.
+Fingerprints (RDKit, no torch needed)
+    The dataset holds 1.3 million distinct molecules across 10.5 million rows, so every
+    molecule appears about 8 times. A fingerprint is therefore computed ONCE per distinct
+    SMILES and cached on disk; the training loop only looks rows up by index. The bits are
+    packed with np.packbits (2,048 bits -> 256 bytes) so the whole table fits in RAM.
 
-Embedding protein (ESM2, cần torch + transformers)
-    Chỉ có 6.315 protein có cặp, nên cấu hình `frozen` chỉ phải chạy ESM2 6.315 lần, một
-    lần duy nhất, rồi cache. Cấu hình `finetune` không dùng cache: ESM2 nằm trong đồ thị
-    tính toán và chạy lại mỗi batch.
+Protein embeddings (ESM2, needs torch + transformers)
+    Only 6,315 proteins take part in a pair, so the `frozen` configuration has to run ESM2
+    6,315 times, once ever, and then reads the cache. The `finetune` configuration uses no
+    cache at all: there ESM2 is part of the computation graph and runs again every batch.
 
-CHIỀU EMBEDDING KHÔNG ĐƯỢC HARDCODE. Nó được đọc từ model đã nạp (`config.hidden_size`),
-ghi vào manifest của cache, và train/eval kiểm tra lại cho khớp.
+THE EMBEDDING DIMENSION IS NEVER HARDCODED. It is read off the loaded model
+(`config.hidden_size`), written into the cache's manifest, and checked again by train and
+eval.
 
-Cache lưu dưới dạng parquet (không dùng pickle): mỗi dòng là một khóa kèm vector, nên
-từ vựng và ma trận luôn đi cùng nhau và không thể lệch nhau.
+The caches are parquet, not pickle: every row is a key together with its vector, so the
+vocabulary and the matrix always travel together and cannot drift apart.
 """
 
 from __future__ import annotations
@@ -31,25 +32,25 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# Khóa metadata trong schema parquet của file cache.
+# The metadata key inside a cache file's parquet schema.
 METADATA_KEY = b"molopt_stage3"
 
 
-# --------------------------------------------------------------------------- cache chung
+# -------------------------------------------------------------------- the caches themselves
 
 
 def write_packed_cache(path: Path, keys: Sequence[str], packed: np.ndarray,
                        metadata: Mapping[str, Any]) -> None:
-    """Ghi cache bit đã đóng gói: mỗi dòng là (khóa, các byte bit).
+    """Write a packed-bit cache: every row is (key, the bit bytes).
 
-    Nhận: đường dẫn; danh sách khóa; ma trận uint8 (số dòng × số byte); metadata.
-    Dùng fixed_size_binary nên mọi dòng cùng độ dài, và khi đọc lại có thể lấy cả ma
-    trận từ một vùng nhớ liền mạch thay vì ghép từng dòng.
+    Takes: the path; the list of keys; a uint8 matrix (rows x bytes); the metadata.
+    The column is fixed_size_binary, so every row has the same width and a read can take
+    the whole matrix out of one contiguous buffer instead of stitching rows together.
     """
     if packed.dtype != np.uint8:
-        raise ValueError(f"cần uint8, nhận {packed.dtype}")
+        raise ValueError(f"uint8 is required, got {packed.dtype}")
     if packed.shape[0] != len(keys):
-        raise ValueError(f"lệch số dòng: {packed.shape[0]} vector và {len(keys)} khóa")
+        raise ValueError(f"row mismatch: {packed.shape[0]} vectors and {len(keys)} keys")
     width = int(packed.shape[1])
     table = pa.table(
         {"key": pa.array(list(keys), pa.string()),
@@ -60,13 +61,13 @@ def write_packed_cache(path: Path, keys: Sequence[str], packed: np.ndarray,
 
 
 def read_packed_cache(path: Path) -> tuple[pa.Array, np.ndarray, dict[str, Any]]:
-    """Đọc cache bit; trả về (khóa, ma trận uint8, metadata)."""
+    """Read a packed-bit cache; returns (keys, uint8 matrix, metadata)."""
     if not path.is_file():
-        raise FileNotFoundError(f"chưa có cache {path}; chạy --mode prepare")
+        raise FileNotFoundError(f"no cache at {path} yet; run --mode prepare")
     table = pq.read_table(path)
     values = table.column("packed").combine_chunks()
     width = values.type.byte_width
-    # fixed_size_binary: buffers() = [validity, data]; data là vùng liền mạch.
+    # fixed_size_binary: buffers() = [validity, data]; data is the contiguous buffer.
     buffer = values.buffers()[1]
     matrix = np.frombuffer(buffer, dtype=np.uint8, count=len(values) * width)
     raw = table.schema.metadata.get(METADATA_KEY) if table.schema.metadata else None
@@ -76,11 +77,11 @@ def read_packed_cache(path: Path) -> tuple[pa.Array, np.ndarray, dict[str, Any]]
 
 def write_vector_cache(path: Path, keys: Sequence[str], vectors: np.ndarray,
                        metadata: Mapping[str, Any]) -> None:
-    """Ghi cache vector float32: mỗi dòng là (khóa, vector độ dài cố định)."""
+    """Write a float32 vector cache: every row is (key, a fixed-length vector)."""
     if vectors.dtype != np.float32:
-        raise ValueError(f"cần float32, nhận {vectors.dtype}")
+        raise ValueError(f"float32 is required, got {vectors.dtype}")
     if vectors.shape[0] != len(keys):
-        raise ValueError(f"lệch số dòng: {vectors.shape[0]} vector và {len(keys)} khóa")
+        raise ValueError(f"row mismatch: {vectors.shape[0]} vectors and {len(keys)} keys")
     dimension = int(vectors.shape[1])
     flat = pa.array(np.ascontiguousarray(vectors).reshape(-1), pa.float32())
     table = pa.table(
@@ -92,9 +93,9 @@ def write_vector_cache(path: Path, keys: Sequence[str], vectors: np.ndarray,
 
 
 def read_vector_cache(path: Path) -> tuple[pa.Array, np.ndarray, dict[str, Any]]:
-    """Đọc cache vector; trả về (khóa, ma trận float32, metadata)."""
+    """Read a vector cache; returns (keys, float32 matrix, metadata)."""
     if not path.is_file():
-        raise FileNotFoundError(f"chưa có cache {path}; chạy --mode prepare")
+        raise FileNotFoundError(f"no cache at {path} yet; run --mode prepare")
     table = pq.read_table(path)
     values = table.column("vector").combine_chunks()
     dimension = values.type.list_size
@@ -105,14 +106,15 @@ def read_vector_cache(path: Path) -> tuple[pa.Array, np.ndarray, dict[str, Any]]
             matrix.reshape(len(values), dimension), metadata)
 
 
-# --------------------------------------------------------------------------- fingerprint
+# --------------------------------------------------------------------------- fingerprints
 
 
 def morgan_generator(radius: int, bits: int, use_chirality: bool):
-    """Bộ sinh Morgan fingerprint của RDKit.
+    """RDKit's Morgan fingerprint generator.
 
-    Dùng rdFingerprintGenerator (API hiện hành) chứ không dùng AllChem.GetMorganFingerprint
-    (đã bị RDKit đánh dấu cũ), để không phụ thuộc vào hàm có thể bị bỏ.
+    Uses rdFingerprintGenerator (the current API) rather than AllChem.GetMorganFingerprint
+    (which RDKit has deprecated), so the project does not depend on a function that may be
+    removed.
     """
     from rdkit.Chem import rdFingerprintGenerator
 
@@ -122,15 +124,16 @@ def morgan_generator(radius: int, bits: int, use_chirality: bool):
 
 def pack_fingerprints(smiles: Sequence[str], radius: int, bits: int,
                       use_chirality: bool) -> tuple[np.ndarray, list[int]]:
-    """Fingerprint của một danh sách SMILES, đã đóng gói bit.
+    """The fingerprints of a list of SMILES, with the bits packed.
 
-    Nhận: danh sách SMILES; tham số Morgan.
-    Trả về: (ma trận uint8 số dòng × bits/8, danh sách chỉ số SMILES mà RDKit không đọc
-    được).
-    SMILES không đọc được KHÔNG bị bỏ: dòng tương ứng là toàn số 0 và chỉ số của nó được
-    trả về để bên gọi đếm và ghi vào manifest. Bỏ lặng lẽ sẽ làm lệch cache so với dataset.
-    Dataset Stage 2b đã kiểm 0 SMILES đọc lỗi, nên danh sách này phải rỗng; nếu không rỗng
-    thì có gì đã thay đổi và cần biết.
+    Takes: the list of SMILES; the Morgan parameters.
+    Returns: (a uint8 matrix of rows x bits/8, the indices of the SMILES RDKit could not
+    parse).
+    A SMILES that cannot be parsed is NOT dropped: its row stays all zeros and its index
+    is returned, for the caller to count and write into the manifest. Dropping it quietly
+    would put the cache out of step with the dataset. Stage 2b measured 0 unparseable
+    SMILES, so this list has to come back empty; if it does not, something changed and that
+    has to be known.
     """
     from rdkit import Chem, RDLogger
 
@@ -148,11 +151,11 @@ def pack_fingerprints(smiles: Sequence[str], radius: int, bits: int,
 
 
 def unpack_rows(packed: np.ndarray, rows: np.ndarray, bits: int) -> np.ndarray:
-    """Giải nén bit của một số dòng thành ma trận float32 0/1.
+    """Unpack the bits of a few rows into a 0/1 float32 matrix.
 
-    Nhận: ma trận đã đóng gói; chỉ số dòng cần lấy; số bit của fingerprint.
-    Trả về: ma trận float32 (số dòng × bits).
-    Chỉ giải nén đúng các dòng của batch, nên bảng đầy đủ vẫn ở dạng gói trong RAM.
+    Takes: the packed matrix; the row indices wanted; the fingerprint's bit count.
+    Returns: a float32 matrix (rows x bits).
+    Only the batch's own rows are unpacked, so the full table stays packed in RAM.
     """
     selected = packed[rows]
     return np.unpackbits(selected, axis=1, count=bits).astype(np.float32)
@@ -162,14 +165,16 @@ def unpack_rows(packed: np.ndarray, rows: np.ndarray, bits: int) -> np.ndarray:
 
 
 def load_protein_encoder(settings: Mapping[str, Any], device: str = "cpu"):
-    """Nạp tokenizer và model ESM2; trả về (tokenizer, model, chiều embedding ĐO ĐƯỢC).
+    """Load the ESM2 tokenizer and model; returns (tokenizer, model, the MEASURED
+    embedding dimension).
 
-    Nhận: khối config stage3.protein_encoder; thiết bị.
-    Trả về: (tokenizer, model, dimension).
-    Chiều lấy từ `model.config.hidden_size` của chính model đã nạp — đây là chỗ duy nhất
-    trong dự án biết chiều thật, và nó được ghi vào manifest cache để các bước sau kiểm
-    lại. Nếu config có `embedding_dim` khác chiều đo được thì báo lỗi, không im lặng dùng
-    một trong hai.
+    Takes: the stage3.protein_encoder config block; the device.
+    Returns: (tokenizer, model, dimension).
+    The dimension comes from `model.config.hidden_size` of the loaded model itself - the
+    one place in the project that knows the real number - and it is written into the
+    cache's manifest for every later step to check against. If the config holds an
+    `embedding_dim` that differs from the measured one, this raises instead of quietly
+    picking one of the two.
     """
     from transformers import AutoTokenizer, EsmModel
 
@@ -180,37 +185,39 @@ def load_protein_encoder(settings: Mapping[str, Any], device: str = "cpu"):
     dimension = int(model.config.hidden_size)
     declared = settings.get("embedding_dim")
     if declared is not None and int(declared) != dimension:
-        raise ValueError(f"config ghi embedding_dim = {declared} nhưng {name} có chiều thật "
-                         f"{dimension}; sửa config chứ đừng bỏ qua")
+        raise ValueError(f"the config says embedding_dim = {declared} but {name} really "
+                         f"has {dimension}; fix the config rather than ignore this")
     return tokenizer, model, dimension
 
 
 def sequence_windows(sequence: str, max_residues: int, strategy: str) -> list[str]:
-    """Chia một chuỗi protein thành các đoạn vừa cửa sổ của ESM2.
+    """Cut a protein sequence into pieces that fit ESM2's window.
 
-    Nhận: chuỗi; số acid amin tối đa mỗi đoạn; 'windows' hoặc 'truncate'.
-    Trả về: danh sách đoạn.
-    'truncate' chỉ giữ đoạn đầu (bắt buộc cho finetune vì bộ nhớ gradient tỉ lệ với độ
-    dài); 'windows' giữ toàn bộ chuỗi thành các đoạn liền nhau, không mất phần đuôi.
+    Takes: the sequence; the maximum residues per piece; 'windows' or 'truncate'.
+    Returns: the list of pieces.
+    'truncate' keeps the first piece only (which finetune needs, because the memory for
+    gradients grows with the length); 'windows' keeps the whole sequence as consecutive
+    pieces, losing no tail.
     """
     if max_residues < 1:
-        raise ValueError(f"max_residues phải >= 1, nhận {max_residues}")
+        raise ValueError(f"max_residues has to be >= 1, got {max_residues}")
     if strategy == "truncate":
         return [sequence[:max_residues]]
     if strategy != "windows":
-        raise ValueError(f"long_sequence lạ: {strategy!r}; chỉ có 'windows' hoặc 'truncate'")
+        raise ValueError(f"unknown long_sequence: {strategy!r}; only 'windows' or "
+                         f"'truncate'")
     return [sequence[start:start + max_residues]
             for start in range(0, max(len(sequence), 1), max_residues)]
 
 
 def embed_one_sequence(sequence: str, tokenizer, model, settings: Mapping[str, Any],
                        device: str) -> np.ndarray:
-    """Vector của một protein: mean-pool theo acid amin, bỏ token đặc biệt.
+    """One protein's vector: mean-pooled over residues, special tokens left out.
 
-    Chuỗi dài hơn cửa sổ được chia đoạn rồi lấy trung bình CÓ TRỌNG SỐ theo độ dài đoạn,
-    nên kết quả đúng bằng mean-pool trên toàn chuỗi nếu model không có hiệu ứng biên —
-    cách tổng hợp trung thực hơn là lấy trung bình không trọng số của các đoạn dài khác
-    nhau.
+    A sequence longer than the window is cut into pieces and averaged WEIGHTED by each
+    piece's length, so the result equals a mean-pool over the whole sequence if the model
+    has no edge effects - a more honest summary than the unweighted mean of pieces that
+    differ in length.
     """
     import torch
 
@@ -223,7 +230,7 @@ def embed_one_sequence(sequence: str, tokenizer, model, settings: Mapping[str, A
             encoded = tokenizer(window, return_tensors="pt", add_special_tokens=True)
             encoded = {key: value.to(device) for key, value in encoded.items()}
             hidden = model(**encoded).last_hidden_state[0]
-            # Bỏ token đầu (CLS) và token cuối (EOS): chỉ lấy phần ứng với acid amin.
+            # Drop the first (CLS) and last (EOS) token: keep only the residues.
             residues = hidden[1:-1]
             if residues.shape[0] == 0:
                 continue
@@ -232,18 +239,20 @@ def embed_one_sequence(sequence: str, tokenizer, model, settings: Mapping[str, A
             totals = pooled * weight if totals is None else totals + pooled * weight
             weight_sum += weight
     if totals is None or weight_sum == 0.0:
-        raise ValueError(f"không lấy được embedding cho chuỗi dài {len(sequence)}")
+        raise ValueError(f"no embedding could be taken for a sequence of length "
+                         f"{len(sequence)}")
     return (totals / weight_sum).astype(np.float32)
 
 
 def embed_proteins(sequences: Mapping[str, str], settings: Mapping[str, Any], device: str,
                    progress_every: int = 500) -> tuple[list[str], np.ndarray, int, int]:
-    """Embedding cho nhiều protein.
+    """Embeddings for many proteins.
 
-    Nhận: {hash protein: chuỗi}; config protein_encoder; thiết bị; nhịp ghi log.
-    Trả về: (danh sách hash theo thứ tự, ma trận float32, chiều đo được, số chuỗi phải
-    chia đoạn hoặc cắt).
-    Thứ tự hash được sắp xếp để cache dựng lại hai lần cho cùng một file.
+    Takes: {protein hash: sequence}; the protein_encoder config; the device; how often to
+    log progress.
+    Returns: (the hashes in order, a float32 matrix, the measured dimension, how many
+    sequences had to be cut into pieces or truncated).
+    The hashes are sorted so that building the cache twice gives the same file.
     """
     import logging
 
@@ -259,20 +268,20 @@ def embed_proteins(sequences: Mapping[str, str], settings: Mapping[str, Any], de
             long_sequences += 1
         matrix[position] = embed_one_sequence(sequence, tokenizer, model, settings, device)
         if progress_every and (position + 1) % progress_every == 0:
-            logging.info("đã embed %s/%s protein", position + 1, len(keys))
+            logging.info("embedded %s/%s proteins", position + 1, len(keys))
     return keys, matrix, dimension, long_sequences
 
 
-# ------------------------------------------------------- embedding phân tử (MoLFormer)
+# --------------------------------------------------- molecule embeddings (MoLFormer)
 
 
 def encoder_revision(settings: Mapping[str, Any], name: str) -> str | None:
-    """Bản (commit/tag trên HuggingFace) phải nạp cho model `name`; None = bản mới nhất.
+    """The revision (HuggingFace commit or tag) to load for model `name`; None = latest.
 
-    Nhận: khối config stage3.molecule_encoder; tên model.
-    Trả về: chuỗi revision hoặc None.
-    Ghim theo TỪNG model vì mỗi repo có lịch sử riêng: đặt một revision dùng chung sẽ
-    sai ngay khi đổi sang model khác trong allowed_models.
+    Takes: the stage3.molecule_encoder config block; the model name.
+    Returns: the revision string, or None.
+    Pinned PER MODEL, because every repository has its own history: one shared revision
+    would be wrong the moment another model from allowed_models is used.
     """
     revisions = settings.get("revisions") or {}
     value = revisions.get(name)
@@ -280,24 +289,26 @@ def encoder_revision(settings: Mapping[str, Any], name: str) -> str | None:
 
 
 def load_molecule_encoder(settings: Mapping[str, Any], device: str = "cpu"):
-    """Nạp tokenizer và model mã hóa SMILES; trả về (tokenizer, model, chiều ĐO ĐƯỢC).
+    """Load the SMILES encoder's tokenizer and model; returns (tokenizer, model, the
+    MEASURED dimension).
 
-    Nhận: khối config stage3.molecule_encoder; thiết bị.
-    Trả về: (tokenizer, model, dimension).
-    Giống load_protein_encoder: chiều lấy từ model đã nạp chứ không lấy từ config, và
-    config ghi lệch thì báo lỗi. `trust_remote_code` bắt buộc với MoLFormer vì model này
-    kèm mã riêng trên HuggingFace; vì vậy tên model phải nằm trong danh sách cho phép của
-    config, không nhận tên tùy ý từ dòng lệnh. Bản code tải về được GHIM theo config
-    (xem revisions_note): chủ repo có sửa mã riêng và bản mới cần transformers v5.
+    Takes: the stage3.molecule_encoder config block; the device.
+    Returns: (tokenizer, model, dimension).
+    Same rule as load_protein_encoder: the dimension comes from the loaded model and not
+    from the config, and a config that disagrees raises. `trust_remote_code` is required
+    for MoLFormer because that model ships its own code on HuggingFace; that is why the
+    model name has to appear in the config's allowed list instead of being taken from the
+    command line. The downloaded code is PINNED by the config (see revisions_note): the
+    repository's owner has changed that code, and the newer version needs transformers v5.
     """
     from transformers import AutoModel, AutoTokenizer
 
     name = str(settings["model"])
     allowed = tuple(settings.get("allowed_models", ()))
     if allowed and name not in allowed:
-        raise ValueError(f"model mã hóa phân tử {name!r} không nằm trong allowed_models "
-                         f"{allowed}; mã của model được tải và chạy nên phải khai báo "
-                         f"trước trong config")
+        raise ValueError(f"the molecule encoder {name!r} is not in allowed_models "
+                         f"{allowed}; the model's own code is downloaded and executed, so "
+                         f"it has to be declared in the config beforehand")
     trust = bool(settings.get("trust_remote_code", False))
     revision = encoder_revision(settings, name)
     tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=trust,
@@ -308,26 +319,26 @@ def load_molecule_encoder(settings: Mapping[str, Any], device: str = "cpu"):
     dimension = int(model.config.hidden_size)
     declared = settings.get("embedding_dim")
     if declared is not None and int(declared) != dimension:
-        raise ValueError(f"config ghi embedding_dim = {declared} nhưng {name} có chiều "
-                         f"thật {dimension}; sửa config chứ đừng bỏ qua")
+        raise ValueError(f"the config says embedding_dim = {declared} but {name} really "
+                         f"has {dimension}; fix the config rather than ignore this")
     return tokenizer, model, dimension
 
 
 def pool_tokens(outputs: Any, mask: Any, pooling: str) -> Any:
-    """Gộp các token của một batch thành một vector mỗi phân tử.
+    """Pool a batch's tokens into one vector per molecule.
 
-    Nhận: đầu ra model; mặt nạ attention; 'pooler' hoặc 'mean'.
-    Trả về: tensor (batch, chiều).
-    'pooler' dùng pooler_output như thẻ model MoLFormer hướng dẫn. 'mean' tự lấy trung
-    bình các token THẬT (bỏ padding) để dùng được với model không có pooler.
+    Takes: the model's output; the attention mask; 'pooler' or 'mean'.
+    Returns: a tensor (batch, dimension).
+    'pooler' uses pooler_output, as MoLFormer's model card instructs. 'mean' averages the
+    REAL tokens itself (padding excluded), so a model without a pooler can be used too.
     """
     if pooling == "pooler":
         pooled = getattr(outputs, "pooler_output", None)
         if pooled is None:
-            raise ValueError("model không có pooler_output; đặt pooling='mean'")
+            raise ValueError("this model has no pooler_output; set pooling='mean'")
         return pooled
     if pooling != "mean":
-        raise ValueError(f"pooling lạ: {pooling!r}; chỉ có 'pooler' hoặc 'mean'")
+        raise ValueError(f"unknown pooling: {pooling!r}; only 'pooler' or 'mean'")
     hidden = outputs.last_hidden_state
     weights = mask.unsqueeze(-1).to(hidden.dtype)
     return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
@@ -336,16 +347,18 @@ def pool_tokens(outputs: Any, mask: Any, pooling: str) -> Any:
 def embed_molecules(smiles: Sequence[str], settings: Mapping[str, Any], device: str,
                     progress_every: int = 20_000
                     ) -> tuple[list[str], np.ndarray, int, int]:
-    """Embedding cho nhiều SMILES, chạy theo batch.
+    """Embeddings for many SMILES, computed in batches.
 
-    Nhận: danh sách SMILES; config stage3.molecule_encoder; thiết bị; nhịp ghi log.
-    Trả về: (danh sách SMILES đã sắp xếp, ma trận float32, chiều đo được, số SMILES bị
-    cắt vì chạm trần token).
-    Khác embed_proteins ở chỗ chạy theo BATCH: phân tử ngắn hơn protein hàng trăm lần nên
-    chạy từng cái một sẽ phí GPU. Thứ tự khóa được sắp xếp để cache dựng lại hai lần cho
-    cùng một file.
-    SMILES quá dài bị tokenizer cắt theo max_tokens; số lần cắt được đếm và ghi log, vì
-    cắt SMILES là mất nguyên tử chứ không phải mất phần đuôi ít quan trọng như ở protein.
+    Takes: the list of SMILES; the stage3.molecule_encoder config; the device; how often to
+    log progress.
+    Returns: (the sorted SMILES, a float32 matrix, the measured dimension, how many SMILES
+    were truncated at the token ceiling).
+    Unlike embed_proteins this runs in BATCHES: a molecule is hundreds of times shorter
+    than a protein, so one at a time would waste the GPU. The keys are sorted so that
+    building the cache twice gives the same file.
+    A SMILES that is too long is truncated by the tokenizer at max_tokens; every truncation
+    is counted and logged, because truncating a SMILES loses atoms rather than a less
+    important tail as it does for a protein.
     """
     import logging
 
@@ -372,8 +385,8 @@ def embed_molecules(smiles: Sequence[str], settings: Mapping[str, Any], device: 
             matrix[start:start + len(chunk)] = pooled.to("cpu").numpy()
             done = start + len(chunk)
             if progress_every and done % progress_every < batch_size:
-                logging.info("đã embed %s/%s phân tử", f"{done:,}", f"{len(keys):,}")
+                logging.info("embedded %s/%s molecules", f"{done:,}", f"{len(keys):,}")
     if truncated:
-        logging.warning("%s SMILES chạm trần %s token và bị cắt", f"{truncated:,}",
-                        max_tokens)
+        logging.warning("%s SMILES hit the ceiling of %s tokens and were truncated",
+                        f"{truncated:,}", max_tokens)
     return keys, matrix, dimension, truncated

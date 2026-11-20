@@ -149,19 +149,26 @@ def main() -> int:
         if value is None:
             continue
         group = groups.setdefault(identity(manifest),
-                                  {"name": name_of(manifest), "seeds": {}, "rulers": {}})
+                                  {"name": name_of(manifest), "seeds": {}, "rulers": {},
+                                   "permutations": set()})
         seed = int(manifest.get("seed") or 0)
-        # THƯỚC ĐO của lần chạy (khối `metrics`), ghi vào manifest từ 13/11/2026. Không
-        # dùng để nhóm (các lần chạy cũ không có khóa này, nhóm theo nó là tách đôi mọi
-        # bảng), nhưng một nhóm trộn hai thước đo khác nhau thì trung bình vô nghĩa, nên
-        # phải nói ra.
+        # The RULER of the run (the `metrics` block), recorded in manifests since
+        # 2026-11-13. Not used for grouping (older runs lack the key, and grouping on it
+        # would split every table in two), but a group mixing two different rulers has a
+        # meaningless mean, so it has to be announced.
         if manifest.get("metrics") is not None:
             group["rulers"][seed] = json.dumps(manifest["metrics"], sort_keys=True,
                                                ensure_ascii=False, default=str)
-        # Cùng hạt giống chạy lại hai lần: giữ lần MỚI NHẤT, và nói ra.
+        # PROTEIN CONTROL (recorded in manifests since 2026-11-19). Left out of the
+        # grouping keys for the same reason: older runs lack the key. When the shuffle is
+        # switched on with `--set`, the label already separates the two groups; but if
+        # somebody switches it on inside config.json the label shows nothing, and a
+        # shuffled run would be averaged together with real ones.
+        group["permutations"].add(int(manifest.get("protein_permute_seed", -1)))
+        # The same seed run twice: keep the NEWER one, and say so.
         if seed in group["seeds"]:
-            print(f"ghi chú: {group['name']} có hai lần chạy hạt {seed}; lấy lần mới hơn",
-                  file=sys.stderr)
+            print(f"note: {group['name']} has two runs for seed {seed}; keeping the "
+                  f"newer one", file=sys.stderr)
         group["seeds"][seed] = value
 
     rows = []
@@ -173,9 +180,14 @@ def main() -> int:
         rulers = {group["rulers"][seed] for seed in sorted(group["seeds"])
                   if seed in group["rulers"]}
         if len(rulers) > 1:
-            print(f"CẢNH BÁO: {group['name']} gom các lần chạy có khối `metrics` KHÁC nhau"
-                  f" ({len(rulers)} thước đo); trung bình của nhóm này không đọc được",
+            print(f"WARNING: {group['name']} groups runs with DIFFERENT `metrics` blocks"
+                  f" ({len(rulers)} rulers); the mean of this group cannot be read",
                   file=sys.stderr)
+        if len(group["permutations"]) > 1:
+            print(f"WARNING: {group['name']} groups protein-SHUFFLED runs together with "
+                  f"ordinary ones (protein_permute_seed "
+                  f"{sorted(group['permutations'])}); the mean of this group cannot be "
+                  f"read", file=sys.stderr)
         points = [group["seeds"][seed] for seed in sorted(group["seeds"])]
         rows.append((statistics.fmean(points),
                      statistics.stdev(points) if len(points) > 1 else None,

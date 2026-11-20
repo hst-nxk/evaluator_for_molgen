@@ -113,7 +113,7 @@ def test_a_missing_subset_file_points_at_the_builder(tmp_path: Path) -> None:
 def test_an_empty_subset_is_an_error(tmp_path: Path) -> None:
     config = write_dataset(tmp_path)
     config["stage3"]["inputs"]["train_subset"] = write_subset(tmp_path, [])
-    with pytest.raises(ValueError, match="rỗng"):
+    with pytest.raises(ValueError, match="is empty"):
         data.read_columns(config, tmp_path, "train", ["pair_id"])
 
 
@@ -121,7 +121,7 @@ def test_a_duplicated_pair_id_in_the_subset_is_an_error(tmp_path: Path) -> None:
     # Trùng pair_id sẽ nhân đôi dòng đó trong train một cách âm thầm.
     config = write_dataset(tmp_path)
     config["stage3"]["inputs"]["train_subset"] = write_subset(tmp_path, ["p0", "p0"])
-    with pytest.raises(ValueError, match="trùng"):
+    with pytest.raises(ValueError, match="repeated pair_id"):
         data.read_columns(config, tmp_path, "train", ["pair_id"])
 
 

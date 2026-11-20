@@ -64,7 +64,7 @@ def test_packed_cache_round_trip_keeps_keys_matrix_and_metadata(tmp_path: Path) 
 
 def test_packed_cache_refuses_a_key_count_that_does_not_match(tmp_path: Path) -> None:
     packed, _ = features.pack_fingerprints(["CCO"], 2, BITS, True)
-    with pytest.raises(ValueError, match="lệch số dòng"):
+    with pytest.raises(ValueError, match="row mismatch"):
         features.write_packed_cache(tmp_path / "fp.parquet", ["CCO", "CC"], packed, {})
 
 

@@ -1,27 +1,41 @@
 rdkit==2026.9.1
-# Chuẩn hóa cấu trúc + lấy parent (bỏ muối/dung môi, trung hòa) ở Stage 1; phiên bản
-# phải trùng config structure.chembl_structure_pipeline_version (code kiểm lúc chạy).
+# Structure standardisation and parent extraction (salts/solvents removed, charges
+# neutralised) in Stage 1; the version must match the config key
+# structure.chembl_structure_pipeline_version (checked by the code at run time).
 # Bento et al. 2020, J. Cheminform. 12:51, DOI 10.1186/s13321-020-00456-1.
 chembl_structure_pipeline==1.2.4
 pyarrow==25.0.1
 pytest==8.4.2
 numpy==2.2.6
-# pandas: import ở CẤP MODULE trong src/molopt/dataset/pipeline.py và curation.py, nên
-# Stage 2b không chạy được khi thiếu nó. Thiếu khai báo này từ đầu (phát hiện 10/11/2026);
-# phiên bản ghi theo bản đang cài trên máy này (pip show, 10/11/2026).
+# pandas: imported at MODULE level in src/molopt/dataset/pipeline.py and curation.py, so
+# Stage 2b cannot run without it. The declaration was missing from the start (noticed
+# 2026-11-10); the version is the one installed on this machine (pip show, 2026-11-10).
 pandas==2.3.3
-# matplotlib: hình của run_audit.py và của scripts/error_analysis.py hist
-# (backend Agg, chạy được trên server không có màn hình).
+# matplotlib: the figures of run_audit.py and of scripts/error_analysis.py hist
+# (Agg backend, so it runs on a headless server).
 matplotlib==3.9.2
 
 # Stage 3 (evaluator).
-# torch: đã cài và kiểm chứng trên máy này ngày 23/10/2026 — 2.5.1+cu121, CUDA build 12.1,
-# torch.cuda.is_available() = True trên RTX 3060 Laptop 6144 MiB. Hậu tố +cu121 chỉ có ở
-# index của PyTorch chứ không có trên PyPI, nên cài bằng:
+# torch: installed and verified on this machine on 2026-10-23 — 2.5.1+cu121, CUDA build
+# 12.1, torch.cuda.is_available() = True on an RTX 3060 Laptop, 6144 MiB. The +cu121
+# suffix only exists in PyTorch's own index, not on PyPI, so install it with:
 #   python -m pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1
-# Máy chỉ có CPU thì bỏ --index-url; bản CPU đủ cho --mode baseline,
-# --mode prepare --skip-protein và --mode smoke --config no_protein.
+# On a CPU-only machine drop --index-url; the CPU build is enough for --mode baseline,
+# --mode prepare --skip-protein and --mode smoke --config no_protein.
 torch==2.5.1
-# transformers: bản đang cài trên máy này (pip show, 24/10/2026), đã dùng cho
-# --mode prepare với facebook/esm2_t12_35M_UR50D.
+# transformers: the version installed on this machine (pip show, 2026-10-24), used for
+# --mode prepare with facebook/esm2_t12_35M_UR50D.
 transformers==4.44.2
+
+# Stage 3, ONLY for `--mode classical` (the Linear/Ridge/Lasso/XGBoost baselines asked for
+# at the 2026-11-18 meeting). These three libraries are imported INSIDE the functions of
+# src/molopt/evaluator/classical.py, so every other mode keeps working without them.
+# NOT INSTALLED on this machine (checked 2026-11-19: `import sklearn`, `import scipy` and
+# `import xgboost` all raise ModuleNotFoundError), so the three pins below are known-good
+# versions, NOT versions this project has actually run. After installing them on the
+# server, record the real versions with `pip show scikit-learn scipy xgboost` and correct
+# exactly these three lines.
+#   python -m pip install scikit-learn scipy xgboost
+scikit-learn==1.5.2
+scipy==1.14.1
+xgboost==2.1.1

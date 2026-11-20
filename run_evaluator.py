@@ -1,13 +1,16 @@
-"""CLI cho Stage 3 — evaluator baseline (dự đoán Δp của một cặp chỉnh sửa).
+"""CLI for Stage 3 — the evaluator baseline (predicting the Δp of one edit pair).
 
     python run_evaluator.py --mode prepare  [--skip-protein] [--molecule-embeddings]
-                                           [--set khóa=giá_trị ...]
+                                           [--set key=value ...]
     python run_evaluator.py --mode baseline
+    python run_evaluator.py --mode classical [--config frozen|no_protein]
+                                           [--baseline linear|ridge|lasso|xgboost|all]
+    python run_evaluator.py --mode capacity [--config ...] [--head ...] [--regularized]
     python run_evaluator.py --mode smoke   [--config frozen|finetune|no_protein]
                                            [--head direct|direct_no_edit|twin|antisymmetric]
                                            [--sharpness on|off]
     python run_evaluator.py --mode train   [--config ...] [--head ...]
-                                           [--sharpness on|off] [--set khóa=giá_trị ...]
+                                           [--sharpness on|off] [--set key=value ...]
     python run_evaluator.py --mode eval    --checkpoint runs/evaluator/<file>.pt
                                            [--partition validation|train]
     python run_evaluator.py --mode errors  --checkpoint runs/evaluator/<file>.pt
@@ -17,25 +20,33 @@
                                            [--partition validation|train]
 """
 # ---------------------------------------------------------------------------------------
-# File này chỉ là điểm vào: đọc config.json, bật logging, rồi gọi hàm trong
-# src/molopt/evaluator. Không có logic xử lý dữ liệu ở đây.
-#   prepare  : dựng cache fingerprint (RDKit) và cache embedding protein (ESM2).
-#              --skip-protein để chỉ dựng fingerprint khi chưa cài torch/transformers.
-#              --molecule-embeddings để dựng thêm cache embedding phân tử (MoLFormer),
-#              chỉ cần khi chạy --set model.ligand_features=embedding.
-#   baseline : chỉ số của hai baseline tầm thường (luôn đoán 0; trung bình theo endpoint)
-#              làm mốc dưới. Không cần torch, không cần cache: chạy được trước prepare.
-#   smoke    : train trên một mẫu nhỏ, chạy được trên CPU, chỉ xác nhận pipeline thông.
-#   train    : train thật; chọn checkpoint theo MAE trên validation.
-#   eval     : nạp checkpoint rồi báo cáo chỉ số theo từng lát cắt.
-#   errors   : nạp checkpoint rồi chia lỗi theo nhóm (việc 6, họp 02/11/2026).
-#   features : nạp checkpoint rồi xuất vector sau encoder của một mẫu train và
-#              validation, để vẽ t-SNE (việc 4).
-#   diagnose : nạp checkpoint rồi đo nơ-ron ReLU chết và độ nhạy với từng đầu vào, khi
-#              một lần train cho dự đoán gần như hằng số.
+# This file is only the entry point: it reads config.json, turns on logging and calls into
+# src/molopt/evaluator. No data handling lives here.
+#   prepare  : build the fingerprint cache (RDKit) and the protein embedding cache (ESM2).
+#              --skip-protein builds only the fingerprints, for a machine without
+#              torch/transformers. --molecule-embeddings additionally builds the molecule
+#              embedding cache (MoLFormer), needed only when running
+#              --set model.ligand_features=embedding.
+#   baseline : the metrics of two trivial baselines (always predict 0; the per-endpoint
+#              mean) as a lower reference. Needs neither torch nor the caches, so it runs
+#              before prepare.
+#   classical: classical ML baselines (Linear/Ridge/Lasso/XGBoost) on EXACTLY the features,
+#              the split and the metrics of a real training run — the bar the deep model
+#              has to clear (2026-11-18 meeting). Needs scikit-learn, scipy and xgboost.
+#   capacity : the capacity check — hand the model a very small sample, switch off dropout
+#              and weight decay, run for a long time, then measure on THAT SAME sample.
+#              Answers "can the model fit its own data at all" (2026-11-18 meeting).
+#   smoke    : train on a small sample, runs on the CPU, only confirms the pipeline works.
+#   train    : the real training run; the checkpoint is selected on validation MAE.
+#   eval     : load a checkpoint and report the metrics slice by slice.
+#   errors   : load a checkpoint and break the errors down by group (task 6, 2026-11-02).
+#   features : load a checkpoint and export the post-encoder vectors of a train and a
+#              validation sample, for t-SNE (task 4).
+#   diagnose : load a checkpoint and measure dead ReLU units and the sensitivity to each
+#              input, for when a run predicts something close to a constant.
 #
-# Thứ tự chạy: baseline -> prepare -> smoke -> train -> eval.
-# Partition `test` không được dùng ở bất kỳ chế độ nào (xem molopt.evaluator.data).
+# Order of use: baseline -> prepare -> smoke -> train -> eval.
+# The `test` partition is used by no mode at all (see molopt.evaluator.data).
 # ---------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -52,61 +63,69 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
+from molopt.evaluator import capacity as evaluator_capacity  # noqa: E402
+from molopt.evaluator import classical as evaluator_classical  # noqa: E402
 from molopt.evaluator import train as evaluator_train  # noqa: E402
 
 MODEL_PREFIX = "model"
 CONFIG_PATH = ROOT / "config.json"
-MODES = ("prepare", "baseline", "smoke", "train", "eval", "errors", "features", "diagnose")
-# Partition mà --mode eval được chấm. Không có test: test chỉ chạy một lần ở cuối.
+MODES = ("prepare", "baseline", "classical", "capacity", "smoke", "train", "eval",
+         "errors", "features", "diagnose")
+# The --baseline value meaning "run them all"; see molopt.evaluator.classical.MODELS.
+ALL_BASELINES = "all"
+# Partitions --mode eval may score. No test: test is scored once, at the very end.
 EVAL_PARTITIONS = ("validation", "train")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    """Đọc config.json; mọi tham số của Stage 3 nằm ở mục 'stage3'."""
+    """Read config.json; every Stage 3 parameter lives under the 'stage3' key."""
     with path.open(encoding="utf-8") as handle:
         return json.load(handle)
 
 
 def setup_logging(log_path: Path) -> None:
-    """Ghi log ra màn hình và ra file log của lần chạy."""
+    """Log to the console and to this run's log file."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT,
                         handlers=[logging.StreamHandler(),
                                   logging.FileHandler(log_path, encoding="utf-8")])
 
 
-# Từ được nhận cho khóa true/false của --set. Không dùng bool(raw): bool("false") là
-# True, nên viết sai sẽ BẬT cờ mà người dùng vừa định tắt.
+# Words accepted for a true/false key of --set. Never bool(raw): bool("false") is True,
+# so a typo would TURN ON the very flag the user meant to turn off.
 BOOLEAN_WORDS = {"true": True, "false": False, "1": True, "0": False,
                  "on": True, "off": False}
 
 
 def parse_number_list(raw: str, key: str, current: Sequence[object]) -> list[int | float]:
-    """Đọc giá trị ``--set`` dạng ``[]`` hoặc ``[256,128]`` thành list số.
+    """Parse a ``--set`` value of the form ``[]`` or ``[256,128]`` into a list of numbers.
 
-    Nhận: phần sau dấu ``=``; tên khóa (chỉ để báo lỗi); giá trị đang có trong config.
-    Trả về: list int/float, giữ nguyên int khi viết không có dấu thập phân.
+    Takes: the part after ``=``; the key name (for error messages only); the value
+    currently in the config.
+    Returns: a list of int/float, keeping ints where written without a decimal point.
 
-    Vì sao cần đường này: các khóa chiều ẩn (``model.antisymmetric_hidden``,
-    ``model.head_hidden``, ``model.ligand_hidden``) đều là list, mà trước ngày 11/11/2026
-    ``--set`` từ chối mọi kiểu không phải số/chuỗi/bool. Hệ quả là thí nghiệm "một lớp
-    Linear không bias trên vector hiệu" (``antisymmetric_hidden`` rỗng) chỉ chạy được nếu
-    sửa tay ``config.json``, mà sửa tay thì MỌI lần chạy trong cùng một script đều đổi
-    theo — tức không còn tách được thí nghiệm đó khỏi lần chạy bên cạnh.
+    Why this path is needed: the hidden-width keys (``model.antisymmetric_hidden``,
+    ``model.head_hidden``, ``model.ligand_hidden``) are all lists, and before 2026-11-11
+    ``--set`` refused every type that was not a number, string or bool. The consequence was
+    that the "single bias-free Linear layer on the difference vector" experiment (an empty
+    ``antisymmetric_hidden``) could only be run by hand-editing ``config.json`` — and a
+    hand edit changes EVERY run in the same script along with it, so that experiment could
+    no longer be separated from the run beside it.
 
-    CHỈ nhận list mà các phần tử hiện tại đều là số. Các list khác trong config là danh
-    sách tên (``configurations``, ``heads``) hoặc list dict (``slices``); ghi đè chúng từ
-    dòng lệnh sẽ làm manifest nói một chuyện mà dữ liệu là chuyện khác, nên bị chặn.
+    ONLY lists whose current elements are all numbers are accepted. The other lists in the
+    config are lists of names (``configurations``, ``heads``) or lists of dicts
+    (``slices``); overriding those from the command line would make the manifest say one
+    thing while the data says another, so it is refused.
     """
     for item in current:
         if isinstance(item, bool) or not isinstance(item, (int, float)):
-            raise ValueError(f"--set: không ghi đè được {key!r} (list chứa "
-                             f"{type(item).__name__}, chỉ nhận list số)")
+            raise ValueError(f"--set: cannot override {key!r} (the list contains "
+                             f"{type(item).__name__}; only lists of numbers)")
     text = raw.strip()
     if not (text.startswith("[") and text.endswith("]")):
-        raise ValueError(f"--set: {key!r} là list, viết trong ngoặc vuông, ví dụ "
-                         f"{key}=[256,128] hoặc {key}=[]; nhận {raw!r}")
+        raise ValueError(f"--set: {key!r} is a list, write it in square brackets, e.g. "
+                         f"{key}=[256,128] or {key}=[]; got {raw!r}")
     inner = text[1:-1].strip()
     if not inner:
         return []
@@ -114,92 +133,107 @@ def parse_number_list(raw: str, key: str, current: Sequence[object]) -> list[int
     for piece in inner.split(","):
         piece = piece.strip()
         if not piece:
-            raise ValueError(f"--set: {key!r} có phần tử rỗng trong {raw!r}")
+            raise ValueError(f"--set: {key!r} has an empty element in {raw!r}")
         try:
             values.append(int(piece) if piece.lstrip("+-").isdigit() else float(piece))
         except ValueError as error:
-            raise ValueError(f"--set: {key!r} có phần tử không phải số: {piece!r}") from error
+            raise ValueError(f"--set: {key!r} has a non-numeric element: {piece!r}") from error
     return values
 
 
 def apply_overrides(settings: dict, pairs: list[str],
                     model_settings: dict | None = None,
                     blocks: dict[str, dict] | None = None) -> dict:
-    """Ghi đè các tham số train từ dòng lệnh, dạng ``khóa=giá trị``.
+    """Override training parameters from the command line, as ``key=value``.
 
-    Chỉ cho phép ghi đè khóa ĐÃ CÓ trong ``stage3.train`` và có giá trị là số, chuỗi,
-    true/false hay list số: gõ sai tên khóa sẽ báo lỗi ngay thay vì âm thầm bỏ qua, nếu
-    không cả một đợt quét tham số có thể chạy xong mới phát hiện là vô nghĩa. Kiểu được
-    suy từ giá trị đang có trong config, nên không cần khai báo kiểu ở dòng lệnh.
+    Only keys that ALREADY EXIST in ``stage3.train`` and hold a number, a string, a
+    true/false or a list of numbers may be overridden: a mistyped key fails immediately
+    instead of being silently ignored, because otherwise a whole parameter sweep can finish
+    before anyone notices it was meaningless. The type is inferred from the value already in
+    the config, so no type has to be declared on the command line.
 
-    List số viết trong ngoặc vuông: ``model.antisymmetric_hidden=[]`` cho một lớp Linear
-    không bias duy nhất, ``model.head_hidden=[256,128]`` cho hai lớp ẩn. Xem
-    ``parse_number_list``.
+    Lists of numbers are written in square brackets: ``model.antisymmetric_hidden=[]`` for a
+    single bias-free Linear layer, ``model.head_hidden=[256,128]`` for two hidden layers.
+    See ``parse_number_list``.
 
-    Khóa có dấu chấm thì đi vào khối con, ví dụ ``finetune_overrides.batch_size=32``.
-    Khóa bắt đầu bằng ``model.`` thì đi sang ``stage3.model`` thay vì ``stage3.train``,
-    ví dụ ``model.dropout=0.3`` — dropout là nút chống khớp quá dữ liệu nhưng lại nằm
-    trong khối mô tả kiến trúc, không nằm trong khối tham số train.
+    A dotted key descends into a sub-block, e.g. ``finetune_overrides.batch_size=32``. A key
+    starting with ``model.`` is routed to ``stage3.model`` instead of ``stage3.train``, e.g.
+    ``model.dropout=0.3`` — dropout is an anti-overfitting knob that nevertheless lives in
+    the block describing the architecture, not in the block of training parameters.
 
-    ``blocks`` thêm các khối khác theo cùng cách, tên khối -> dict của khối. CLI truyền
-    ``protein_encoder`` và ``paths`` để thử một model ESM2 khác mà không sửa config.json:
-    ``protein_encoder.model=... protein_encoder.embedding_dim=... paths.cache_dir=...``.
-    Đổi cả ``paths.cache_dir`` là bắt buộc trên thực tế: cache embedding chỉ có một file,
-    và ``train.Caches`` từ chối cache dựng bằng model khác config, nên dùng chung thư mục
-    thì lần dựng mới đè mất cache của model đang dùng.
-    Khối ``inputs`` dùng cho thí nghiệm đổi cách chia tập và đổi cỡ tập train:
-    ``inputs.partition_override=work/splits/partition_override_id30.parquet`` và
-    ``inputs.train_subset=work/splits/train_subset_c200_r500.parquet``. Ở đây KHÔNG cần
-    đổi ``paths.cache_dir``: cache đánh khóa theo phân tử và theo protein chứ không theo
-    partition hay theo dòng, nên cùng một cache dùng được cho mọi ngưỡng và mọi subset.
+    ``blocks`` adds further blocks the same way, block name -> the block's dict. The CLI
+    passes ``protein_encoder``, ``molecule_encoder`` and ``paths`` so another encoder can be
+    tried without editing config.json::
 
-    Khối ``metrics`` dùng để đổi cách CHẤM mà không đổi cách train, ví dụ
-    ``metrics.expand_both_directions=false``. Cần đường này vì phép nhân đôi hai chiều
-    hiện tại đổi dấu PREDICTION đã lưu chứ không chạy lại mô hình trên đầu vào đã đảo
-    (xem metrics.expand_directions), nên nó không kiểm chiều ngược mà chỉ đổi cách gom
-    query; tắt nó là cách duy nhất để biết con số khi không nhân đôi. Mục 11.3 của
-    docs/STAGE3_EVALUATOR.md ghi phép kiểm này từ lâu mà chưa ai chạy.
-    Trả về: dict khóa -> giá trị mới, để ghi vào manifest của lần chạy.
+        --set protein_encoder.model=facebook/esm2_t30_150M_UR50D \
+        --set protein_encoder.embedding_dim=640 --set paths.cache_dir=work/cache_esm150
+        --set molecule_encoder.model=DeepChem/ChemBERTa-77M-MLM \
+        --set paths.cache_dir=work/cache_chemberta
+
+    ``embedding_dim`` has to be passed ALONG WITH the model: ``features.py`` refuses a
+    cache build when the declared dimension differs from the model's real
+    ``hidden_size`` (480 for ESM2 35M, 640 for 150M, 1280 for 650M), and refusing is the
+    right behaviour — the alternative is a cache of the wrong width discovered three hours
+    into a run. Changing ``paths.cache_dir`` too is required in practice: the embedding
+    cache is a single file, and ``train.Caches`` refuses a cache built with a model other
+    than the configured one, so sharing the directory means the new build overwrites the
+    cache of the model in use.
+    The ``inputs`` block serves the experiments that change the split or the size of the
+    training set: ``inputs.partition_override=work/splits/partition_override_id30.parquet``
+    and ``inputs.train_subset=work/splits/train_subset_c200_r500.parquet``. Here
+    ``paths.cache_dir`` does NOT need changing: the caches are keyed by molecule and by
+    protein, not by partition or by row, so one cache serves every threshold and every
+    subset.
+
+    The ``metrics`` block changes how a run is SCORED without changing how it trains, e.g.
+    ``metrics.expand_both_directions=false``. This path is needed because the current
+    both-directions expansion flips the sign of the STORED PREDICTION rather than running
+    the model again on the reversed input (see metrics.expand_directions), so it does not
+    test the reverse direction but only changes how queries are grouped; switching it off is
+    the only way to learn the number without the expansion. Section 11.3 of
+    docs/STAGE3_EVALUATOR.md has recorded this check for a long time and nobody has run it.
+    Returns: a dict of key -> new value, to be recorded in the run's manifest.
     """
     routes: dict[str, dict | None] = {MODEL_PREFIX: model_settings, **(blocks or {})}
     applied: dict = {}
     for pair in pairs:
         if "=" not in pair:
-            raise ValueError(f"--set cần dạng khóa=giá trị, nhận {pair!r}")
+            raise ValueError(f"--set needs the form key=value, got {pair!r}")
         key, _, raw = pair.partition("=")
         key = key.strip()
         target = settings
         path = key.split(".")
         if path[0] in routes:
             if routes[path[0]] is None:
-                raise ValueError(f"--set: không nhận {key!r} ở chế độ này")
+                raise ValueError(f"--set: {key!r} is not accepted in this mode")
             target = routes[path[0]]
             prefix = path[0]
             path = path[1:]
             if not path or not all(path):
-                raise ValueError(f"--set: thiếu tên tham số sau '{prefix}.'")
+                raise ValueError(f"--set: missing a parameter name after '{prefix}.'")
         for step in path[:-1]:
             if not isinstance(target, dict) or step not in target:
-                raise ValueError(f"--set: không có khối {step!r} trong {key!r}")
+                raise ValueError(f"--set: no block {step!r} inside {key!r}")
             target = target[step]
         leaf = path[-1]
         if not isinstance(target, dict) or leaf not in target:
-            raise ValueError(f"--set: không có tham số {key!r} trong stage3.train")
+            raise ValueError(f"--set: no parameter {key!r} in stage3.train")
         current = target[leaf]
         if isinstance(current, list):
             target[leaf] = parse_number_list(raw, key, current)
             applied[key] = target[leaf]
             continue
         if not isinstance(current, (bool, int, float, str)):
-            raise ValueError(f"--set: không ghi đè được {key!r} "
-                             f"(kiểu {type(current).__name__})")
+            raise ValueError(f"--set: cannot override {key!r} "
+                             f"(type {type(current).__name__})")
         value: object = raw
-        # bool phải xét TRƯỚC int (bool là lớp con của int) và phải phân tích tường minh:
-        # bool("false") là True, nên để Python tự chuyển sẽ bật cờ mà người dùng vừa tắt.
+        # bool has to be checked BEFORE int (bool is a subclass of int) and parsed
+        # explicitly: bool("false") is True, so letting Python convert would turn on the very
+        # flag the user just turned off.
         if isinstance(current, bool):
             if raw.strip().lower() not in BOOLEAN_WORDS:
-                raise ValueError(f"--set: {key!r} là true/false, nhận {raw!r}; "
-                                 f"viết một trong {sorted(BOOLEAN_WORDS)}")
+                raise ValueError(f"--set: {key!r} is true/false, got {raw!r}; "
+                                 f"write one of {sorted(BOOLEAN_WORDS)}")
             value = BOOLEAN_WORDS[raw.strip().lower()]
         elif isinstance(current, int):
             value = int(raw)
@@ -210,59 +244,121 @@ def apply_overrides(settings: dict, pairs: list[str],
     return applied
 
 
+# Characters allowed in --run-id. Everything else is refused rather than stripped: the id
+# goes into file names, and an id that is silently rewritten no longer matches the one the
+# caller is waiting for.
+RUN_ID_CHARACTERS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
+
+
+def run_stamp(moment: datetime, run_id: str | None) -> str:
+    """The stamp that names this run's files: timestamp, plus ``run_id`` when given.
+
+    Takes: the moment the run starts; the ``--run-id`` value or None.
+    Returns: ``20261119_084500`` or ``20261119_084500_3a-5417``.
+
+    WHY A RUN ID EXISTS. The timestamp is only accurate to the second, and every mode
+    writes into one shared ``runs/evaluator/``. Two consequences, both of which produce
+    numbers for a model nobody chose:
+
+    * two runs started in the same second write the SAME checkpoint and manifest path, so
+      one overwrites the other;
+    * a batch script that wants the checkpoint of the run it just finished cannot tell its
+      own manifest from the manifest of a second batch running on another GPU, because
+      "the newest manifest" belongs to whichever job happened to finish last.
+
+    With an id passed in by the caller, the manifest is ``train_<configuration>_<head>_
+    <timestamp>_<id>.json`` and the caller can open exactly that one. See
+    ``scripts/pick_train_checkpoint.py`` and ``scripts/server_run_diagnostics_1911.sh``.
+    """
+    stamp = moment.strftime(evaluator_train.TIMESTAMP_FORMAT)
+    if not run_id:
+        return stamp
+    unknown = sorted(set(run_id) - RUN_ID_CHARACTERS)
+    if unknown:
+        raise ValueError(f"--run-id may only hold letters, digits and '-'; got {run_id!r} "
+                         f"with {unknown}")
+    return f"{stamp}_{run_id}"
+
+
 def main() -> int:
-    """Nhận tham số dòng lệnh, chạy chế độ tương ứng. Trả về mã thoát (0 = xong)."""
+    """Parse the command line and run the chosen mode. Returns the exit code (0 = done)."""
     config = load_config(CONFIG_PATH)
     settings = config["stage3"]["train"]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=MODES, required=True)
     parser.add_argument("--config", dest="configuration", default="frozen",
                         choices=list(settings["configurations"]),
-                        help="cấu hình nhánh protein (mặc định frozen: rẻ nhất)")
+                        help="protein branch configuration (default frozen: the cheapest)")
     parser.add_argument("--head", default=settings["head"], choices=list(settings["heads"]),
-                        help="direct: dự đoán thẳng Δp; direct_no_edit: như direct nhưng "
-                             "bỏ nhánh edit; twin: chấm riêng từng phân tử rồi lấy hiệu "
-                             "(phản đối xứng do cấu tạo); antisymmetric: hàm lẻ trên vector "
-                             "hiệu nhân cổng ngữ cảnh (phản đối xứng do cấu tạo, vẫn học "
-                             "được tương tác trong cặp)")
+                        help="direct: predict Δp straight away; direct_no_edit: like "
+                             "direct but without the edit branch; twin: score each molecule "
+                             "separately and take the difference (antisymmetric by "
+                             "construction); antisymmetric: an odd function of the "
+                             "difference vector times a context gate (antisymmetric by "
+                             "construction, still able to learn within-pair interaction)")
     parser.add_argument("--skip-protein", action="store_true",
-                        help="prepare: chỉ dựng cache fingerprint, bỏ qua ESM2")
+                        help="prepare: build only the fingerprint cache, skip ESM2")
     parser.add_argument("--molecule-embeddings", action="store_true",
-                        help="prepare: dựng thêm cache embedding phân tử (MoLFormer), "
-                             "cần cho --set model.ligand_features=embedding")
+                        help="prepare: additionally build the molecule embedding cache "
+                             "(MoLFormer), needed for --set model.ligand_features=embedding")
     parser.add_argument("--sharpness", choices=("on", "off"), default=None,
-                        help="smoke/train: bật hoặc tắt số hạng phạt chuẩn gradient đầu ra "
-                             "(IGNITE, arXiv:2503.04242); không truyền thì theo config "
-                             "stage3.train.sharpness.enabled")
+                        help="smoke/train: switch the output gradient-norm penalty on or "
+                             "off (IGNITE, arXiv:2503.04242); left out, the config key "
+                             "stage3.train.sharpness.enabled decides")
     parser.add_argument("--set", dest="overrides", action="append", default=[],
-                        metavar="KHÓA=GIÁ_TRỊ",
-                        help="ghi đè một tham số mà không sửa config.json, ví dụ "
+                        metavar="KEY=VALUE",
+                        help="override one parameter without editing config.json, e.g. "
                              "--set weight_decay=0.1 (stage3.train), --set model.dropout=0.6 "
-                             "(stage3.model), --set protein_encoder.model=... và "
-                             "--set paths.cache_dir=... (dùng cả cho prepare); dùng được "
-                             "nhiều lần")
+                             "(stage3.model), --set protein_encoder.model=... with "
+                             "--set protein_encoder.embedding_dim=... and "
+                             "--set paths.cache_dir=..., --set molecule_encoder.model=... "
+                             "(also used by prepare); may be repeated")
+    parser.add_argument("--baseline", dest="baselines", action="append", default=[],
+                        choices=list(evaluator_classical.MODELS) + [ALL_BASELINES],
+                        help="classical: which baseline to run; may be repeated, default "
+                             "all (run them all, cheapest first)")
+    parser.add_argument("--regularized", action="store_true",
+                        help="capacity: KEEP the configured dropout and weight decay "
+                             "instead of switching them off; only for measuring whether "
+                             "those two are what blocks fitting")
+    parser.add_argument("--run-id", dest="run_id", default=None,
+                        help="a label added to every file this run writes, so that two "
+                             "runs started in the same second cannot overwrite each "
+                             "other's checkpoint and a batch script can find its OWN "
+                             "manifest while another job writes into the same directory "
+                             "(see scripts/pick_train_checkpoint.py)")
     parser.add_argument("--checkpoint", type=Path,
-                        help="eval, errors, features, diagnose: file .pt cần nạp")
+                        help="eval, errors, features, diagnose: the .pt file to load")
     parser.add_argument("--partition", default=EVAL_PARTITIONS[0], choices=EVAL_PARTITIONS,
-                        help="eval, errors, diagnose: partition được chấm; train để so với "
-                             "validation xem mô hình overfit hay chưa học được (test luôn "
-                             "bị chặn)")
+                        help="eval, errors, diagnose: the partition to score; use train to "
+                             "compare against validation and see whether the model overfits "
+                             "or has not learned (test is always refused)")
     args = parser.parse_args()
 
     try:
         overrides = apply_overrides(settings, args.overrides, config["stage3"]["model"],
                                     {"protein_encoder": config["stage3"]["protein_encoder"],
+                                     # molecule_encoder too: ChemBERTa is already in
+                                     # allowed_models, but with no --set route the only way
+                                     # to reach it was editing config.json by hand - which
+                                     # changes EVERY run of a batch script at once.
+                                     "molecule_encoder": config["stage3"]["molecule_encoder"],
                                      "paths": config["stage3"]["paths"],
                                      "inputs": config["stage3"]["inputs"],
-                                     "metrics": config["stage3"]["metrics"]})
+                                     "metrics": config["stage3"]["metrics"],
+                                     "classical": config["stage3"]["classical"],
+                                     "capacity": config["stage3"]["capacity"]})
     except ValueError as error:
         parser.error(str(error))
 
-    stamp = datetime.now().strftime(evaluator_train.TIMESTAMP_FORMAT)
+    try:
+        stamp = run_stamp(datetime.now(), args.run_id)
+    except ValueError as error:
+        parser.error(str(error))
     runs_dir = ROOT / config["stage3"]["paths"]["runs_dir"]
     setup_logging(runs_dir / f"{args.mode}_{stamp}.log")
     if overrides:
-        logging.info("ghi đè tham số: %s", overrides)
+        logging.info("parameter overrides: %s", overrides)
 
     if args.mode == "prepare":
         evaluator_train.run_prepare(config, ROOT, args.skip_protein,
@@ -271,15 +367,27 @@ def main() -> int:
     if args.mode == "baseline":
         evaluator_train.run_baselines(config, ROOT, stamp)
         return 0
+    if args.mode == "classical":
+        chosen = args.baselines or [ALL_BASELINES]
+        baselines = (list(evaluator_classical.MODELS) if ALL_BASELINES in chosen
+                     else [name for name in evaluator_classical.MODELS if name in chosen])
+        evaluator_classical.run_classical(config, ROOT, args.configuration, baselines,
+                                          stamp, overrides)
+        return 0
+    if args.mode == "capacity":
+        evaluator_capacity.run_capacity(config, ROOT, args.configuration, args.head,
+                                        stamp, regularized=args.regularized,
+                                        overrides=overrides)
+        return 0
     if args.mode in ("smoke", "train"):
         evaluator_train.run_train(config, ROOT, args.configuration, args.head,
                                   smoke=args.mode == "smoke", stamp=stamp,
                                   sharpness_mode=args.sharpness, overrides=overrides)
         return 0
     if args.checkpoint is None:
-        parser.error(f"--mode {args.mode} cần --checkpoint")
+        parser.error(f"--mode {args.mode} needs --checkpoint")
     if not args.checkpoint.is_file():
-        parser.error(f"không thấy checkpoint {args.checkpoint}")
+        parser.error(f"checkpoint not found: {args.checkpoint}")
     if args.mode == "errors":
         evaluator_train.run_errors(config, ROOT, args.checkpoint, stamp, args.partition)
     elif args.mode == "features":

@@ -381,6 +381,61 @@ def empty_protein_vocabulary(mapping: Mapping[str, str]) -> pa.Array:
     return pa.array(sorted(mapping), pa.string())
 
 
+@dataclass
+class ProteinRuntime:
+    """Mọi thứ một lần chạy cần biết về nhánh protein, đã dựng xong.
+
+    mode       : 'frozen' | 'finetune' | 'none' (models.protein_mode_for)
+    vocabulary : từ vựng hash protein; `PairArrays.protein` là chỉ số vào chính nó
+    source     : None (không có nhánh) | ma trận embedding đã cache | ProteinEncoderRuntime
+    dimension  : chiều embedding; None khi cấu hình không có nhánh protein
+    sequences  : hash -> chuỗi amino acid, rỗng ở cấu hình frozen
+
+    Có dataclass này để `run_train`, `capacity.run_capacity` và mọi chế độ sau dùng CHUNG
+    một đường dựng nhánh protein. Trước 19/11/2026 đoạn dựng này nằm thẳng trong
+    `run_train`, nên mỗi chế độ mới phải sao lại 25 dòng — và một bản sao đi lệch nghĩa là
+    hai lần chạy khác nhau mà manifest ghi giống nhau.
+    """
+
+    mode: str
+    vocabulary: pa.Array
+    source: Any
+    dimension: int | None
+    sequences: Mapping[str, str]
+
+
+def build_protein_runtime(config: Mapping[str, Any], root: Path, configuration: str,
+                          caches: Caches, device: str) -> ProteinRuntime:
+    """Dựng nhánh protein cho một cấu hình; xem ProteinRuntime."""
+    from . import models
+
+    settings = config["stage3"]["train"]
+    mode = models.protein_mode_for(configuration)
+    if mode == models.PROTEIN_FROZEN:
+        return ProteinRuntime(mode=mode, vocabulary=caches.protein_keys,
+                              source=caches.protein_vectors,
+                              dimension=caches.protein_dim, sequences={})
+    sequences = protein_sequences(config, root)
+    vocabulary = empty_protein_vocabulary(sequences)
+    if mode != models.PROTEIN_FINETUNE:
+        return ProteinRuntime(mode=mode, vocabulary=vocabulary, source=None,
+                              dimension=None, sequences=sequences)
+    encoder_settings = dict(config["stage3"]["protein_encoder"])
+    # finetune bắt buộc cắt chuỗi: bộ nhớ gradient tỉ lệ với số acid amin.
+    encoder_settings["long_sequence"] = "truncate"
+    # Tên biến KHÔNG được là `overrides`: `run_train` có tham số cùng tên và ghi nó vào
+    # manifest, nên trùng tên là mất dấu danh sách --set đã quét.
+    tuning = settings.get("finetune_overrides", {})
+    if "max_residues" in tuning:
+        encoder_settings["max_residues"] = int(tuning["max_residues"])
+    ordered = [sequences[key] for key in vocabulary.to_pylist()]
+    source = ProteinEncoderRuntime(encoder_settings, ordered, device)
+    LOGGER.info("CHIỀU EMBEDDING ĐO ĐƯỢC: %s (model %s)", source.dimension,
+                encoder_settings["model"])
+    return ProteinRuntime(mode=mode, vocabulary=vocabulary, source=source,
+                          dimension=source.dimension, sequences=sequences)
+
+
 # --------------------------------------------------------------------------- batch
 
 
@@ -446,6 +501,13 @@ class ProteinEncoderRuntime:
         self.sequences = list(sequences)
         self.device = device
         self.max_residues = int(settings["max_residues"])
+        # Kept so the checkpoint can record the window this run actually used. The train
+        # path narrows `max_residues` through `finetune_overrides` (512 instead of 1022),
+        # and a re-scoring run that rebuilt the encoder from the shared config would feed
+        # the SAME weights longer sequences — the same model, different inputs, different
+        # predictions, with nothing to announce it. See load_checkpoint.
+        self.settings = {key: settings[key] for key in sorted(settings)
+                         if isinstance(settings[key], (str, int, float, bool))}
         self.torch = torch
         # Token không phải acid amin. Pool chỉ trên acid amin để giống hệt cache frozen
         # (features.embed_one_sequence bỏ CLS/EOS) — xem CHUẨN POOLING ở encode().
@@ -1124,16 +1186,55 @@ def effective_batch_sizes(settings: Mapping[str, Any], protein_mode: str,
     return batch_size, eval_batch_size
 
 
+# Value of stage3.train.protein_permute_seed when the protein column is NOT shuffled. A
+# negative number rather than None so that `--set protein_permute_seed=-1` can switch it
+# off from the command line: apply_overrides infers the type from the value already in the
+# config, so this key must always be an integer.
+PROTEIN_PERMUTE_OFF = -1
+# One permutation per partition, offset from the base seed by this table.
+PARTITION_PERMUTE_OFFSET = {data.TRAIN: 0, data.VALIDATION: 1, data.TEST: 2}
+
+
+def protein_permutation_seed(train_settings: Mapping[str, Any],
+                             partition: str) -> int | None:
+    """Protein-shuffle seed for one partition; None means no shuffling.
+
+    Takes: the ``stage3.train`` block; the partition name.
+    Returns: the partition-offset seed, or None when the config switches shuffling off.
+    See `data.permute_protein_rows` for the question this shuffle answers.
+    """
+    base = int(train_settings.get("protein_permute_seed", PROTEIN_PERMUTE_OFF))
+    if base < 0:
+        return None
+    if partition not in PARTITION_PERMUTE_OFFSET:
+        raise ValueError(f"unknown partition: {partition!r}")
+    return base + PARTITION_PERMUTE_OFFSET[partition]
+
+
 def prepare_arrays(config: Mapping[str, Any], root: Path, partition: str, caches: Caches,
                    protein_vocabulary: pa.Array, limit: int | None
                    ) -> tuple[data.PairArrays, dict[str, np.ndarray], pa.Table]:
-    """Đọc và mã hóa một partition; trả về (mảng, cột khóa query, bảng gốc)."""
+    """Read and encode one partition; returns (arrays, query key columns, raw table).
+
+    When ``stage3.train.protein_permute_seed`` >= 0 the ARRAYS' protein column is shuffled
+    across rows while the QUERY KEY columns are not — that is the protein control asked for
+    at the 2026-11-18 meeting, see `data.permute_protein_rows`. The shuffle lives here, the
+    single chokepoint every mode (train, eval, errors, features, diagnose) goes through, so
+    no code path can run half of the experiment.
+    """
     table = data.read_partition(config, root, partition, limit)
     arrays = data.encode_pairs(table, caches.molecule_keys, caches.fragment_keys,
                                protein_vocabulary, list(config["endpoints"]),
                                config["stage3"]["metrics"]["slices"])
     keys = data.query_key_columns(table, caches.molecule_keys, protein_vocabulary,
                                   list(config["endpoints"]))
+    seed = protein_permutation_seed(config["stage3"]["train"], partition)
+    if seed is not None:
+        arrays = data.permute_protein_rows(arrays, seed)
+        LOGGER.warning("PROTEIN CONTROL: the protein column of %s has been SHUFFLED "
+                       "across rows (seed %s). This is NOT an ordinary run: every row's "
+                       "protein embedding now belongs to a different protein. Queries are "
+                       "still grouped by the real protein.", partition, seed)
     return arrays, keys, table
 
 
@@ -1275,31 +1376,9 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
     accumulate_steps = max(1, int(settings.get("accumulate_steps", 1) or 1))
 
     caches = Caches(config, root, need_protein=protein_mode == models.PROTEIN_FROZEN)
-    sequences: dict[str, str] = {}
-    protein_source: Any = None
-    if protein_mode == models.PROTEIN_FROZEN:
-        protein_vocabulary = caches.protein_keys
-        protein_source = caches.protein_vectors
-        protein_dim = caches.protein_dim
-    else:
-        sequences = protein_sequences(config, root)
-        protein_vocabulary = empty_protein_vocabulary(sequences)
-        protein_dim = None
-        if protein_mode == models.PROTEIN_FINETUNE:
-            encoder_settings = dict(config["stage3"]["protein_encoder"])
-            # finetune bắt buộc cắt chuỗi: bộ nhớ gradient tỉ lệ với số acid amin.
-            encoder_settings["long_sequence"] = "truncate"
-            # KHÔNG đặt tên biến này là `overrides`: trùng với tham số của hàm, và
-            # manifest ở cuối hàm ghi `overrides` — trùng tên thì mọi lần finetune ghi
-            # finetune_overrides thay cho danh sách --set, mất dấu tham số đã quét.
-            tuning = settings.get("finetune_overrides", {})
-            if "max_residues" in tuning:
-                encoder_settings["max_residues"] = int(tuning["max_residues"])
-            ordered = [sequences[key] for key in protein_vocabulary.to_pylist()]
-            protein_source = ProteinEncoderRuntime(encoder_settings, ordered, device)
-            protein_dim = protein_source.dimension
-            LOGGER.info("CHIỀU EMBEDDING ĐO ĐƯỢC: %s (model %s)", protein_dim,
-                        encoder_settings["model"])
+    runtime = build_protein_runtime(config, root, configuration, caches, device)
+    protein_vocabulary, protein_source = runtime.vocabulary, runtime.source
+    protein_dim = runtime.dimension
 
     train_arrays, train_keys, _ = prepare_arrays(config, root, data.TRAIN, caches,
                                                  protein_vocabulary, limit)
@@ -1478,10 +1557,26 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
                      "ligand_bits": caches.ligand_bits,
                      "fragment_bits": caches.fragment_bits,
                      "label_scaler": scaler.state(),
+                     # The shuffle seed MUST live in the .pt, not only in the JSON
+                     # manifest: `--mode eval/errors/features/diagnose` rebuilds the data
+                     # from the CURRENT command's config, so a checkpoint trained on
+                     # shuffled data and re-scored with the default config silently becomes
+                     # a "train shuffled, eval clean" measurement — a different experiment
+                     # entirely, with nothing to announce it. See check_protein_permutation.
+                     "protein_permute_seed": int(
+                         settings.get("protein_permute_seed", PROTEIN_PERMUTE_OFF)),
+                     # The split/subset files, for the same reason as the shuffle seed:
+                     # re-scoring rebuilds the rows from the current command, so a missing
+                     # `--set inputs.partition_override_pairs=...` quietly scores the
+                     # default validation partition instead. See check_input_split.
+                     "inputs": input_fingerprint(config),
                      "model_settings": models.architecture_settings(
                          config["stage3"]["model"])}
             if isinstance(protein_source, ProteinEncoderRuntime):
                 state["protein_encoder"] = protein_source.model.state_dict()
+                # The encoder settings of THIS run, not of the shared config: see the
+                # comment on ProteinEncoderRuntime.settings.
+                state["protein_encoder_settings"] = dict(protein_source.settings)
             torch.save(state, checkpoint_path)
             LOGGER.info("checkpoint tốt nhất (%s) -> %s", label, checkpoint_path)
             return False
@@ -1556,6 +1651,11 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "antisymmetry_penalty": antisymmetry_weight,
         "antisymmetry_violation_last_epoch": epoch_stats.get("antisymmetry_violation"),
         "edit_filter": edit_filter,
+        # Đối chứng protein (họp 18/11/2026): -1 là lần chạy bình thường, >= 0 là lần
+        # chạy đã XÁO cột protein. PHẢI có trong manifest, nếu không một lần chạy đối
+        # chứng và một lần chạy thật trông giống hệt nhau trong bảng tổng hợp.
+        "protein_permute_seed": int(
+            settings.get("protein_permute_seed", PROTEIN_PERMUTE_OFF)),
         # Ảnh chụp khối `metrics` đang dùng: THƯỚC ĐO của lần chạy này, không phải tham số
         # của mô hình. Phải ghi vì trước 13/11/2026 manifest không có nó, nên
         # scripts/group_runs.py chỉ nhìn thấy thay đổi phép đo khi nó được `--set` tường
@@ -1618,6 +1718,142 @@ class LoadedCheckpoint:
     scaler: LabelScaler = LabelScaler(LABEL_NONE, 0.0, 1.0)
 
 
+# Keys of `stage3.inputs` that decide WHICH ROWS a run sees. They are written into the
+# checkpoint and checked on re-scoring. `evaluator` and `proteins` are left out on purpose:
+# those name the dataset itself, and a dataset swap is already caught by the cache manifest
+# check in Caches.
+SPLIT_KEYS = ("train_subset", "partition_override", "partition_override_pairs")
+
+
+def input_fingerprint(config: Mapping[str, Any]) -> dict[str, str]:
+    """The split/subset files of this run, for the checkpoint to carry.
+
+    Takes: the whole config. Returns: key -> path as a string (an empty string when the
+    key is unset), for every key of ``SPLIT_KEYS``.
+    """
+    inputs = config["stage3"]["inputs"]
+    return {key: str(inputs.get(key) or "") for key in SPLIT_KEYS}
+
+
+def check_input_split(state: Mapping[str, Any],
+                      config: Mapping[str, Any]) -> dict[str, str] | None:
+    """Refuse to re-score a checkpoint against a DIFFERENT split or subset.
+
+    Takes: the state loaded from the .pt; the current command's config.
+    Returns: the fingerprint recorded in the checkpoint, or None for an old checkpoint
+    without the key. Raises ValueError when the two disagree.
+
+    Why this raises instead of warning: `--mode eval/errors/features/diagnose` rebuilds the
+    rows from the CURRENT command's config, so forgetting
+    `--set inputs.partition_override_pairs=...` makes the command read the DEFAULT
+    validation partition (493,852 rows) instead of the split's own (24,946 rows) — a
+    different experiment on different rows, with an ordinary-looking table of numbers and
+    nothing to announce it. The protein-shuffle seed was already locked this way (see
+    check_protein_permutation); this key was the one still left open.
+    """
+    saved = state.get("inputs")
+    current = input_fingerprint(config)
+    if saved is None:
+        # Checkpoints from before 2026-11-19 do not store this key. Nothing can be checked,
+        # so warn EVERY time, including when the current command sets no flag at all: that
+        # is the worst case, not the safe one. A PAIR75 checkpoint re-scored by a bare
+        # command reads the default validation partition, and if silence meant "fine" the
+        # table would look ordinary. Warning only when a flag is present would clear
+        # exactly the case nobody can catch by eye.
+        asked = ", ".join(f"{key}={value}" for key, value in current.items() if value)
+        LOGGER.warning("this checkpoint records no split (trained before 2026-11-19), so "
+                       "the split CANNOT be checked; the current command uses %s. Confirm "
+                       "by hand against the run's manifest that this is the split the "
+                       "checkpoint was trained on",
+                       asked or "the default partitions (no inputs.* flag)")
+        return None
+    saved = {key: str(saved.get(key) or "") for key in SPLIT_KEYS}
+    if saved != current:
+        differences = "; ".join(
+            f"{key}: checkpoint {saved[key] or '(unset)'} vs command "
+            f"{current[key] or '(unset)'}"
+            for key in SPLIT_KEYS if saved[key] != current[key])
+        flags = " ".join(f"--set inputs.{key}={saved[key]}" for key in SPLIT_KEYS
+                         if saved[key])
+        raise ValueError(
+            f"the checkpoint was trained on a different split ({differences}); re-scoring "
+            f"it on these rows reports numbers for an experiment that never ran. Add "
+            f"`{flags}` to score it correctly" if flags else
+            f"the checkpoint was trained on a different split ({differences}); drop the "
+            f"inputs.* flags to score the rows the checkpoint was actually trained on")
+    return saved
+
+
+def check_protein_permutation(state: Mapping[str, Any],
+                              train_settings: Mapping[str, Any]) -> int | None:
+    """Refuse to re-score a checkpoint under a DIFFERENT protein-shuffle setting.
+
+    Takes: the state loaded from the .pt; the ``stage3.train`` block of the current command.
+    Returns: the seed recorded in the checkpoint, or None for an old checkpoint without the
+    key. Raises ValueError when the two disagree.
+
+    Why this raises instead of warning: two runs differing only here produce two perfectly
+    ordinary-looking metric tables, and the WRONG one (trained on shuffled data, scored on
+    real data) is the HIGHER of the two — nobody questions a good number.
+    """
+    saved = state.get("protein_permute_seed")
+    current = int(train_settings.get("protein_permute_seed", PROTEIN_PERMUTE_OFF))
+    if saved is None:
+        # Checkpoints from before 2026-11-19 do not store this key; all of them are
+        # unshuffled runs.
+        if current >= 0:
+            raise ValueError(
+                f"this checkpoint records no protein_permute_seed (trained before "
+                f"2026-11-19, i.e. with NO protein shuffling) while the current command "
+                f"sets protein_permute_seed={current}; drop that flag to score the data "
+                f"the checkpoint was actually trained on")
+        return None
+    if int(saved) != current:
+        raise ValueError(
+            f"the checkpoint was trained with protein_permute_seed={int(saved)} while the "
+            f"current command sets {current}; mixing the two reports numbers for an "
+            f"experiment that never ran. Add `--set protein_permute_seed={int(saved)}` to "
+            f"score it correctly")
+    return int(saved)
+
+
+def finetune_encoder_settings(state: Mapping[str, Any], config: Mapping[str, Any],
+                             settings: Mapping[str, Any]) -> dict[str, Any]:
+    """The protein-encoder settings to re-score a finetune checkpoint with.
+
+    Takes: the loaded checkpoint state; the whole config; the stage-3 train settings.
+    Returns: the settings dict for ``ProteinEncoderRuntime``.
+
+    WHY NOT SIMPLY THE CONFIG. The train path narrows the sequence window through
+    ``stage3.train.finetune_overrides`` (``max_residues`` 512 instead of the shared 1022),
+    because finetune keeps ESM2 in the backward graph and its memory grows with the number
+    of residues. Rebuilding the encoder from the shared config would therefore hand the SAME
+    weights longer sequences for every protein above 512 residues: the same model, different
+    inputs, so predictions that differ from the ones that selected this checkpoint, with
+    nothing in the output to announce it.
+
+    So a checkpoint records the settings its own run used, and they win here. Checkpoints
+    trained before 2026-11-19 do not record them; for those the window CANNOT be checked, so
+    the caller is warned instead of being left to assume it matched.
+    """
+    encoder_settings = dict(config["stage3"]["protein_encoder"])
+    # finetune always truncates: gradient memory is proportional to the number of residues.
+    encoder_settings["long_sequence"] = "truncate"
+    saved = state.get("protein_encoder_settings")
+    if saved:
+        encoder_settings.update(saved)
+        return encoder_settings
+    tuning = settings.get("finetune_overrides", {})
+    LOGGER.warning("checkpoint này không ghi cấu hình encoder (train trước 19/11/2026), nên "
+                   "cửa sổ chuỗi KHÔNG kiểm được: lệnh đang chạy dùng max_residues=%s, còn "
+                   "lượt train có thể đã dùng finetune_overrides.max_residues=%s. Với "
+                   "protein dài hơn cửa sổ nhỏ hơn, cùng trọng số nhận đầu vào khác nên số "
+                   "đo ở đây có thể lệch so với lúc chọn checkpoint.",
+                   encoder_settings["max_residues"],
+                   tuning.get("max_residues", "(không đặt)"))
+    return encoder_settings
+
+
 def load_checkpoint(config: Mapping[str, Any], root: Path,
                     checkpoint: Path) -> LoadedCheckpoint:
     """Nạp checkpoint, cache và nguồn vector protein đúng như lúc train."""
@@ -1629,6 +1865,12 @@ def load_checkpoint(config: Mapping[str, Any], root: Path,
     device = resolve_device(settings["device"])
     limit_gpu_memory(settings, device)
     state = torch.load(checkpoint, map_location=device, weights_only=False)
+    permuted = check_protein_permutation(state, settings)
+    check_input_split(state, config)
+    if permuted is not None and permuted >= 0:
+        LOGGER.warning("checkpoint này train trên dữ liệu ĐÃ XÁO protein (hạt giống %s), "
+                       "và lệnh đang chạy cũng xáo; mọi số dưới đây là số của phép đối "
+                       "chứng, không phải của mô hình thật", permuted)
     protein_mode = str(state["protein_mode"])
     caches = Caches(config, root, need_protein=protein_mode == models.PROTEIN_FROZEN)
     protein_source: Any = None
@@ -1639,8 +1881,9 @@ def load_checkpoint(config: Mapping[str, Any], root: Path,
         sequences = protein_sequences(config, root)
         protein_vocabulary = empty_protein_vocabulary(sequences)
         if protein_mode == models.PROTEIN_FINETUNE:
-            encoder_settings = dict(config["stage3"]["protein_encoder"])
-            encoder_settings["long_sequence"] = "truncate"
+            # The window the TRAINING run used, not the shared one: see the docstring of
+            # finetune_encoder_settings.
+            encoder_settings = finetune_encoder_settings(state, config, settings)
             ordered = [sequences[key] for key in protein_vocabulary.to_pylist()]
             protein_source = ProteinEncoderRuntime(encoder_settings, ordered, device)
             if "protein_encoder" in state:
@@ -2096,9 +2339,154 @@ def diagnose_model(model: Any, arrays: data.PairArrays, caches: Caches, protein_
             "label_sd": label_sd, "relu_layers": layers, "sensitivity": sensitivity}
 
 
+def gradient_group(name: str) -> str:
+    """The block a parameter belongs to, from its name in ``model.named_parameters()``.
+
+    Takes: a parameter name such as ``head.blocks.3.linear.weight``.
+    Returns: the name cut after the first numbered component (``head.blocks.3``), or the
+    first component when there is no number (``protein_projection``).
+
+    Why cut at the number: the residual head is an ``nn.Sequential`` of blocks, so the
+    index IS the block — and "does every one of the 7 residual blocks receive gradient" is
+    exactly the question asked at the 2026-11-18 meeting. The same rule gives one group per
+    layer of the plain MLP encoders, which is the useful granularity there too.
+    """
+    parts = name.split(".")
+    for index, part in enumerate(parts):
+        if part.isdigit():
+            return ".".join(parts[: index + 1])
+    return parts[0]
+
+
+def gradient_norms(model: Any, arrays: data.PairArrays, caches: Caches, protein_source: Any,
+                   device: str, batch_size: int, criterion: Any, seed: int,
+                   batches: int = 5, loss_name: str = "") -> dict[str, Any]:
+    """Gradient norm of each block's parameters, measured after ``loss.backward()``.
+
+    Takes: the model; the sample to measure on, whose ``target`` must ALREADY be in the
+    space the model was trained in (see the note on label scaling below); the caches and
+    the protein source; device; batch size; the loss function; the seed for choosing
+    batches; how many batches to average over; the NAME of the loss, recorded in the result
+    so a number is never read without knowing which loss produced it.
+    Returns: ``{"batches": n, "loss": name, "total_grad_norm": ..., "groups": [...]}`` with
+    one entry per group of ``gradient_group``, each holding the parameter count, the
+    gradient norm, the norm per parameter, the share of the total and the fraction of
+    entries that are exactly zero.
+
+    WHY THIS EXISTS, separately from the two measurements of ``diagnose_model``. Those run
+    under ``torch.no_grad()``: they count ReLU units that never fire and measure how much
+    the prediction moves when an input is shuffled. Neither one touches a gradient, and a
+    block whose activations are non-zero can still receive a gradient of exactly zero (a
+    detached path, a gate stuck at 0, a head that ignores the branch). The direct answer to
+    "does this block learn" is the norm of the gradient of its own parameters, which only
+    exists after a backward pass on real training rows.
+
+    Measured in ``eval`` mode (dropout off) so repeated runs give the same number; dropout
+    would make the norm of a single batch depend on which units happened to be dropped.
+    State the result as what it is: "the gradient measured on train batches, at this
+    checkpoint, with dropout off". A zero here is strong evidence that nothing reaches the
+    block, but eval-mode gradients are NOT the training gradients in general — with dropout
+    active the expectation is taken over masks, and the two need not agree.
+
+    LABEL SCALING. The caller must hand over targets in the space the model was trained in.
+    ``run_train`` applies ``LabelScaler.forward`` to the train targets before fitting, so a
+    checkpoint trained with ``zscore``/``minmax`` learned on z, not on Δp; feeding raw Δp
+    here would compute the gradient of a different loss — wrong scale, and with a non-zero
+    ``shift`` the sign can be wrong too. ``run_diagnose`` does the scaling with the scaler
+    read from the checkpoint itself.
+
+    Only the model's own parameters are measured, not ESM2's under the ``finetune``
+    configuration: the question is about the evaluator's branches and heads. For that reason
+    the batch is built under ``torch.no_grad()``, which also keeps ESM2 out of the graph —
+    otherwise the backward pass would run through it and hold its activations for every
+    batch, spending VRAM on numbers this report never shows.
+
+    Nothing is updated: the gradients are cleared again before returning, and no optimizer
+    is involved, so the checkpoint on disk is untouched.
+    """
+    import torch
+
+    if len(arrays) == 0:
+        raise ValueError("no rows to measure gradients on")
+    if batches < 1:
+        raise ValueError(f"batches must be >= 1, got {batches}")
+    model.eval()
+    if isinstance(protein_source, ProteinEncoderRuntime):
+        protein_source.train(False)
+    rng = np.random.default_rng(seed)
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    totals: list[float] = []
+    done = 0
+    for rows in data.iter_batches(len(arrays), batch_size, rng):
+        if done >= batches:
+            break
+        with torch.no_grad():
+            # The protein vectors of the finetune configuration are computed by ESM2; built
+            # here they stay out of the graph, so the backward pass below reaches the
+            # evaluator's parameters only.
+            batch = batch_tensors(arrays, rows, caches, protein_source, device,
+                                  model.uses_edit_branch)
+        model.zero_grad(set_to_none=True)
+        prediction = model(*(batch[name] for name in MODEL_INPUTS))
+        criterion(prediction, batch["target"]).backward()
+        square = 0.0
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            key = gradient_group(name)
+            if key not in groups:
+                groups[key] = {"group": key, "parameters": 0, "square": 0.0, "zero": 0,
+                               "seen": 0}
+                order.append(key)
+            slot = groups[key]
+            if done == 0:
+                slot["parameters"] += int(parameter.numel())
+            gradient = parameter.grad
+            slot["seen"] += int(parameter.numel())
+            if gradient is None:
+                # No gradient at all reached this parameter: count every entry as zero,
+                # which is what "this block does not learn" looks like.
+                slot["zero"] += int(parameter.numel())
+                continue
+            detached = gradient.detach()
+            value = float(detached.double().pow(2).sum())
+            slot["square"] += value
+            slot["zero"] += int((detached == 0).sum())
+            square += value
+        totals.append(square ** 0.5)
+        done += 1
+    model.zero_grad(set_to_none=True)
+    # Root mean square across batches, not the mean of the norms: the norm of one batch is
+    # itself a square root, and averaging squares keeps the per-group numbers adding up to
+    # the total.
+    total = (sum(value ** 2 for value in totals) / max(len(totals), 1)) ** 0.5
+    report = []
+    for key in order:
+        slot = groups[key]
+        norm = (slot["square"] / max(done, 1)) ** 0.5
+        count = max(slot["parameters"], 1)
+        report.append({
+            "group": key, "parameters": slot["parameters"], "grad_norm": norm,
+            # Divided by sqrt(parameter count) so a 7,000-parameter block and a
+            # 600,000-parameter one can be compared: the norm of a vector grows with its
+            # length even when every entry is the same size.
+            "grad_norm_per_parameter": norm / (count ** 0.5),
+            "share_of_total": norm ** 2 / total ** 2 if total > 0 else None,
+            "zero_fraction": slot["zero"] / max(slot["seen"], 1)})
+    return {"batches": done, "batch_size": batch_size, "loss": loss_name,
+            "total_grad_norm": total, "groups": report}
+
+
 def run_diagnose(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp: str,
                  partition: str = data.VALIDATION) -> dict[str, Any]:
     """Chẩn đoán một checkpoint trên một mẫu dòng của partition (validation hoặc train).
+
+    Ba phép đo: nơ-ron ReLU chết, độ nhạy với từng đầu vào (cả hai dưới torch.no_grad)
+    và CHUẨN GRADIENT của tham số từng block sau loss.backward() — phép đo thứ ba trả lời
+    câu hỏi họp 18/11 "7 residual block có nhận gradient không", mà hai phép đầu không
+    trả lời được (activation khác 0 vẫn có thể gradient bằng 0). Chuẩn gradient chỉ có
+    nghĩa trên dòng TRAIN, nên dùng --partition train cho câu hỏi đó.
 
     Dùng khi một lần train cho dự đoán gần như hằng số (06/11/2026: fusion=projector +
     head plain, đúng chiều 0,168, Spearman không tính được). Mẫu lấy
@@ -2113,9 +2501,38 @@ def run_diagnose(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp:
     rng = np.random.default_rng(seed)
     count = min(per_partition, len(arrays))
     rows = np.sort(rng.choice(len(arrays), size=count, replace=False))
-    report = diagnose_model(loaded.model, data.take_rows(arrays, rows), loaded.caches,
+    sample = data.take_rows(arrays, rows)
+    report = diagnose_model(loaded.model, sample, loaded.caches,
                             loaded.protein_source, loaded.device, loaded.eval_batch_size,
                             seed, loaded.scaler)
+    # Gradient norms need a backward pass, so they use the TRAIN batch size, not
+    # eval_batch_size: a backward pass holds the activations of the whole batch.
+    train_batch, _ = effective_batch_sizes(config["stage3"]["train"], loaded.protein_mode,
+                                           False)
+    # The targets must be in the space the model was trained in, exactly as run_train puts
+    # them there: the scaler comes from the CHECKPOINT, not from the current config, since
+    # the config may have changed since that run.
+    fit_sample = (sample if not loaded.scaler.active else
+                  data.PairArrays(
+                      molecule_a=sample.molecule_a, molecule_b=sample.molecule_b,
+                      fragment_a=sample.fragment_a, fragment_b=sample.fragment_b,
+                      protein=sample.protein, endpoint=sample.endpoint,
+                      target=loaded.scaler.forward(sample.target), slices=sample.slices))
+    settings = config["stage3"]["train"]
+    report["gradients"] = gradient_norms(
+        loaded.model, fit_sample, loaded.caches, loaded.protein_source, loaded.device,
+        min(train_batch, len(sample)), loss_function(settings), seed,
+        int(config["stage3"]["analysis"]["gradient_batches"]),
+        loss_name=str(settings["loss"]))
+    report["gradients"]["labels"] = ("scaled by the checkpoint's own label scaler "
+                                     f"({loaded.scaler.name})" if loaded.scaler.active
+                                     else "raw delta p")
+    # The loss comes from the CURRENT command's config, not from the checkpoint (the
+    # checkpoint does not store it), so the manifest records every number needed to say
+    # which loss produced these gradients. To reproduce the gradients of an older train
+    # run, read `loss` and `huber_delta` from that run's manifest and pass them with --set.
+    report["gradients"]["huber_delta"] = (float(settings["huber_delta"])
+                                         if str(settings["loss"]) == "huber" else None)
     summary = report["prediction"]
     LOGGER.info("dự đoán (%s, %s dòng): trung bình %.4f | sd %.4f | [%.4f, %.4f] | "
                 "%s giá trị khác nhau | sd nhãn %.4f", partition, f"{count:,}",
@@ -2128,6 +2545,17 @@ def run_diagnose(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp:
         relative = shift["relative_to_label_sd"]
         LOGGER.info("xáo %-9s -> dự đoán đổi trung bình %.4f (= %s lần sd nhãn)", name,
                     shift["mean_abs_shift"], "-" if relative is None else f"{relative:.4f}")
+    gradients = report["gradients"]
+    LOGGER.info("gradient norms over %s %s batch(es) of %s rows, loss %s, labels %s "
+                "(total %.4g):", gradients["batches"], partition, gradients["batch_size"],
+                gradients["loss"], gradients["labels"], gradients["total_grad_norm"])
+    for group in gradients["groups"]:
+        share = group["share_of_total"]
+        LOGGER.info("  %-28s %8s params | norm %.4g | per param %.4g | share %s | "
+                    "zero %5.1f%%", group["group"], f"{group['parameters']:,}",
+                    group["grad_norm"], group["grad_norm_per_parameter"],
+                    "-" if share is None else f"{share:.4f}",
+                    100 * group["zero_fraction"])
     _, runs_dir = layout(config, root)
     runs_dir.mkdir(parents=True, exist_ok=True)
     path = runs_dir / f"diagnose_{loaded.configuration}_{loaded.head}_{partition}_{stamp}.json"

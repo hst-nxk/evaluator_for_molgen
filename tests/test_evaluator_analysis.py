@@ -322,6 +322,25 @@ def test_antisymmetric_representations_are_the_odd_branch_and_the_gate() -> None
         assert torch.allclose(model(*inputs), (odd * gate).sum(dim=1), atol=1e-6)
 
 
+def test_run_diagnose_reports_the_gradient_norm_of_every_block(
+        fake_run: dict[str, Any]) -> None:
+    """Review point of 2026-11-19: the ReLU count and the sensitivity measurement both run
+    under torch.no_grad(), so neither answers "does this block receive gradient"."""
+    report = train.run_diagnose(fake_run["config"], fake_run["root"], Path("x.pt"), "s")
+    gradients = report["gradients"]
+    assert gradients["batches"] >= 1
+    assert gradients["total_grad_norm"] > 0
+    expected = {train.gradient_group(name)
+                for name, parameter in fake_run["model"].named_parameters()
+                if parameter.requires_grad}
+    assert {group["group"] for group in gradients["groups"]} == expected
+    # The manifest on disk carries them too, not just the returned dict.
+    saved = json.loads(
+        (fake_run["root"] / "diagnose_frozen_direct_validation_s.json").read_text(
+            encoding="utf-8"))
+    assert saved["gradients"]["groups"] == gradients["groups"]
+
+
 def test_run_diagnose_reports_layers_and_every_input(fake_run: dict[str, Any]) -> None:
     report = train.run_diagnose(fake_run["config"], fake_run["root"], Path("x.pt"), "s")
     assert (fake_run["root"] / "diagnose_frozen_direct_validation_s.json").is_file()

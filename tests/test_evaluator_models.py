@@ -157,7 +157,7 @@ def test_protein_mode_for_maps_each_configuration() -> None:
 
 
 def test_protein_mode_for_refuses_an_unknown_configuration() -> None:
-    with pytest.raises(ValueError, match="cấu hình lạ"):
+    with pytest.raises(ValueError, match="unknown configuration"):
         models.protein_mode_for("partial")
 
 
@@ -763,7 +763,7 @@ def test_pair_features_refuses_the_heads_where_it_has_no_meaning() -> None:
 
 
 def test_pair_features_refuses_linear_head_and_the_other_fusions() -> None:
-    with pytest.raises(ValueError, match="trùng nút"):
+    with pytest.raises(ValueError, match="second knob for the same thing"):
         build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN,
                    head_block=models.HEAD_BLOCK_LINEAR,
                    pair_features=models.PAIR_FEATURES_DIFFERENCE)
@@ -774,5 +774,5 @@ def test_pair_features_refuses_linear_head_and_the_other_fusions() -> None:
 
 
 def test_pair_features_rejects_an_unknown_value() -> None:
-    with pytest.raises(ValueError, match="pair_features lạ"):
+    with pytest.raises(ValueError, match="unknown pair_features"):
         build_with(models.HEAD_DIRECT, models.PROTEIN_FROZEN, pair_features="hiệu")

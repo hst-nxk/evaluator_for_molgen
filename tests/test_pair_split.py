@@ -140,7 +140,7 @@ def test_a_duplicate_pair_id_in_the_table_is_an_error(tmp_path: Path) -> None:
                              "unseen_pair": pa.array([False, True], pa.bool_())}), target)
     config = write_dataset(tmp_path)
     config["stage3"]["inputs"]["partition_override_pairs"] = target.name
-    with pytest.raises(ValueError, match="pair_id trùng"):
+    with pytest.raises(ValueError, match="repeated pair_id"):
         data.read_columns(config, tmp_path, "train", ["pair_id"])
 
 
@@ -158,7 +158,7 @@ def test_combining_with_the_other_split_paths_is_refused(tmp_path: Path, other: 
     config["stage3"]["inputs"]["partition_override_pairs"] = write_pairs(
         tmp_path, {"p0": ("train", False)})
     config["stage3"]["inputs"][other] = "bang_khac.parquet"
-    with pytest.raises(ValueError, match="không được bật cùng lúc"):
+    with pytest.raises(ValueError, match="cannot both be on"):
         data.read_columns(config, tmp_path, "train", ["pair_id"])
 
 

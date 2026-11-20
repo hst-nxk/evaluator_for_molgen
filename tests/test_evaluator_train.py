@@ -290,7 +290,7 @@ def test_override_rejects_an_unknown_block() -> None:
 
 
 def test_override_needs_an_equals_sign() -> None:
-    with pytest.raises(ValueError, match="khóa=giá trị"):
+    with pytest.raises(ValueError, match="key=value"):
         run_evaluator.apply_overrides(train_settings(), ["huber_delta 0.3"])
 
 
@@ -353,7 +353,7 @@ def test_override_rejects_an_unknown_key_in_the_model_block() -> None:
 
 
 def test_override_rejects_the_model_prefix_with_no_key() -> None:
-    with pytest.raises(ValueError, match="thiếu tên tham số"):
+    with pytest.raises(ValueError, match="missing a parameter name"):
         run_evaluator.apply_overrides(train_settings(), ["model.=0.3"], {"dropout": 0.1})
 
 
@@ -450,7 +450,7 @@ def test_override_keeps_whole_numbers_as_int() -> None:
 
 def test_override_refuses_a_list_value_without_brackets() -> None:
     model = {'antisymmetric_hidden': [256, 128]}
-    with pytest.raises(ValueError, match='ngoặc vuông'):
+    with pytest.raises(ValueError, match='square brackets'):
         run_evaluator.apply_overrides(train_settings(),
                                       ['model.antisymmetric_hidden=256'], model)
     assert model['antisymmetric_hidden'] == [256, 128]
@@ -469,7 +469,7 @@ def test_override_refuses_a_list_of_names() -> None:
     """`heads` và `configurations` là danh sách tên: ghi đè chúng làm manifest nói sai."""
     settings = train_settings()
     settings['heads'] = ['direct', 'twin']
-    with pytest.raises(ValueError, match='list số'):
+    with pytest.raises(ValueError, match='lists of numbers'):
         run_evaluator.apply_overrides(settings, ['heads=[1]'])
     assert settings['heads'] == ['direct', 'twin']
 
@@ -925,3 +925,24 @@ def test_the_penalty_reaches_the_weights(monkeypatch: pytest.MonkeyPatch) -> Non
                           torch.nn.MSELoss(), 10, 0.0, np.random.default_rng(0), None,
                           0, None, False, 1, 1.0, second)
     assert second["antisymmetry_violation"] < first["antisymmetry_violation"]
+
+def test_the_run_stamp_carries_the_run_id() -> None:
+    """Review point of 2026-11-19: the timestamp is accurate only to the second, and every
+    mode writes into one shared runs/evaluator/. The run id is what makes a run's files its
+    own, so a second batch cannot overwrite them or be mistaken for them."""
+    from datetime import datetime
+
+    moment = datetime(2026, 11, 19, 8, 45, 0)
+    assert run_evaluator.run_stamp(moment, None) == "20261119_084500"
+    assert run_evaluator.run_stamp(moment, "") == "20261119_084500"
+    assert run_evaluator.run_stamp(moment, "t3a-5417") == "20261119_084500_t3a-5417"
+
+
+@pytest.mark.parametrize("bad", ("t3a 5417", "t3a/5417", "t3a_5417", "t3a.5417"))
+def test_a_run_id_that_would_change_the_file_name_is_refused(bad: str) -> None:
+    # The id goes into file names and the caller waits for THAT name, so an id that would
+    # have to be rewritten (or that would split the name) is refused instead.
+    from datetime import datetime
+
+    with pytest.raises(ValueError, match="letters, digits"):
+        run_evaluator.run_stamp(datetime(2026, 11, 19), bad)
