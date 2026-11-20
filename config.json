@@ -659,6 +659,19 @@
         "note": "enabled = false: mac dinh giu nguyen vong train cu de so sanh. Bat bang --sharpness on tren dong lenh (khong phai sua config) de chay ablation co / khong co so hang phat. Chi phi: moi batch can 3 luot forward thay vi 1 (luot goc, luot tinh gradient dau ra, luot tai diem bi lam nhieu omega + r * g2 / ||g2||), nen cham khoang 3 lan. HAI CHO LECH VOI BAI BAO, co y: (1) bai bao cap nhat omega bang gradient descent thuan, du an nay dung AdamW nhu cac lan train truoc de so sanh duoc; (2) gia thiet 1 cua bai bao can dau ra bi chan trong [0, 1], con nhan Delta p cua du an nay khong bi chan (khoang -10 den 10), nen phan ly thuyet (dinh ly 2) KHONG ap dung truc tiep; day la ly do phai do bang ablation chu khong tin ly thuyet. Keo theo: epsilon 0.1 cua bai bao do tren dau ra nam trong [0, 1], con do sac o day do tren thang Delta p (do lech chuan nhan khoang 0,88), nen epsilon 0.1 KHONG phai cung mot thang do; smoke 31/10/2026 do duoc do sac 0,11-0,14 nen lambda tang dan. Neu ablation cho ket qua xau thi phai quet lai epsilon theo thang Delta p truoc khi ket luan phuong phap khong hieu qua. Bai bao khong noi lambda co bi chan duoi 0 hay khong; code nay chan tai 0 vi dang Lagrange yeu cau lambda > 0."
       },
       "seed": 20261023,
+      "measure_train_metrics": false,
+      "measure_train_max_rows": 200000,
+      "measure_train_note": "Do MAE / pairwise phia TRAIN tai MOI moc do, bang dung ham evaluate va dung dinh nghia query nhu phia validation - nen hinh learning curve co hai duong CUNG MOT dai luong. Vi sao khong bat san: moi moc do phai chay them mot luot forward qua cac dong train dung de do. Tren PAIR75 (75.000 dong) la vai giay nen bat duoc; tren FULL (6.627.559 dong) thi khong, va do la ly do co tran measure_train_max_rows: vuot tran thi do tren mot mau ngau nhien CO DINH (seed cua lan chay), vi hai moc do tren hai mau khac nhau se cho duong cong train la nhieu lay mau chu khong phai tien trinh hoc. So dong thuc su da do duoc ghi vao manifest (train_measured_rows) va in tren hinh. train_loss KHONG thay the duoc phep do nay: no la muc tieu optimiser tren nhan da scale va con dropout.",
+      "wandb": {
+        "enabled": true,
+        "mode": "online",
+        "project": "molopt-stage3",
+        "dir": "",
+        "group": "",
+        "run_name": "",
+        "extra_environment": {}
+      },
+      "wandb_note": "Weights & Biases. 'online' (chosen 2026-11-20 by the project owner) uploads the metrics of every measurement and the run configuration to wandb.ai while the run proceeds, which is what makes the charts live; it needs `pip install wandb` and `wandb login` on the machine that trains. WHAT GOES UP: metrics, seed, learning rate, batch size, split FILE NAMES, row counts, configuration and head, the run name, and the W&B client version. No molecules, no labels, no SMILES, no data rows. W&B also collects host and hardware metadata of its own; the documented switches for code capture, git capture and console capture are forced off by progress.py (console capture would ship the training log and its absolute paths), but system metrics such as host name, GPU model and OS are NOT blocked and this is not pretended otherwise. 'offline' writes into wandb/ and sends nothing, but it has NO VIEWER - offline data becomes a chart only after `wandb sync`, which is itself an upload and needs an account. 'disabled', or enabled=false, keeps only progress_<stamp>.jsonl, which every figure of this project is drawn from anyway: scripts/plot_progress.py --watch gives a live figure with no account and no network. extra_environment adds any further WANDB_* variable without a code change. A missing wandb package, a missing login or a blocked network is a warning, never a failed run.",
       "dataloader_workers": 0,
       "device": "auto",
       "gpu_memory_limit_mib": 9216,

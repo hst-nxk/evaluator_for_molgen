@@ -434,10 +434,89 @@ def footnotes(manifests: Mapping[str, Mapping[str, Any] | None],
     return lines
 
 
-def tables(runs_dir: Path, pid: int, slice_name: str,
-           train_slice: str = "all") -> list[str]:
-    """Every table, in report order."""
+def discovered_table(manifests: Mapping[str, Mapping[str, Any] | None],
+                     tasks: tuple[tuple[str, str | None], ...], slice_name: str,
+                     train_slice: str) -> list[str]:
+    """One row per task this file has no fixed table for, read from its manifest.
+
+    WHY. The 2026-11-20 review ran nine simulated t9* runs through the real CLI: the
+    figures were drawn, the tables exited 0, and not one row of the nine appeared. Loading
+    a manifest is not tabulating it - every table in this file names its tasks, so a batch
+    that minted new names produced nothing and said nothing. This is the general row: it
+    reports whatever a train manifest can report without knowing what the task means.
+
+    The train column needs the task's `--mode eval --partition train` half and is checked
+    with `same_checkpoint`, the same rule the fixed tables use; without it the column is
+    `-` rather than the end of the last epoch, which is a different quantity.
+    """
+    rows = []
+    for task, half in tasks:
+        manifest = manifests.get(task)
+        if manifest is None:
+            rows.append((task, None, None, []))
+            continue
+        other = manifests.get(half) if half else None
+        problems = same_checkpoint(manifest, other) if other else ["no train half"]
+        rows.append((task, manifest, None if problems else other, problems))
+    if not any(manifest is not None for _, manifest, _, _ in rows):
+        return []
+
+    out = ["### Every run of this batch", "",
+           f"Read from the manifests themselves. Validation columns at the "
+           f"`{slice_name}` slice, train columns at `{train_slice}`.", "",
+           "| task | configuration | head | split | seed | train rows | "
+           f"val MAE | val pw-macro | train MAE | train pw-macro | note |",
+           "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for task, manifest, half, problems in rows:
+        if manifest is None:
+            out.append(f"| {task} | - | - | - | - | - | - | - | - | - | "
+                       f"no single manifest carries this run id |")
+            continue
+        regression, ranking = slice_scores(manifest.get("validation_metrics"), slice_name)
+        split = (manifest.get("partition_override_pairs")
+                 or manifest.get("train_subset") or "FULL")
+        note = []
+        if manifest.get("measure_train_metrics"):
+            note.append(f"train side measured at every point "
+                        f"({manifest.get('train_measured_rows')} rows)")
+        if problems:
+            note.append("; ".join(problems))
+        if half is None:
+            train_regression: Mapping[str, Any] = {}
+            train_ranking: Mapping[str, Any] = {}
+        else:
+            train_regression, train_ranking = slice_scores(
+                half.get("train_metrics") or half.get("validation_metrics"), train_slice)
+        out.append(
+            f"| {task} | {manifest.get('configuration', MISSING)} | "
+            f"{manifest.get('head', MISSING)} | {Path(str(split)).name} | "
+            f"{manifest.get('seed', MISSING)} | "
+            f"{(manifest.get('rows') or {}).get('train', MISSING)} | "
+            f"{fmt(regression.get('mae'))} | "
+            f"{fmt(ranking.get('pairwise_accuracy_macro'))} | "
+            f"{fmt(train_regression.get('mae'))} | "
+            f"{fmt(train_ranking.get('pairwise_accuracy_macro'))} | "
+            + ("; ".join(note) if note else "") + " |")
+    out += ["",
+            "This table knows nothing about what each task was for; it reports what the "
+            "manifest holds. A pair of runs is only a comparison if everything but the "
+            "one thing under test is equal in these columns - the split, the seed and the "
+            "configuration are printed so that can be checked by eye.",
+            ""]
+    return out
+
+
+def tables(runs_dir: Path, pid: int, slice_name: str, train_slice: str = "all",
+           extra_tasks: tuple[str, ...] = (),
+           discovered: tuple[tuple[str, str | None], ...] = ()) -> list[str]:
+    """Every table, in report order.
+
+    `extra_tasks` carries the task names read from the batch's own log, so a batch that
+    minted names this file has never heard of (the nine t9* runs of 2026-11-20) is
+    tabulated instead of producing a table of missing rows.
+    """
     tasks = (gate.CLASSICAL_TASKS + gate.TRAIN_TASKS + CAPACITY_TASKS + EVAL_TASKS)
+    tasks = tasks + tuple(task for task in extra_tasks if task not in tasks)
     manifests: dict[str, Mapping[str, Any] | None] = {}
     for task in tasks:
         found = gate.manifests_for(runs_dir, task, pid)
@@ -459,6 +538,11 @@ def tables(runs_dir: Path, pid: int, slice_name: str,
     lines += capacity_table(manifests)
     lines += protein_table(manifests, slice_name)
     lines += ablation_table(manifests.get("t1a"), manifests.get("t1b"), slice_name)
+    # Every task the log launched that no fixed table above covers. Without this the nine
+    # t9* runs produced figures and an empty report.
+    covered = set(gate.CLASSICAL_TASKS + gate.TRAIN_TASKS + CAPACITY_TASKS + EVAL_TASKS)
+    unknown = tuple((task, half) for task, half in discovered if task not in covered)
+    lines += discovered_table(manifests, unknown, slice_name, train_slice)
     lines += footnotes(manifests, slice_name, train_slice)
     return lines
 
@@ -487,6 +571,8 @@ def main(argv: list[str] | None = None) -> int:
         print("pass either the batch's log or --pid, not both and not neither",
               file=sys.stderr)
         return 2
+    extra: tuple[str, ...] = ()
+    pairs: tuple[tuple[str, str | None], ...] = ()
     if args.pid is not None:
         pid = args.pid
     else:
@@ -494,13 +580,20 @@ def main(argv: list[str] | None = None) -> int:
         if not log.is_file():
             print(f"{log} does not exist", file=sys.stderr)
             return 2
+        text = log.read_text(encoding="utf-8", errors="replace")
         try:
-            pid = gate.pid_from_log(log.read_text(encoding="utf-8", errors="replace"))
+            pid = gate.pid_from_log(text)
         except ValueError as error:
             print(str(error), file=sys.stderr)
             return 2
+        # The task names this batch actually used. Given --pid instead of a log there is
+        # nothing to read them from, and only the built-in lists are tabulated.
+        found = gate.tasks_from_log(text)
+        extra = tuple(task for pair in found for task in pair if task)
+        pairs = found
 
-    for line in tables(runs_dir, pid, args.slice, args.train_slice):
+    for line in tables(runs_dir, pid, args.slice, args.train_slice, extra_tasks=extra,
+                       discovered=pairs):
         print(line)
     return 0
 

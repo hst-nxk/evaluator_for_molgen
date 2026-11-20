@@ -32,7 +32,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from . import analysis, data, features, metrics, sharpness
+from . import analysis, data, features, metrics, progress, sharpness
 
 LOGGER = logging.getLogger(__name__)
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
@@ -1495,10 +1495,61 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
                     selection, selection_slice, f"{slice_rows[selection_slice]:,}",
                     f"{len(validation_arrays):,}")
     history: list[dict[str, Any]] = []
+    # Mỗi mốc đo được ghi ra file NGAY, không đợi manifest cuối: một lần chạy đang dở
+    # trước đây không công bố gì cả, nên không vẽ được và không đọc được hình dạng của nó
+    # ngoài cách cuộn log. Xem src/molopt/evaluator/progress.py.
+    stream = progress.ProgressStream.open(
+        runs_dir, stamp, config["stage3"]["train"].get("wandb"),
+        {"configuration": configuration, "head": head, "stamp": stamp,
+         "selection_metric": selection, "selection_slice": selection_slice,
+         "epochs": epochs, "batch_size": batch_size,
+         "learning_rate": float(settings["learning_rate"]),
+         "weight_decay": float(settings["weight_decay"]),
+         "seed": int(settings["seed"]),
+         "train_rows": len(train_arrays_fit), "validation_rows": len(validation_arrays),
+         # CHI TEN FILE. Hai truong nay la duong dan, va wandb online nhan nguyen chuoi
+         # duoc truyen vao: ai chay bang duong dan tuyet doi thi cay thu muc cua may
+         # (ten nguoi dung, ten du an) se len mang. Ten file la tat ca nhung gi mot bieu
+         # do can de biet nó la split nao.
+         "partition_override_pairs": progress.file_name(
+             config["stage3"]["inputs"].get("partition_override_pairs")),
+         "train_subset": progress.file_name(
+             config["stage3"]["inputs"].get("train_subset")),
+         "protein_permute_seed": int(settings.get("protein_permute_seed",
+                                                  PROTEIN_PERMUTE_OFF))})
     best_score = math.inf
     best_point = -1
     since_best = 0
     started = time.perf_counter()
+
+    # Các dòng train dùng để ĐO (không phải để học) tại mỗi mốc: cố định một lần, bằng
+    # seed của lần chạy, nên mọi mốc đo trên đúng cùng một tập dòng - hai mốc đo trên hai
+    # mẫu khác nhau thì đường cong train là nhiễu lấy mẫu chứ không phải tiến trình học.
+    # Trần số dòng là bắt buộc: PAIR75 có 75.000 dòng (vài giây), FULL có 6,6 triệu.
+    measure_train = bool(settings.get("measure_train_metrics", False))
+    measure_rows: np.ndarray | None = None
+    if measure_train:
+        cap = int(settings.get("measure_train_max_rows", 200000) or 0)
+        if 0 < cap < len(train_arrays_fit):
+            measure_rows = np.sort(np.random.default_rng(int(settings["seed"]))
+                                   .permutation(len(train_arrays_fit))[:cap])
+            LOGGER.info("đo phía train tại mỗi mốc: %s dòng lấy mẫu từ %s (trần %s, "
+                        "seed %s)", f"{measure_rows.size:,}",
+                        f"{len(train_arrays_fit):,}", f"{cap:,}", settings["seed"])
+        else:
+            LOGGER.info("đo phía train tại mỗi mốc: toàn bộ %s dòng",
+                        f"{len(train_arrays_fit):,}")
+    # `train_arrays`, KHONG phai `train_arrays_fit`. Hai mang chi khac nhau o cot target:
+    # ban _fit co nhan DA SCALE vi do la thu optimiser hoc, con `predict` tra du doan o
+    # don vi dp GOC (no tu nghich dao scaler). Lay ban _fit thi MAE phia train la hieu cua
+    # hai don vi khac nhau - review 20/11 do duoc 0,9291 (train) so voi 0,8299
+    # (validation) voi zscore, mot "khoang cach train-validation" hoan toan do loi don vi.
+    # Phia validation von luon dung mang chua scale, nen day la cung mot quy uoc.
+    measure_arrays = (train_arrays if measure_rows is None
+                      else data.take_rows(train_arrays, measure_rows))
+    measure_keys = (train_keys if measure_rows is None
+                    else {name: column[measure_rows]
+                          for name, column in train_keys.items()})
 
     def consider(epoch: int, step: int | None, train_loss: float | None) -> bool:
         """Đo validation tại một mốc, lưu checkpoint nếu tốt nhất; True = dừng sớm.
@@ -1523,9 +1574,20 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
             record["validation_selection"] = scores[selection_slice]
         if train_loss is not None:
             record["train_loss"] = train_loss
+        if measure_train:
+            # Cùng hàm evaluate, cùng lát cắt, cùng định nghĩa query như phía validation,
+            # nên hai đường trên hình là CÙNG một đại lượng. `train_loss` thì không: nó là
+            # mục tiêu optimiser trên nhãn đã scale và còn dropout.
+            record["train"] = evaluate(
+                measure_arrays,
+                predict(model, measure_arrays, caches, protein_source, device,
+                        eval_batch_size, scaler),
+                measure_keys, config)["all"]
+            record["train_measured_rows"] = len(measure_arrays)
         if penalty is not None:
             record["sharpness"] = penalty.state()
         history.append(record)
+        stream.record(record)
         for line in metrics.format_metrics(f"{label} validation",
                                            scores["all"]["regression"],
                                            scores["all"].get("ranking"),
@@ -1682,6 +1744,8 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "best_step": None if best_point < 0 else history[best_point]["step"],
         "selection_metric": selection,
         "selection_slice": selection_slice,
+        "measure_train_metrics": measure_train,
+        "train_measured_rows": len(measure_arrays) if measure_train else None,
         "selection_slice_rows": slice_rows[selection_slice],
         "best_validation_mae": None if best_point < 0 else
         history[best_point]["validation"]["regression"]["mae"],
@@ -1692,6 +1756,9 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         "gpu_peak_reserved_mib": peak_gpu_memory_mib(device),
     }
     LOGGER.info("VRAM cao nhất PyTorch đã giữ: %s MiB", manifest["gpu_peak_reserved_mib"])
+    if stream.path is not None:
+        manifest["progress_stream"] = str(stream.path)
+    stream.close()
     path = runs_dir / f"{manifest['mode']}_{configuration}_{head}_{stamp}.json"
     path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     LOGGER.info("manifest lần chạy: %s", path)

@@ -462,3 +462,54 @@ def test_a_run_id_or_a_checkpoint_path_are_both_accepted() -> None:
 def test_the_batch_takes_the_gpu_lock() -> None:
     assert 'source "$ROOT/scripts/gpu_batch_lock.sh"' in SCRIPT
     assert 'claim_gpu "$GPU" "$ROOT/.cache" "seen_molecules_2011"' in SCRIPT
+
+# ------------------------------------------- fingerprint (review 20/11, lượt hai)
+def row_table(**columns: Any) -> Any:
+    """Một bảng dòng tối thiểu, đủ các cột khóa."""
+    base = {"pair_id": ["p1", "p2", "p3"],
+            "protein_hash": ["h1", "h1", "h2"],
+            "smiles_a": ["CCO", "CCC", "CCN"],
+            "smiles_b": ["CCF", "CCBr", "CCI"],
+            "endpoint": ["Ki", "Ki", "IC50"]}
+    base.update(columns)
+    return pa.table(base)
+
+
+def test_changing_the_protein_changes_the_fingerprint() -> None:
+    """Chính ca review tái hiện: đổi `protein_hash` và `pair_id`, giữ SMILES + endpoint,
+    và bản cũ trả về CÙNG fingerprint.
+
+    Đây là lỗi có ý nghĩa vì protein tham gia khóa query của pairwise macro: cùng phân tử
+    trên protein khác là một phép đo khác hoàn toàn.
+    """
+    first, _ = seen.fingerprint(row_table())
+    second, _ = seen.fingerprint(row_table(protein_hash=["h9", "h9", "h8"],
+                                             pair_id=["q1", "q2", "q3"]))
+    assert first != second
+
+
+def test_changing_only_the_pair_id_changes_the_fingerprint() -> None:
+    first, _ = seen.fingerprint(row_table())
+    second, _ = seen.fingerprint(row_table(pair_id=["z1", "z2", "z3"]))
+    assert first != second
+
+
+def test_the_row_order_does_not_change_the_fingerprint() -> None:
+    # Cùng tập dòng, thứ tự khác, phải cùng digest - nếu không thì mọi so sánh đều vô ích.
+    first, _ = seen.fingerprint(row_table())
+    second, _ = seen.fingerprint(row_table(
+        pair_id=["p3", "p2", "p1"], protein_hash=["h2", "h1", "h1"],
+        smiles_a=["CCN", "CCC", "CCO"], smiles_b=["CCI", "CCBr", "CCF"],
+        endpoint=["IC50", "Ki", "Ki"]))
+    assert first == second
+
+
+def test_the_columns_behind_the_digest_are_reported() -> None:
+    """Dump cũ thiếu một cột khóa thì fingerprint YẾU HƠN, và phải nói ra cột nào đã dùng -
+    hai digest chỉ so được với nhau khi lấy trên cùng bộ cột."""
+    _, columns = seen.fingerprint(row_table())
+    assert columns == "pair_id,protein_hash,smiles_a,smiles_b,endpoint"
+    weak = pa.table({"smiles_a": ["CCO"], "smiles_b": ["CCF"], "endpoint": ["Ki"]})
+    digest, weak_columns = seen.fingerprint(weak)
+    assert weak_columns == "smiles_a,smiles_b,endpoint"
+    assert digest != seen.fingerprint(row_table())[0]

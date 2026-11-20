@@ -951,7 +951,117 @@ Checkpoints trained before 2026-11-19 do not carry them; for those the window **
 checked, so loading one logs a warning that names both numbers instead of letting the reader
 assume they matched. The frozen tasks of 2026-11-19 never go through this branch.
 
-## 4.10 Scoring the classical baselines on the seen/unseen groups
+## 4.10 A figure for every result, and a stream to draw it from
+
+The 2026-11-18 meeting asked about train against validation and a table of final numbers
+could not answer it: whether a number is the top of a curve or a point on a plateau, and
+how far train sits above validation, are properties of the shape. From 2026-11-20 every
+result that has a train side and a validation side gets a figure of both.
+
+**The progress stream.** A training run used to publish nothing until it finished - the
+manifest, with its whole `history`, is written at the end, and everything in between lived
+only in the log as prose. `src/molopt/evaluator/progress.py` now writes one JSON line per
+measurement and flushes it, to `runs/evaluator/progress_<stamp>.jsonl`, so the file is
+complete up to the last measurement at every instant: `tail -5` of it carries the numbers
+a page of log carries, and a figure can be drawn while the run continues. The manifest
+records the stream's path under `progress_stream`.
+
+Nothing in that module may take a run down. Every failure - the directory, the file, the
+import, the W&B handshake - is caught, warned about once, and the run continues. A
+measurement that was not recorded is a lost figure; a measurement that raised would be a
+lost GPU batch.
+
+A measured train side is only the train side if it is in the SAME UNITS. The first
+version measured over `train_arrays_fit`, whose target column is the SCALED label the
+optimiser learns, while `predict` returns Δp in original units because it inverts the
+scaler itself - so with `label_normalization=zscore` the "train MAE" was a difference
+between two different units, 0.9291 against a validation 0.8299, a train-validation gap
+made entirely of the mistake. The measurement reads `train_arrays`, the same convention
+the validation side has always used, and a test asserts on the target column that
+`evaluate` is actually handed.
+
+On a split keyed by pair, the strict slice of the TRAIN partition is empty by
+construction, so the two sides of a gap figure are read at different slices - train at
+`all`, validation at `strict`. Both slices are printed on the bars themselves, not only in
+the caption.
+
+### 4.13 Two lines of the same metric
+
+`train_loss` is not the train side of a validation metric. It is the optimiser's objective
+on scaled labels and under dropout, so a figure that puts it beside validation MAE invites
+a comparison that is not valid - which is exactly what a train-versus-validation figure was
+asked for.
+
+`stage3.train.measure_train_metrics` closes that. When it is on, every measurement runs
+`evaluate` over the training rows as well, with the same slices and the same query
+definition as the validation side, and the record carries a `train` block of the same
+shape. `plot_train_validation.py` then draws two lines of ONE quantity per panel, and the
+caption states how many training rows stood behind the train line. When it is off, the
+caption says so, because a single-line figure with no note reads as "no overfitting here".
+
+It is off by default because each measurement costs one more forward pass over the
+measured rows. On PAIR75 (75,000 rows) and SUB100 (~100,000) that is seconds; on FULL
+(6,627,559) it is not, which is why `measure_train_max_rows` (200,000) caps it. Above the
+cap the rows are a random sample drawn ONCE from the run's own seed, never re-drawn per
+measurement: two measurements over two different samples would make the train curve
+sampling noise rather than learning. The number of rows actually measured goes into the
+manifest as `train_measured_rows` and onto the figure.
+
+**Weights & Biases is online**, by the project owner's decision of 2026-11-20, and
+`stage3.train.wandb.mode` is the only place that changes. Setup on a machine that trains:
+
+```bash
+python -m pip install wandb && wandb login
+```
+
+What goes up while the run proceeds: the metrics of every measurement, the run
+configuration this module is handed (seed, learning rate, batch size, split **file names**,
+row counts, configuration and head), the run name, and the W&B client version. **No
+molecules, no labels, no SMILES, no data rows.** W&B also collects host and hardware
+metadata of its own; the documented switches for code capture, git capture and console
+capture are forced off in every mode - console capture would otherwise ship the training
+log with its absolute paths - while **system metrics such as host name, GPU model and OS
+are not blocked**, and this is stated rather than glossed over. `extra_environment` in the
+config takes any further `WANDB_*` variable without a code change.
+
+Every task of one batch lands in one W&B group: a stamp is `<date>_<time>_<task>-<pid>`
+because the batch passes `--run-id`, so the pid is what the tasks share, and `batch-<pid>`
+becomes the group unless the config names one.
+
+The other two modes. `"offline"` writes into `wandb/` and sends nothing, but it has **no
+viewer**: offline data becomes a chart only after `wandb sync`, which is itself an upload
+and needs an account, so it is a staging step and not a way to see anything. `"disabled"`,
+or `enabled: false`, keeps the stream alone - and `plot_progress.py --watch` already gives
+a live figure with no account and no network, which is the path to take if W&B is ever
+unwanted. A missing package, a missing `wandb login` or a blocked network is a warning
+that names the fix, never a failed run.
+
+**The figures.**
+
+| script | from | what it shows |
+|---|---|---|
+| `plot_progress.py` | `progress_*.jsonl` | a run IN FLIGHT; `--watch N` redraws every N seconds |
+| `plot_train_validation.py curve` | a train manifest | validation at every measurement, with the selected point marked |
+| `plot_train_validation.py gap` | a train manifest + its `--mode eval --partition train` half | train against validation at the selected checkpoint, gap written on the figure |
+| `plot_train_validation.py classical` | a classical manifest | train against validation per baseline, at the alpha the run selected |
+| `figures_for_batch.py` | a batch log | all of the above for one batch, and it NAMES every result that has no figure |
+
+Two things these figures deliberately do not do. **Train loss never shares an axis with
+validation MAE**: it is the optimiser's objective on scaled labels and under dropout, not
+the same quantity, and putting them together invites exactly the misreading the figure
+exists to prevent - so it gets its own panel and the caption says why. And **a figure of
+an unfinished run marks no selection**: the best measurement so far is annotated, the
+caption says the run may still move past it, and the figure to quote is the one drawn from
+the manifest.
+
+The limitation to know when reading a curve: a run records `train_loss` once per epoch and
+validation metrics at every measurement, but **no train MAE or train pairwise accuracy per
+measurement**, so a two-line curve of the same metric over time cannot be drawn from
+existing manifests. Measuring the train partition at every measurement point is what would
+turn that panel into a second line; it costs one forward pass over the training rows per
+measurement, which is affordable on PAIR75 and SUB100 and not on FULL.
+
+## 4.11 Scoring the classical baselines on the seen/unseen groups
 
 `scripts/classical_row_dump.py` plus `scripts/server_run_classical_seen_2011.sh`.
 
@@ -984,7 +1094,7 @@ of the split and not of the model, so the MLP run's train dump serves every base
 CPU only, no GPU lock, so it can run beside a training batch; the feature matrix is the
 memory high-water mark.
 
-## 4.11 `queries_ranked` is not the macro's denominator
+## 4.12 `queries_ranked` is not the macro's denominator
 
 `metrics.ranking_report` counts a query into `queries_ranked` as soon as it clears
 `min_candidates`. The macro averages a **subset** of those: a query whose candidates all

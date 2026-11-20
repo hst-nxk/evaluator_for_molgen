@@ -216,3 +216,77 @@ def test_the_manifest_records_the_subset_and_the_split_in_use(loop: dict[str, An
     manifest = run(loop, models.HEAD_DIRECT)
     assert manifest["train_subset"] == "work/splits/x.parquet"
     assert manifest["partition_override"] == ""
+
+
+# ------------------------------------------------- đo phía train tại mỗi mốc (20/11/2026)
+# Vì sao: trong họp bị hỏi hình train-vs-validation, mà manifest chỉ có `train_loss` -
+# mục tiêu optimiser trên nhãn ĐÃ SCALE và còn dropout, nên không cùng đại lượng với
+# validation MAE. `measure_train_metrics` đo đúng cùng một thứ ở cả hai phía.
+def test_the_train_side_is_measured_at_every_point(loop: dict[str, Any]) -> None:
+    manifest = run(loop, "direct", measure_train_metrics=True)
+    assert manifest["measure_train_metrics"] is True
+    assert manifest["train_measured_rows"] == ROWS
+    history = manifest["history"]
+    assert history, "không có mốc đo nào"
+    for record in history:
+        # Cùng cấu trúc với phía validation, nên hình vẽ được hai đường cùng metric.
+        assert record["train"]["regression"]["mae"] is not None
+        assert record["train"]["ranking"]["pairwise_accuracy_macro"] is not None
+        assert record["train_measured_rows"] == ROWS
+
+
+def test_nothing_is_measured_when_the_flag_is_off(loop: dict[str, Any]) -> None:
+    # Mặc định phải tắt: mỗi mốc đo là một lượt forward thêm, trên FULL (6.627.559 dòng)
+    # thì không trả được.
+    manifest = run(loop, "direct", measure_train_metrics=False)
+    assert manifest["measure_train_metrics"] is False
+    assert manifest["train_measured_rows"] is None
+    assert all("train" not in record for record in manifest["history"])
+
+
+def test_the_measured_rows_are_capped_and_the_same_at_every_point(
+        loop: dict[str, Any]) -> None:
+    """Trần là bắt buộc, và mẫu phải CỐ ĐỊNH.
+
+    Hai mốc đo trên hai mẫu khác nhau thì đường cong phía train là nhiễu lấy mẫu chứ
+    không phải tiến trình học. Mẫu lấy theo seed của lần chạy nên lặp lại được.
+    """
+    cap = max(2, ROWS // 2)
+    manifest = run(loop, "direct", measure_train_metrics=True,
+                   measure_train_max_rows=cap)
+    assert manifest["train_measured_rows"] == cap
+    assert {record["train_measured_rows"] for record in manifest["history"]} == {cap}
+    again = run(loop, "direct", measure_train_metrics=True, measure_train_max_rows=cap)
+    assert (again["history"][0]["train"]["regression"]["mae"]
+            == manifest["history"][0]["train"]["regression"]["mae"])
+
+def test_the_train_side_is_measured_in_original_units(loop: dict[str, Any],
+                                                      monkeypatch) -> None:
+    """Review 20/11: bản đầu đo trên `train_arrays_fit`, tức nhãn ĐÃ SCALE.
+
+    `predict` trả dự đoán ở đơn vị Δp gốc (nó tự nghịch đảo scaler), nên lấy mảng _fit thì
+    MAE phía train là hiệu của hai đơn vị khác nhau - review đo được 0,9291 (train) so với
+    0,8299 (validation) với zscore, một "khoảng cách train-validation" hoàn toàn do lỗi
+    đơn vị. Test bắt chính cột target được truyền vào `evaluate`.
+    """
+    seen: list[np.ndarray] = []
+    original = train.evaluate
+
+    def spy(arrays, prediction, keys, config):
+        seen.append(np.asarray(arrays.target, dtype=np.float64).copy())
+        return original(arrays, prediction, keys, config)
+
+    monkeypatch.setattr(train, "evaluate", spy)
+    manifest = run(loop, "direct", measure_train_metrics=True,
+                   label_normalization="zscore")
+    assert manifest["label_scaler"]["name"] == "zscore"
+    assert manifest["label_scaler"]["scale"] != 1.0
+    truth = np.asarray(loop["arrays"].target, dtype=np.float64)
+    # Mọi lần gọi evaluate phải thấy nhãn ở đơn vị gốc - cả phía validation lẫn phía
+    # train. Nhãn đã scale có độ lệch chuẩn ~1; nhãn gốc thì không.
+    for target in seen:
+        if target.size != truth.size:
+            continue
+        assert float(np.abs(target).max()) == pytest.approx(
+            float(np.abs(truth).max()), rel=1e-6), (
+            "evaluate nhận nhãn đã scale: MAE sẽ ở đơn vị sai")

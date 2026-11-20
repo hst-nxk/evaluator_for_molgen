@@ -408,3 +408,74 @@ def test_the_cli_reads_the_pid_out_of_the_log(runs: Path, tmp_path: Path,
                    encoding="utf-8")
     assert tables.main([str(runs), str(log)]) == 0
     assert f"batch pid {PID}" in capsys.readouterr().out
+
+# ------------------------------------------- bảng cho task log phát hiện (review 20/11)
+def discovered_manifest(task: str, seed: int, **changes: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "stage": "stage3_train", "mode": "train", "configuration": "frozen",
+        "head": "direct", "seed": seed,
+        "selection_metric": "pairwise_accuracy_macro", "selection_slice": "strict",
+        "partition_override_pairs": "work/splits/pair_split_1411.parquet",
+        "rows": {"train": 75000, "validation": 24946},
+        "measure_train_metrics": True, "train_measured_rows": 75000,
+        "checkpoint": f"runs/evaluator/best_{task}.pt",
+        "validation_metrics": {
+            "all": {"regression": {"mae": 0.5144}, "ranking": {}},
+            "strict": {"regression": {"mae": 0.5144},
+                       "ranking": {"pairwise_accuracy_macro": 0.7778}}},
+        "history": [{"epoch": 0, "step": None}]}
+    payload.update(changes)
+    return payload
+
+
+def test_every_discovered_task_gets_a_row() -> None:
+    """Review 20/11 lượt hai: chín lượt t9* vẽ được 18 hình, trình lập bảng thoát 0 và
+    KHÔNG có dòng nào của chín task. Nạp manifest không phải là lập bảng.
+    """
+    tasks = tuple((f"t9{letter}{index}", None)
+                  for letter in "abc" for index in (1, 2, 3))
+    manifests = {task: discovered_manifest(task, 20261023 + number % 3)
+                 for number, (task, _) in enumerate(tasks)}
+    out = "\n".join(tables.discovered_table(manifests, tasks, "strict", "all"))
+    for task, _ in tasks:
+        assert f"| {task} |" in out, task
+    assert "0.7778" in out
+    assert "20261023" in out
+
+
+def test_a_discovered_task_with_no_manifest_says_so() -> None:
+    tasks = (("t9a1", None),)
+    out = "\n".join(tables.discovered_table({"t9a1": None, "t9b1":
+                                             discovered_manifest("t9b1", 1)},
+                                            (("t9a1", None), ("t9b1", None)),
+                                            "strict", "all"))
+    assert "no single manifest carries this run id" in out
+
+
+def test_the_train_columns_need_the_matching_eval_half() -> None:
+    """Nửa train phải là CÙNG checkpoint - nếu không thì cột train là một đại lượng khác,
+    và để trống còn tốt hơn là lấp bằng số của cuối epoch cuối."""
+    train = discovered_manifest("t9a1", 20261023)
+    other = {"stage": "stage3_eval", "partition": "train",
+             "checkpoint": "runs/evaluator/best_SOMETHING_ELSE.pt",
+             "train_metrics": {"all": {"regression": {"mae": 0.3698},
+                                       "ranking": {"pairwise_accuracy_macro": 0.8425}}}}
+    out = "\n".join(tables.discovered_table({"t9a1": train, "t9a1-eval": other},
+                                            (("t9a1", "t9a1-eval"),), "strict", "all"))
+    assert "different checkpoints" in out
+    assert "0.8425" not in out
+
+
+def test_the_matching_eval_half_fills_the_train_columns() -> None:
+    train = discovered_manifest("t9a1", 20261023)
+    other = {"stage": "stage3_eval", "partition": "train",
+             "checkpoint": "runs/evaluator/best_t9a1.pt",
+             "train_metrics": {"all": {"regression": {"mae": 0.3698},
+                                       "ranking": {"pairwise_accuracy_macro": 0.8425}}}}
+    out = "\n".join(tables.discovered_table({"t9a1": train, "t9a1-eval": other},
+                                            (("t9a1", "t9a1-eval"),), "strict", "all"))
+    assert "0.8425" in out and "0.3698" in out
+
+
+def test_nothing_is_printed_when_no_task_was_discovered() -> None:
+    assert tables.discovered_table({}, (), "strict", "all") == []

@@ -288,3 +288,35 @@ def test_an_unreadable_manifest_is_a_failure_not_a_crash(tmp_path: Path) -> None
     good, lines = checker.check(tmp_path, PID)
     assert not good
     assert any("cannot be read as JSON" in line for line in lines)
+
+# ------------------------------------------- tìm task từ log (review 20/11)
+LAUNCHES = """+ python run_evaluator.py --mode train --run-id t9a1-4242 --config frozen
++ python run_evaluator.py --mode eval --run-id t9a1-eval-4242 --checkpoint a --partition train
++ python run_evaluator.py --mode train --run-id t9b1-4242 --config no_protein
++ python run_evaluator.py --mode errors --run-id t7s1-4242 --partition validation
++ python run_evaluator.py --mode eval --run-id t9zz-eval-4242 --partition validation
+"""
+
+
+def test_the_tasks_of_a_batch_are_read_from_its_log() -> None:
+    """Danh sách task từng là hằng số trong file, nên một batch đặt tên mới (chín lượt
+    t9* ngày 20/11) sinh ra manifest đúng rồi vẽ được 0 hình và lập bảng toàn dòng thiếu.
+    Log là chỗ duy nhất không thể lệch khỏi thứ đã chạy.
+    """
+    assert checker.tasks_from_log(LAUNCHES) == (("t9a1", "t9a1-eval"), ("t9b1", None))
+
+
+def test_an_errors_task_is_not_listed_as_a_figure_task() -> None:
+    # `--mode errors` ghi row dump, không ghi train manifest; liệt kê nó vào đây thì mỗi
+    # lần chạy đều có nó trong mục "NO figure", và người đọc sẽ học cách bỏ qua mục đó.
+    assert all(task != "t7s1" for task, _ in checker.tasks_from_log(LAUNCHES))
+
+
+def test_an_eval_of_validation_is_not_a_train_half() -> None:
+    # Nửa train phải là `--mode eval --partition train`; nửa validation không phải.
+    assert all(half != "t9zz-eval" for _, half in checker.tasks_from_log(LAUNCHES))
+
+
+def test_a_log_with_no_training_run_yields_nothing() -> None:
+    assert checker.tasks_from_log("+ python run_evaluator.py --mode classical "
+                               "--run-id t1a-7-7") == ()

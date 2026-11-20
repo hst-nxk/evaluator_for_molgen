@@ -55,6 +55,7 @@ next to the scores rather than leaving to the reader's imagination.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -417,6 +418,103 @@ def lines(report: dict[str, Any]) -> list[str]:
     return out
 
 
+# Every column that identifies a validation row. `pair_id` is the row's own identity and
+# `protein_hash` is part of the query key the pairwise macro groups on, so leaving either
+# out lets two genuinely different row sets share a digest: the 2026-11-20 review changed
+# both and got the same fingerprint back. The two SMILES and the endpoint stay because a
+# dump written before pair_id was recorded still has them.
+ROW_KEY = ("pair_id", "protein_hash", "smiles_a", "smiles_b", "endpoint")
+
+
+def fingerprint(table: Any) -> tuple[str, str]:
+    """(digest of WHICH ROWS this is, the columns it was taken over).
+
+    Averaging over seeds requires that every report scored the same validation rows. The
+    row COUNT does not establish that - two different slices of two different splits can
+    have the same count - and the row keys have to include the protein: the pairwise macro
+    groups queries by (reference molecule, PROTEIN, endpoint), so a dump with the same
+    molecules against different proteins is a different measurement entirely.
+
+    The columns actually used are returned beside the digest, because a dump that predates
+    one of them yields a weaker fingerprint and the report must say which.
+    """
+    present = [name for name in ROW_KEY if name in table.column_names]
+    columns = [table.column(name).to_pylist() for name in present]
+    keys = sorted(zip(*columns)) if columns else []
+    digest = hashlib.sha256()
+    digest.update(("|".join(present) + "\n").encode("utf-8"))
+    for key in keys:
+        digest.update(("\t".join(str(part) for part in key) + "\n").encode("utf-8"))
+    return digest.hexdigest()[:32], ",".join(present)
+
+
+def dump_report(folder: Path) -> dict[str, Any]:
+    path = folder / REPORT_FILE
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def seed_of(checkpoint: str, runs_dir: Path) -> Any:
+    """The SEED of the run that wrote this checkpoint, from its train manifest, or None.
+
+    Two checkpoint files with different names can hold the same seed - a rerun, a copy, a
+    second scoring of one run - and the 2026-11-20 review got such a pair accepted as two
+    seeds. The seed is not in the checkpoint's name and not in the dump, so it is read
+    from the train manifest that recorded this checkpoint path.
+    """
+    wanted = Path(checkpoint).name
+    if not wanted or not runs_dir.is_dir():
+        return None
+    for path in sorted(runs_dir.glob("train_*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if Path(str(payload.get("checkpoint") or "")).name == wanted:
+            return payload.get("seed")
+    return None
+
+
+def provenance(folder: Path) -> dict[str, Any]:
+    """WHICH RUN produced a dump, in whatever terms that kind of run has.
+
+    An MLP dump names a `.pt` checkpoint. A classical dump has no checkpoint at all: it
+    names the manifest it refit from, the model and the selected alpha
+    (scripts/classical_row_dump.py). The 2026-11-20 review found the across-seed CLI
+    demanding a checkpoint of both and so refusing every real lasso baseline, while its
+    own test passed on a fixture that had invented one. `identity` is the field to compare;
+    it is built from whichever terms exist.
+    """
+    report = dump_report(folder)
+    checkpoint = str(report.get("checkpoint") or "")
+    model = str(report.get("model") or "")
+    source = str(report.get("source_manifest") or "")
+    alpha = report.get("alpha")
+    found: dict[str, Any] = {"validation_checkpoint": checkpoint,
+                             "validation_model": model,
+                             "validation_source_manifest": source,
+                             "validation_alpha": alpha,
+                             "validation_seed": report.get("seed")}
+    if checkpoint:
+        found["identity"] = f"checkpoint:{Path(checkpoint).name}"
+        found["kind"] = "mlp"
+        if found["validation_seed"] is None:
+            found["validation_seed"] = seed_of(checkpoint, folder.parent)
+    elif source and model:
+        label = str(report.get("label") or model)
+        found["identity"] = f"classical:{Path(source).name}#{label}@{alpha}"
+        found["kind"] = "classical"
+    else:
+        found["identity"] = ""
+        found["kind"] = "unknown"
+    return found
+
+
 def build(train_folder: Path, validation_folder: Path, slice_name: str, label: str
           ) -> dict[str, Any]:
     """The whole report, from two `--mode errors` dumps of the SAME checkpoint."""
@@ -436,6 +534,7 @@ def build(train_folder: Path, validation_folder: Path, slice_name: str, label: s
     seen = np.array([int(a in molecules) + int(b in molecules)
                      for a, b in zip(first, second)], dtype=np.int64)
 
+    validation_digest, digest_columns = fingerprint(validation_table)
     tolerance = direction_tolerance(validation_folder)
     needed, needed_source = min_candidates(validation_folder)
     by_query, overall = query_table(validation_table, molecules, tolerance, needed)
@@ -447,6 +546,11 @@ def build(train_folder: Path, validation_folder: Path, slice_name: str, label: s
             "train_molecules": len(molecules),
             "direction_tolerance": tolerance, "min_candidates": needed,
             "min_candidates_source": needed_source,
+            # These exist only so a sweep over seeds can be PROVED to be one: the rows
+            # must be identical and the runs must not be.
+            "validation_fingerprint": validation_digest,
+            "validation_fingerprint_columns": digest_columns,
+            **provenance(validation_folder),
             "by_row": row_groups(validation_table, seen),
             "by_seen_macro": by_seen,
             "by_query": by_query, "overall": overall,

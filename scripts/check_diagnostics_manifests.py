@@ -79,6 +79,41 @@ def pid_from_log(text: str) -> int:
     return found.pop()
 
 
+def tasks_from_log(text: str) -> tuple[tuple[str, str | None], ...]:
+    """Every (train task, its eval-on-train task) a log actually launched, in order.
+
+    WHY THIS IS NOT A CONSTANT. The task names were hard-coded (t3a..t3d, t5r*, t5s*), so
+    a batch that minted new names produced a correct set of manifests and then zero
+    figures and a table of missing rows - the 2026-11-20 review caught exactly that for
+    the nine t9* runs. The log already names every task, in the only place that cannot
+    drift from what ran: the `--run-id` of the command itself.
+
+    A task ending in `-eval` is attached to the task it scores rather than listed as one
+    of its own, which is the shape the figure code wants: the eval half is what makes a
+    train-versus-validation figure possible, and its absence is reported, not fatal.
+    """
+    trains: list[str] = []
+    halves: set[str] = set()
+    for line in text.splitlines():
+        found = RUN_ID.search(line)
+        if found is None:
+            continue
+        task = found.group(1)
+        # Mode-aware on purpose: a `--mode errors` task writes a row dump, not a train
+        # manifest, so listing it here would put it in the "NO figure" report every time
+        # and train the reader to ignore that list.
+        if "--mode train" in line:
+            if task not in trains:
+                trains.append(task)
+        elif "--mode eval" in line and "--partition train" in line:
+            halves.add(task)
+    pairs = []
+    for task in trains:
+        candidate = f"{task}-eval"
+        pairs.append((task, candidate if candidate in halves else None))
+    return tuple(pairs)
+
+
 def manifests_for(runs_dir: Path, task: str, pid: int) -> list[Path]:
     """Every manifest written by one task of one batch, by its run-id suffix."""
     return sorted(runs_dir.glob(f"*_{task}-{pid}.json"))
