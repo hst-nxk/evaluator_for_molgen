@@ -951,6 +951,21 @@ Checkpoints trained before 2026-11-19 do not carry them; for those the window **
 checked, so loading one logs a warning that names both numbers instead of letting the reader
 assume they matched. The frozen tasks of 2026-11-19 never go through this branch.
 
+## 4.10 `queries_ranked` is not the macro's denominator
+
+`metrics.ranking_report` counts a query into `queries_ranked` as soon as it clears
+`min_candidates`. The macro averages a **subset** of those: a query whose candidates all
+sit within `direction_tolerance` of each other yields no counted comparison, so it
+contributes no term - yet it is still counted as ranked. On t3a (PAIR75, 2026-11-20) the
+two numbers differ by a third: **5,645 queries cleared the bar, 3,892 entered the macro**
+- 9.1 % of the 42,777 queries, not 13.2 %. The gap was found by the reconstruction in
+`seen_molecules.py`, which reports the two counts separately.
+
+From 2026-11-20 the metric records `pairwise_accuracy_queries`, the real denominator, and
+`diagnostics_tables.py` quotes that one. A manifest written before that date does not
+carry the field; the footnote then states that the share it prints is an **upper bound**
+on the macro's denominator instead of implying the two sets are the same.
+
 ## 5. Ba cấu hình
 
 | cấu hình | nhánh protein | mục đích |

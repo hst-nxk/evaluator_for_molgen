@@ -24,11 +24,17 @@ PID = 4174688
 
 
 def scores(mae: float, r2: float, pairwise: float, rows: int = 100,
-           ranked: int = 50, total: int = 100) -> dict:
+           ranked: int = 50, total: int = 100, counted: int | None = None) -> dict:
+    """One slice of a manifest. `counted` is `pairwise_accuracy_queries`, the macro's own
+    denominator, which the metric records from 2026-11-20 on; None leaves it out, the way
+    an older manifest is."""
+    ranking = {"pairwise_accuracy_macro": pairwise,
+               "pairwise_accuracy_micro": pairwise,
+               "queries_ranked": ranked, "queries_total": total}
+    if counted is not None:
+        ranking["pairwise_accuracy_queries"] = counted
     return {"regression": {"n": rows, "mae": mae, "r2": r2, "spearman": 0.4},
-            "ranking": {"pairwise_accuracy_macro": pairwise,
-                        "pairwise_accuracy_micro": pairwise,
-                        "queries_ranked": ranked, "queries_total": total}}
+            "ranking": ranking}
 
 
 def empty_scores() -> dict:
@@ -95,7 +101,7 @@ def classical(path: Path, *, columns: int = 6628, protein: str = "frozen",
 
 def train(path: Path, *, pairwise: float, rows: int = 24946, ranked: int = 5645,
           total: int = 42777, permuted: int | None = None,
-          all_pairwise: float | None = None) -> None:
+          all_pairwise: float | None = None, counted: int | None = None) -> None:
     payload = {"stage": "stage3_train", "selection_metric": "pairwise_accuracy_macro",
                "selection_slice": "strict", "selection_slice_rows": rows,
                "best_epoch": 9, "history": [{"epoch": index} for index in range(10)],
@@ -105,8 +111,9 @@ def train(path: Path, *, pairwise: float, rows: int = 24946, ranked: int = 5645,
                "validation_metrics": {
                    "all": scores(0.5144, 0.2395,
                                  pairwise if all_pairwise is None else all_pairwise,
-                                 rows, ranked, total),
-                   "strict": scores(0.5144, 0.2395, pairwise, rows, ranked, total)}}
+                                 rows, ranked, total, counted),
+                   "strict": scores(0.5144, 0.2395, pairwise, rows, ranked, total,
+                                    counted)}}
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -242,10 +249,31 @@ def test_the_slice_the_tables_read_is_the_slice_they_say(runs: Path) -> None:
     assert "0.7778" not in out
 
 
+def test_the_macros_own_denominator_is_quoted_when_the_manifest_has_it(
+        tmp_path: Path) -> None:
+    """`queries_ranked` counts the queries that cleared min_candidates, NOT the terms of
+    the macro: a query whose candidates all sit inside the direction tolerance adds no
+    term yet is counted. The t3a dump of 2026-11-20 showed how far apart the two are -
+    5,645 cleared the bar, 3,892 entered the macro, 9.1 % and not 13.2 % of the 42,777
+    queries - so the metric now records the real denominator and the footnote quotes it.
+    """
+    directory = tmp_path / "evaluator"
+    directory.mkdir()
+    train(directory / f"train_frozen_direct_1_t3a-{PID}.json", pairwise=0.7778,
+          ranked=5645, total=42777, counted=3892)
+    out = text(directory)
+    assert "t3a: 3,892 of 42,777 queries are in the pairwise macro** (9.1 %)" in out
+    assert "5,645 cleared the min_candidates bar" in out
+    assert "further apart than the direction tolerance" in out
+    # The phrasing that implied the larger set WAS the macro is gone for good.
+    assert "queries could be ranked" not in out
+
+
 def test_a_slice_that_covers_every_row_is_called_out(runs: Path) -> None:
     out = text(runs)
     assert "the `strict` slice holds every validation row** (24,946)" in out
-    assert "5,645 of 42,777 queries could be ranked** (13.2 %)" in out
+    assert "5,645 of 42,777 queries cleared the min_candidates bar** (13.2 %)" in out
+    assert "an upper bound on the macro's own denominator" in out
 
 
 def test_the_capacity_table_carries_the_threshold_and_the_verdict(runs: Path) -> None:

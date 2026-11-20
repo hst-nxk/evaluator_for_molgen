@@ -298,6 +298,13 @@ def ranking_metrics(group_ids: np.ndarray, truth: np.ndarray, prediction: np.nda
         "pairwise_accuracy_macro": (float(np.mean(accuracy_values)) if accuracy_values
                                     else UNDEFINED),
         "pairwise_accuracy_micro": (agree_total / pairs_total) if pairs_total else UNDEFINED,
+        # Mau so THUC SU cua macro, va no KHAC `queries_ranked`. `queries_ranked` dem
+        # moi query vuot nguong min_candidates, ke ca query ma khong cap ung vien nao
+        # chenh nhau qua direction_tolerance - query do khong gop mot so hang nao vao
+        # accuracy_values, nhung van duoc dem la "ranked". Do t3a (20/11/2026): 5.645
+        # query vuot nguong, chi 3.892 query gop vao macro. Khong ghi so nay thi moi
+        # bang trich macro deu mo ta mot tap nho hon nhan ghi tren no.
+        "pairwise_accuracy_queries": len(accuracy_values),
         "pairs_counted": pairs_total,
     }
     for k in sorted(hits):

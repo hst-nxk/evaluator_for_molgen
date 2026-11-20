@@ -366,10 +366,28 @@ def footnotes(manifests: Mapping[str, Mapping[str, Any] | None],
         if ranking_slice.get("queries_ranked") is not None:
             ranked = ranking_slice["queries_ranked"]
             total = ranking_slice.get("queries_total")
-            if total:
-                lines.append(f"* **{task}: {ranked:,} of {total:,} queries could be "
-                             f"ranked** ({100.0 * ranked / total:.1f} %). The pairwise "
-                             f"number describes that subset.")
+            # `queries_ranked` counts the queries that CLEARED min_candidates. It is not
+            # the macro's denominator: a query whose candidates all sit within
+            # direction_tolerance of each other contributes no term to the mean yet is
+            # still counted here. The real denominator is `pairwise_accuracy_queries`,
+            # recorded from 2026-11-20 on; a manifest written before that does not carry
+            # it, and this footnote then says what it can rather than implying the
+            # smaller set is the larger one. (Measured on t3a: 5,645 cleared the bar,
+            # 3,892 entered the macro.)
+            counted = ranking_slice.get("pairwise_accuracy_queries")
+            if total and counted is not None:
+                lines.append(f"* **{task}: {counted:,} of {total:,} queries are in the "
+                             f"pairwise macro** ({100.0 * counted / total:.1f} %). "
+                             f"{ranked:,} cleared the min_candidates bar; the macro "
+                             f"averages only the {counted:,} that also had two "
+                             f"candidates further apart than the direction tolerance.")
+            elif total:
+                lines.append(f"* **{task}: {ranked:,} of {total:,} queries cleared the "
+                             f"min_candidates bar** ({100.0 * ranked / total:.1f} %). "
+                             f"The macro averages a SUBSET of those - the ones with a "
+                             f"countable comparison - and this manifest predates the "
+                             f"field that records how many, so the share above is an "
+                             f"upper bound on the macro's own denominator.")
     for task in (SUB100["classical"], PAIR75["classical"], "t1b"):
         manifest = manifests.get(task)
         if manifest is None:
