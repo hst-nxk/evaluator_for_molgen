@@ -951,7 +951,40 @@ Checkpoints trained before 2026-11-19 do not carry them; for those the window **
 checked, so loading one logs a warning that names both numbers instead of letting the reader
 assume they matched. The frozen tasks of 2026-11-19 never go through this branch.
 
-## 4.10 `queries_ranked` is not the macro's denominator
+## 4.10 Scoring the classical baselines on the seen/unseen groups
+
+`scripts/classical_row_dump.py` plus `scripts/server_run_classical_seen_2011.sh`.
+
+The breakdown of 2026-11-20 put the MLP's PAIR75 score where it comes from: direction
+accuracy 0.8092 on validation rows whose two molecules both appeared in training, 0.5677
+on rows where neither did, with the two groups' mean |label| the same (0.5886 against
+0.5896), so it is not a difference in how hard the labels are. The MLP's macro for the
+unseen group is 0.6673, which sits inside the range the classical baselines reach
+**overall** (0.6267-0.6801). Those are macros over different query sets - 215 queries
+against 3,892 - so they do not compare, and nothing can yet be said about whether the
++0.0977 advantage survives on new molecules. The baselines have to be scored on the same
+three groups.
+
+`--mode errors` can only dump a checkpoint, and a classical fit has none: `run_classical`
+fits, scores, records and discards the estimator. So the script refits the baseline its
+manifest describes and writes the dump in the layout `seen_molecules.py` already reads,
+which runs over a baseline unmodified.
+
+Everything that decides the fit is taken from the manifest - configuration, split,
+selected alpha, row cap and the seed that picks the capped sample - and **the refit is
+checked, not assumed**: its own validation metrics must reproduce the metrics the manifest
+recorded, to 1e-9, before any folder is written. These models are deterministic given
+their seed, so that is a guard against the wrong model or the wrong rows rather than a
+budget for variation, and there is no flag to skip it. The script also refuses to pick an
+alpha the run did not select, and refuses a manifest whose protein column was shuffled
+(the refusal comes before the feature matrix is built, which is the expensive part).
+
+The train side of the breakdown is only the set of molecules seen in training, a property
+of the split and not of the model, so the MLP run's train dump serves every baseline too.
+CPU only, no GPU lock, so it can run beside a training batch; the feature matrix is the
+memory high-water mark.
+
+## 4.11 `queries_ranked` is not the macro's denominator
 
 `metrics.ranking_report` counts a query into `queries_ranked` as soon as it clears
 `min_candidates`. The macro averages a **subset** of those: a query whose candidates all
