@@ -165,6 +165,43 @@ def test_a_side_selected_by_another_rule_is_not_compared(runs: Path, tmp_path: P
     assert "0.9000" not in out
 
 
+def test_the_scale_of_one_side_alone_is_printed_beside_the_difference(runs: Path
+                                                                      ) -> None:
+    """A mean difference means nothing without the scale it is read against: how much the
+    plain number moves when only the training seed changes. The paired design is meant to
+    make the difference steadier than either side, and printing both is what shows
+    whether it did. Printed by the script so that no number in a report is arithmetic
+    somebody did by hand over the rows of the table.
+    """
+    out = text(runs)
+    assert "the REAL side alone across these 3 seeds: spread 0.0059" in out
+    assert "(from 0.7742 to 0.7801), standard deviation 0.0030." in out
+    assert out.index("Standard deviation of the differences") < out.index("REAL side")
+
+
+def test_the_measured_batch_of_20_11_reads_the_way_it_was_reported(tmp_path: Path
+                                                                   ) -> None:
+    """The three pairs actually measured on the server on 2026-11-20. Kept as a test so
+    the sentences quoted from them stay reproducible from the code: the differences are
+    an order of magnitude steadier than the side they are taken from, which is the whole
+    argument for pairing on the seed.
+    """
+    directory = tmp_path / "measured"
+    directory.mkdir()
+    pairs(directory, [(0.7778, 0.7805), (0.7696, 0.7719), (0.7834, 0.7874)])
+    good, lines = summary.report(summary.rows(directory, PID, "strict"), "strict")
+    out = "\n".join(lines)
+    assert good
+    assert "Mean difference (shuffled - real): +0.0030 over 3 pair(s)." in out
+    # 0.0009 and not the 0.0008 the server printed: these fixtures carry the scores
+    # rounded to four decimals, and the real manifests carry full precision. The point
+    # the test fixes is the ORDER OF MAGNITUDE between the two lines below, which is the
+    # same either way.
+    assert "Standard deviation of the differences: 0.0009." in out
+    assert "the REAL side alone across these 3 seeds: spread 0.0138" in out
+    assert "standard deviation 0.0069." in out
+
+
 def test_one_pair_is_told_it_has_no_noise_scale(tmp_path: Path) -> None:
     directory = tmp_path / "one"
     directory.mkdir()

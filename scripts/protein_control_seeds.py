@@ -210,6 +210,7 @@ def report(records: list[dict[str, Any]], slice_name: str) -> tuple[bool, list[s
              "|---|---|---|---|---|"]
     good = True
     differences = []
+    reals: list[float] = []   # the real side of the COMPLETE pairs, in the same order
     for record in records:
         if record["difference"] is None:
             good = False
@@ -219,6 +220,7 @@ def report(records: list[dict[str, Any]], slice_name: str) -> tuple[bool, list[s
                          f"{cells[0]} | {cells[1]} | - |")
             continue
         differences.append(record["difference"])
+        reals.append(record["real"])
         lines.append(f"| {record['pair']} | {record.get('real_seed', '-')} | "
                      f"{record['real']:.4f} | {record['shuffled']:.4f} | "
                      f"{record['difference']:+.4f} |")
@@ -236,6 +238,18 @@ def report(records: list[dict[str, Any]], slice_name: str) -> tuple[bool, list[s
         if len(differences) > 1:
             lines.append(f"Standard deviation of the differences: "
                          f"{statistics.stdev(differences):.4f}.")
+            # The SAME statistics for one side on its own, which is the scale the mean
+            # difference has to be read against: how much the plain number moves when
+            # only the training seed changes. The paired design exists to make the
+            # difference steadier than either side, and printing both is what shows
+            # whether it did. Computed here so no number in a report is arithmetic
+            # somebody did by hand over the rows of the table above.
+            real_only = reals
+            lines.append(f"For scale, the REAL side alone across these "
+                         f"{len(real_only)} seeds: spread "
+                         f"{max(real_only) - min(real_only):.4f} "
+                         f"(from {min(real_only):.4f} to {max(real_only):.4f}), "
+                         f"standard deviation {statistics.stdev(real_only):.4f}.")
             lines.append("")
             # Descriptive statistics and nothing more. An earlier version of this script
             # printed that the effect was "bounded above by the spread", which does not
