@@ -205,8 +205,26 @@ def test_the_checkpoint_is_taken_by_run_id_and_not_by_file_age() -> None:
 
 def test_the_pid_file_and_the_log_are_named_after_the_gpu() -> None:
     assert 'LOG="$ROOT/runs/diagnostics_1911_gpu$GPU.log"' in TEXT
-    assert 'PID_FILE="$directory/${prefix}_gpu$gpu.pid"' in LOCK
-    assert 'LOCK_FILE="$directory/${prefix}_gpu$gpu.lock"' in LOCK
+    assert 'PID_FILE="$directory/gpu$gpu.pid"' in LOCK
+    assert 'LOCK_FILE="$directory/gpu$gpu.lock"' in LOCK
+
+
+def test_the_lock_is_keyed_on_the_gpu_and_nothing_else() -> None:
+    """Review 2026-11-20: the lock's name held the script's prefix, so the claim was per
+    SCRIPT, not per GPU. scripts/server_run_diagnostics_1911.sh took
+    `diagnostics_1911_gpu1.lock` and scripts/server_run_protein_seeds_2011.sh took
+    `protein_seeds_2011_gpu1.lock`; both claims succeeded and two batches then shared one
+    GPU, each believing it had claimed it. A GPU is one resource, so one lock name.
+    """
+    stop = (SCRIPTS / "stop_gpu_batch.sh").read_text(encoding="utf-8")
+    assert "${prefix}_gpu" not in LOCK
+    assert "${PREFIX}_gpu" not in stop
+    assert '"$DIRECTORY/gpu$GPU.lock"' in stop
+    assert '"$DIRECTORY/gpu$GPU.pid"' in stop
+    # The prefix still goes INTO the record, which is what names the batch, and a stop
+    # that names a batch must refuse to signal a different one.
+    assert 'echo "prefix=$prefix"' in LOCK
+    assert 'if [[ -n "$EXPECTED_PREFIX" && "$prefix" != "$EXPECTED_PREFIX" ]]; then' in stop
     # No path without the GPU in it is left anywhere, including the header's instructions.
     assert "diagnostics_1911.pid" not in TEXT
     assert "diagnostics_1911.log" not in TEXT
@@ -332,6 +350,30 @@ def test_exactly_one_of_two_simultaneous_batches_reaches_the_first_task(
 
 
 @pytest.mark.skipif(not HAS_FLOCK, reason="this bash has no flock")
+def test_two_DIFFERENT_batches_cannot_both_claim_one_gpu(tmp_path: Path) -> None:
+    """The bug of 2026-11-20, as a running check rather than a text assertion.
+
+    Before the fix each script's prefix was part of the lock's name, so two different
+    batches on GPU 0 took two different locks and both succeeded. The claim has to depend
+    on the GPU alone, which is what the second claimant below proves by being refused.
+    """
+    first = start_claimant(tmp_path, "5")
+    try:
+        assert first.stdout is not None
+        assert "TASK 1" in first.stdout.readline().decode()
+        other = [f'source "{bash_path(LOCK_SCRIPT)}"',
+                 f'claim_gpu 0 "{bash_path(tmp_path)}" another_batch || exit $?',
+                 'echo "TASK 1 pid $$"']
+        second = in_bash(" ; ".join(other) + "\n")
+        assert second.returncode == 4, second
+        assert "already running on GPU 0" in second.stderr
+        assert "TASK 1" not in second.stdout
+    finally:
+        first.kill()
+        first.wait()
+
+
+@pytest.mark.skipif(not HAS_FLOCK, reason="this bash has no flock")
 def test_the_gpu_is_free_again_once_the_winner_has_finished(tmp_path: Path) -> None:
     # The lock lives on an open descriptor, so the kernel releases it when the process ends
     # however it ends: a crashed batch must not block the GPU for good.
@@ -357,7 +399,7 @@ def test_a_missing_flock_says_so_instead_of_claiming_the_gpu_is_busy(tmp_path: P
 @pytest.mark.skipif(not HAS_FLOCK, reason="this bash has no flock")
 def test_the_pid_file_is_gone_after_the_batch_ends(tmp_path: Path) -> None:
     race(tmp_path, holder_seconds="0")
-    assert not (tmp_path / "batch_gpu0.pid").exists()
+    assert not (tmp_path / "gpu0.pid").exists()
 
 
 # ------------------------------------------------------- stopping ONE batch, and only it
@@ -375,7 +417,7 @@ def stop(tmp_path: Path, gpu: str = "0") -> subprocess.CompletedProcess[str]:
 
 
 def record(tmp_path: Path, gpu: str = "0") -> dict[str, str]:
-    lines = (tmp_path / f"batch_gpu{gpu}.pid").read_text(encoding="utf-8").splitlines()
+    lines = (tmp_path / f"gpu{gpu}.pid").read_text(encoding="utf-8").splitlines()
     return dict(line.split("=", 1) for line in lines if "=" in line)
 
 
@@ -404,26 +446,26 @@ def test_a_stop_refuses_a_record_whose_pid_was_handed_to_something_else(
     """THE CASE FROM THE REVIEW. The batch was SIGKILLed, so its record survived; the pid now
     belongs to another process (here: this very shell). Nothing may be signalled."""
     directory = tmp_path
-    (directory / "batch_gpu0.lock").write_text("", encoding="utf-8")
-    done = in_bash(f'echo "pid=$$" > "{bash_path(directory)}/batch_gpu0.pid"\n'
-                   f'echo "pgid=$$" >> "{bash_path(directory)}/batch_gpu0.pid"\n'
-                   f'echo "gpu=0" >> "{bash_path(directory)}/batch_gpu0.pid"\n'
-                   f'echo "prefix=batch" >> "{bash_path(directory)}/batch_gpu0.pid"\n'
-                   f'echo "started=1" >> "{bash_path(directory)}/batch_gpu0.pid"\n')
+    (directory / "gpu0.lock").write_text("", encoding="utf-8")
+    done = in_bash(f'echo "pid=$$" > "{bash_path(directory)}/gpu0.pid"\n'
+                   f'echo "pgid=$$" >> "{bash_path(directory)}/gpu0.pid"\n'
+                   f'echo "gpu=0" >> "{bash_path(directory)}/gpu0.pid"\n'
+                   f'echo "prefix=batch" >> "{bash_path(directory)}/gpu0.pid"\n'
+                   f'echo "started=1" >> "{bash_path(directory)}/gpu0.pid"\n')
     assert done.returncode == 0, done
     # `started=1` cannot be this pid's real start time, so the pid is not that batch.
     result = stop(tmp_path)
     assert result.returncode == 1, result
     assert "no batch is running on GPU 0" in result.stdout
     # And the stale record is cleared, so the next reader is not misled by it again.
-    assert not (tmp_path / "batch_gpu0.pid").exists()
+    assert not (tmp_path / "gpu0.pid").exists()
 
 
 @pytest.mark.skipif(not HAS_FLOCK, reason="this bash has no flock")
 def test_a_stop_refuses_a_record_written_for_another_gpu(tmp_path: Path) -> None:
     # newline="\n": written on Windows, read by bash, which would otherwise see a
     # carriage return as part of the value ("GPU 0\r" is not "GPU 0").
-    (tmp_path / "batch_gpu1.pid").write_text("pid=1\npgid=1\ngpu=0\nprefix=batch\n"
+    (tmp_path / "gpu1.pid").write_text("pid=1\npgid=1\ngpu=0\nprefix=batch\n"
                                              "started=1\n", encoding="utf-8",
                                              newline="\n")
     result = stop(tmp_path, gpu="1")
@@ -472,7 +514,7 @@ def test_a_stop_finds_the_work_when_the_record_no_longer_matches(tmp_path: Path)
     try:
         written = wait_for_record(tmp_path)
         assert written["pgid"] == written["pid"], written
-        path = tmp_path / "batch_gpu0.pid"
+        path = tmp_path / "gpu0.pid"
         path.write_text(f"pid={written['pid']}\npgid={written['pgid']}\ngpu=0\n"
                         "prefix=batch\nstarted=1\n", encoding="utf-8", newline="\n")
         result = stop(tmp_path)
@@ -488,7 +530,7 @@ def test_a_stop_finds_the_work_when_the_record_no_longer_matches(tmp_path: Path)
 
 def wait_for_record(tmp_path: Path, gpu: str = "0", seconds: float = 20) -> dict[str, str]:
     """Wait until the claimant has written its record, then return it."""
-    path = tmp_path / f"batch_gpu{gpu}.pid"
+    path = tmp_path / f"gpu{gpu}.pid"
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if path.exists() and "started=" in path.read_text(encoding="utf-8"):
@@ -598,7 +640,7 @@ def start_token(pid: str) -> str:
 
 def rewrite_record(tmp_path: Path, *, pid: str, pgid: str, started: str,
                    gpu: str = "0") -> None:
-    (tmp_path / f"batch_gpu{gpu}.pid").write_text(
+    (tmp_path / f"gpu{gpu}.pid").write_text(
         f"pid={pid}\npgid={pgid}\ngpu={gpu}\nprefix=batch\nstarted={started}\n",
         encoding="utf-8", newline="\n")
 

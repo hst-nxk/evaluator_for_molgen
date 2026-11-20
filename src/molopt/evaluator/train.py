@@ -2131,6 +2131,12 @@ def run_errors(config: Mapping[str, Any], root: Path, checkpoint: Path, stamp: s
         "head": loaded.head, "partition": partition, "rows": len(arrays),
         "label_scaler": loaded.scaler.state(),
         "direction_tolerance": tolerance, "settings": dict(settings),
+        # Khối `metrics` của chính lần chạy. Phải ghi vì "settings" ở trên là
+        # stage3.ANALYSIS, nên một script đọc lại dump không có cách nào biết
+        # min_candidates đã dùng là bao nhiêu - nó chỉ còn cách đoán theo config.json
+        # hiện tại, mà con số đó có thể đã đổi từ lúc dump được ghi.
+        "metrics_settings": {key: value for key, value in metric_settings.items()
+                             if not key.endswith("note")},
         "spread": spread, "queries_overall": overall[0] if overall else None,
         "by_row": row_tables, "by_query": query_tables,
         "worst_proteins": proteins, "worst_edits": edit_list,

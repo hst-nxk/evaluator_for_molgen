@@ -42,9 +42,14 @@ fi
 GPU="$1"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIRECTORY="${2:-$ROOT/.cache}"
-PREFIX="${3:-diagnostics_1911}"
-LOCK_FILE="$DIRECTORY/${PREFIX}_gpu$GPU.lock"
-PID_FILE="$DIRECTORY/${PREFIX}_gpu$GPU.pid"
+# An EXPECTED prefix, not part of the path. Both files are named after the GPU alone (see
+# scripts/gpu_batch_lock.sh), so this script finds whichever batch holds GPU $GPU, whatever
+# script started it. When a prefix IS passed it is checked against the record, and a
+# mismatch refuses to signal anything: a stop aimed at "the diagnostics batch" must not
+# reach a different batch that happens to hold the same GPU.
+EXPECTED_PREFIX="${3:-}"
+LOCK_FILE="$DIRECTORY/gpu$GPU.lock"
+PID_FILE="$DIRECTORY/gpu$GPU.pid"
 
 if ! command -v flock > /dev/null; then
   echo "flock is not installed, so whether a batch holds GPU $GPU cannot be told" >&2
@@ -129,6 +134,11 @@ done < "$PID_FILE"
 if [[ -z "$pid" || -z "$pgid" || -z "$started" ]]; then
   echo "$PID_FILE is not a record this script can check (written by an older version?);"\
        "stop the batch by hand after checking what it is: ps -o pid=,args= -p '$pid'" >&2
+  exit 3
+fi
+# When the caller named a batch, the record has to be that batch.
+if [[ -n "$EXPECTED_PREFIX" && "$prefix" != "$EXPECTED_PREFIX" ]]; then
+  echo "$PID_FILE records the batch '$prefix', not '$EXPECTED_PREFIX'; refusing to"       "signal anything. '$prefix' is what holds GPU $GPU - stop it by that name, or"       "without naming one." >&2
   exit 3
 fi
 # The GPU in the record must be the GPU asked for. They can only differ if the file was

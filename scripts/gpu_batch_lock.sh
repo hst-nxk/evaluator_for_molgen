@@ -62,8 +62,14 @@ claim_gpu() {
   local gpu="$1"
   local directory="$2"
   local prefix="$3"
-  LOCK_FILE="$directory/${prefix}_gpu$gpu.lock"
-  PID_FILE="$directory/${prefix}_gpu$gpu.pid"
+  # Named after the GPU and NOTHING else. The prefix used to be part of both names, which
+  # made the claim per SCRIPT instead of per GPU: scripts/server_run_diagnostics_1911.sh
+  # took diagnostics_1911_gpu1.lock while scripts/server_run_protein_seeds_2011.sh took
+  # protein_seeds_2011_gpu1.lock, both succeeded, and two batches then shared one GPU -
+  # exactly what this file exists to prevent. The prefix is still recorded INSIDE the pid
+  # file, where it names the batch without keying the lock.
+  LOCK_FILE="$directory/gpu$gpu.lock"
+  PID_FILE="$directory/gpu$gpu.pid"
   mkdir -p "$directory" || return 1
   # Without flock there is no atomic claim at all, and `! flock -n 9` would be TRUE
   # (command not found), which reads exactly like "another batch holds the GPU". Say what

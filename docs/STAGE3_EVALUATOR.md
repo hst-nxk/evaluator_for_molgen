@@ -748,16 +748,173 @@ says nothing about it; and `--mode classical` rewrites its manifest after every 
 run that died mid-grid already carries both selection fields and a provisional winner with
 `complete: false`.
 
+#### Building the tables: `scripts/diagnostics_tables.py`
+
+```bash
+python scripts/diagnostics_tables.py runs/evaluator runs/diagnostics_1911_gpu1.log
+```
+
+Prints the four tables as Markdown, every number read out of a manifest at a fixed key.
+The baseline table carries **train and validation** side by side, which is what the meeting
+asked for: the classical rows are scored on the very rows they were fitted on, from their
+own manifest, and the MLP's train half comes from the separate `--mode eval --partition
+train` run of the SAME checkpoint (`t3a-eval`, `t3c-eval`) - a `--mode train` manifest holds
+no pass over the training rows, so without that eval run the train columns are `-` and a
+footnote says which run is missing.
+
+Two things the table will not do. It will not pair halves from different models: both
+manifests carry the checkpoint they used, and the train half is refused (with the reason in
+the row) unless the two paths agree and the eval manifest says `partition: "train"`. And it
+will not read both halves at one slice. The train columns are the `--train-slice` (default
+`all`), the validation columns the `--slice` (default `strict`), and **the header names
+both**, because on a pair-keyed split they cannot be the same: `build_pair_split.py` writes
+`unseen_pair = is_validation`, so every TRAIN row carries false and the `strict` slice of
+the train partition is empty by construction. Reading `strict` on both sides printed `-`
+for the train half of a batch that had finished perfectly - that was the state until
+2026-11-20. `--slice all --train-slice all` measures the gap over the two whole
+partitions.
+Carrying numbers by hand was the one step of this pipeline with no test behind it, and it
+has three failure modes the script is built against: a regularised model quoted at a level
+nobody selected (it shows only the level the run recorded in `selected_alpha`, and names
+the alpha in the row), a column headed `strict` holding `all` numbers (asking for a slice
+the manifests do not have empties the columns instead of falling back), and a task with no
+manifest filled in from another batch (it prints `-` and names the task in the footnotes).
+Degenerate and unconverged fits keep their flags in a notes column — including the non-zero
+coefficient count, which is what makes a fit held up by a single coefficient visible when
+`constant_predictor` is false. The footnotes are generated, not written: a slice that holds
+every validation row is called out as not being a second measurement, the share of
+rankable queries is stated, and every table ends on the reminder that each score belongs to
+a configuration selected on validation.
+
+#### Is the PAIR75 score carried by molecules already seen? `scripts/seen_molecules.py`
+
+```bash
+setsid nohup bash scripts/server_run_seen_molecules_2011.sh 1 t3a-<batch pid> \
+    > /dev/null 2>&1 &
+```
+
+The second argument is the training task's **run id**, which the script resolves through
+`scripts/pick_train_checkpoint.py` (two positional arguments, no flags:
+`python scripts/pick_train_checkpoint.py runs/evaluator t3a-4174688`); a `.pt` path is
+accepted too.
+
+PAIR75 is keyed on the **pair**, so no validation pair was in training - that is what
+`unseen_pair` and the `strict` slice guarantee - but a single **molecule** of a validation
+pair may well have been, inside another pair. If the 0.7778 lives on those rows it is not a
+generalisation number, and the gap to SUB100's 0.53 is a property of the split rather than
+of the model. The batch writes the two row dumps the analysis needs (`--mode errors` on
+train and on validation, same checkpoint, same split) and runs the analysis on them; the
+protein-shuffle flag is deliberately absent, so a `t3b` checkpoint cannot be analysed here
+by accident - `--mode errors` refuses a checkpoint whose recorded `protein_permute_seed`
+does not match the command's.
+
+The report is written in three units, because they answer different questions. **Per row**
+(one MMP pair): the rows split into three groups by how many of their two molecules appear
+in the train dump - 0, 1 or 2 - each with its row count, MAE and direction accuracy over
+rows (the *micro* quantity, from the dump's own `sign_counted`/`sign_correct`), plus the
+label statistics of the group. **Per group as a slice**: the same three groups with
+`pairwise_accuracy_macro` measured inside each - the rows of the group are selected first
+and the queries built afterwards, which is the order every slice of this project is
+measured in. That order is what makes a macro over a 0/1/2 group well defined at all: one
+comparison inside a query involves THREE molecules (a reference and two candidates), so the
+count of seen molecules belongs to a row, and a slice is a set of rows. The three groups do
+**not** add up to the whole set - restricting the rows cuts a query into smaller queries, so
+`ranked` can be far below the whole set's - and the report says so rather than inviting the
+reader to average them. **Per query of the whole set** (reference molecule, protein,
+endpoint): each query placed by whether its *reference* was seen and by how many of its
+candidates were, which answers whether it matters which SIDE of a comparison the model had
+already met.
+
+The query side is a reconstruction from the row dump - pairs doubled into both directions,
+grouped by (reference, protein, endpoint), scored with `metrics.pairwise_direction` at the
+run's own tolerance - so it is **checked**: the overall macro and the number of queries
+**with at least `min_candidates` candidates** must reproduce the dump's own
+`queries.parquet`, and the script exits non-zero when they do not. That bar is part of the
+check and not a detail: `analysis.query_table` writes down only the queries that clear it,
+so comparing raw totals calls a correct run wrong - two rows A-B and A-C rebuild three
+queries (A, B, C) while the file holds one (A). The full rebuilt total is printed beside it
+as coverage, and every table carries both counts.
+
+A query below the bar is **skipped**, not merely left out of the count:
+`metrics.ranking_report` skips it before scoring anything, so scoring it here would make
+this macro a different quantity from the one the manifests report. At `min_candidates = 2`
+the two behaviours agree (a single candidate yields no comparison), which is why a run at 3
+was needed to show the difference.
+
+Where the threshold comes from is printed with it. `report.json` carries `metrics_settings`
+(added 2026-11-20) for exactly this; its `settings` field is the stage3 **analysis** block
+and is never read here, since a metric threshold taken from it would silently pick up a
+different setting of the same name. For a dump written before that field existed the
+fallback is `config.json`, and the report says so - today's config.json is not necessarily
+the one the dump was written with.
+A breakdown that cannot reproduce the number it breaks down is not evidence, and the batch
+carries that exit code through instead of printing DONE.
+
+What it does **not** establish: that the model memorises. A higher score on seen molecules
+has at least two readings - the model recalls them, or those rows are simply easier - so
+each row group also carries its label mean, label sd and mean |Δp|, which is what lets the
+second reading be checked rather than assumed away.
+
+#### Giving the protein null a noise scale: `scripts/server_run_protein_seeds_2011.sh`
+
+The 2026-11-19 batch measured `pairwise_accuracy_macro` 0.7778 with the real protein column
+and 0.7805 with it shuffled across rows: **+0.0027**, i.e. destroying every row's protein
+identity made the model slightly better. One run per side cannot tell that from
+run-to-run noise, and "no difference" and "a difference below our noise" are different
+claims. This batch runs three pairs on PAIR75 (about 20 minutes, six train runs): pair *i*
+is the same configuration twice, differing only in whether the protein column was shuffled,
+while across pairs both the training seed and the permutation draw change — so the spread
+of the three differences covers both sources of noise. The first seed is the 2026-11-19
+batch's own, so pair 1 reproduces t3a/t3b and a mismatch there means something else
+changed.
+
+```bash
+setsid nohup bash scripts/server_run_protein_seeds_2011.sh 1 > /dev/null 2>&1 &
+python scripts/protein_control_seeds.py runs/evaluator runs/protein_seeds_2011_gpu1.log
+```
+
+The summary also checks what the batch IS before putting a name on it. `pair_problems`
+only asks whether the two sides of a pair agree with each other, and two manifests on the
+default split with the same seed agree perfectly while being a different experiment
+altogether - so the split named in the manifests has to be PAIR75, the complete pairs have
+to carry one training seed each (otherwise the spread across pairs is not a spread across
+seeds), and pair 1 has to repeat the 2026-11-19 seed and permutation before it is called a
+reproducibility check of t3a/t3b. A sentence whose condition does not hold is withheld
+rather than reworded, and the exit code is non-zero.
+
+The summary refuses to print a mean difference without the spread next to it, and it says
+in so many words that what it prints is descriptive statistics: a mean of this size next to
+a spread of that size. It is **not** a bound on the effect - the spread of three differences
+is a property of this sample, not a limit on anything - and not a significance test. It also
+refuses to subtract two manifests that are not the two sides of one pair: the seed, the
+split, the subset, the configuration and the head all have to match and exactly one side has
+to carry `protein_permute_seed >= 0`, or the row prints both scores and no difference. And
+because pair 1 repeats the 2026-11-19 configuration, the output says it is a reproducibility
+check of t3a/t3b rather than a fourth independent pair.
+
 All of them run in one go with `scripts/server_run_diagnostics_1911.sh <GPU index>`,
 whose log, pid file and every run id are named after that GPU index so two batches on
 two GPUs can run side by side without overwriting each other's files. One batch per GPU is
-enforced with a `flock` lock (`scripts/gpu_batch_lock.sh`), not by reading a pid file:
+enforced with a `flock` lock on `.cache/gpu<N>.lock` (`scripts/gpu_batch_lock.sh`), not by
+reading a pid file:
 reading and then writing is two steps, so two batches launched in the same second would both
 read "nobody there" before either wrote. The lock lives on a descriptor the batch keeps
 open, so the kernel releases it however the batch ends — `kill -9` included — and it also
 owns the pid file, which is written under the lock and removed by a trap on EXIT (the early
 exit for a missing split file used to leave it behind, and a leftover pid eventually names
-an unrelated process). To stop a batch, use `scripts/stop_gpu_batch.sh <GPU index>`, never a `kill` one-liner: a
+an unrelated process). Both files are named after the GPU and nothing else - `.cache/gpu<N>.lock` and
+`.cache/gpu<N>.pid`. Until 2026-11-20 the script's own prefix was part of both names, which
+made the claim per SCRIPT rather than per GPU: `server_run_diagnostics_1911.sh` took
+`diagnostics_1911_gpu1.lock` while `server_run_protein_seeds_2011.sh` took
+`protein_seeds_2011_gpu1.lock`, both claims succeeded, and two batches shared one GPU with
+each believing it held it. A GPU is one resource, so one lock name; the prefix is still
+recorded inside the pid file, where it names the batch without keying the lock, and
+`stop_gpu_batch.sh <GPU> [cache dir] [prefix]` checks the record against that name and
+refuses to signal a batch that is not the one asked for. (A batch started before this
+change holds the old file name, so it must be stopped with the version of the script that
+started it.)
+
+To stop a batch, use `scripts/stop_gpu_batch.sh <GPU index>`, never a `kill` one-liner: a
 pid alone cannot be checked, and a pid left behind by a SIGKILLed batch can later belong to
 a batch of the SAME script on another GPU, where even `ps | grep
 server_run_diagnostics_1911` matches. The record `claim_gpu` writes therefore holds the GPU,
