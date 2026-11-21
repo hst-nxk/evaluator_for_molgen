@@ -79,7 +79,9 @@ def test_the_observation_run_is_separate_and_excluded_from_the_comparison() -> N
     # Its own stopping must not cut the curve short.
     assert "--set early_stopping_patience_evals=100" in SCRIPT
     # And it must not be mistaken for the main run: a run id of its own.
-    assert '"$task-curve-$$"' in SCRIPT
+    # No extra hyphen: a '-curve-' id is invisible to tasks_from_log().
+    assert '"${task}curve-$$"' in SCRIPT
+    assert '"$task-curve-$$"' not in SCRIPT
     assert SCRIPT.count('--run-id "$task-$$"') == 1
 
 
@@ -102,4 +104,4 @@ def test_the_task_id_is_new_and_matches_the_readers_convention() -> None:
     # t12full is named in the prose on purpose; what matters is that no run
     # id of this script reuses it, which the loop below checks.
     for run_id in re.findall(r'--run-id "([^"]+)"', SCRIPT):
-        assert run_id.startswith("$task"), run_id
+        assert run_id.startswith(("$task", "${task}")), run_id

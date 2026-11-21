@@ -103,10 +103,13 @@ run python run_evaluator.py --mode eval --partition train --checkpoint "$checkpo
 # t12full's best point was its FIRST mark, so the real optimum may lie before step 2000 and
 # nobody has measured there. This run looks, with marks every 500 steps over ONE epoch. Its
 # own selection and stopping are therefore on a different schedule from the run above, so
-# its score must never be quoted beside t9c1 - only its CURVE is being read. The train-side
+# its score must never be quoted beside t9c1 - only its CURVE is being read. Its run id
+# carries no extra hyphen: check_diagnostics_manifests.RUN_ID allows '-' only before
+# 'eval', so a '-curve-' id is invisible to tasks_from_log() and the figure step silently
+# skips a run that trained perfectly - which is what happened on 2026-11-21. The train-side
 # measurement is off here, because the curve does not need it and it doubles the cost.
 run python run_evaluator.py --mode train --config no_protein --head direct \
-  --run-id "$task-curve-$$" "${shared[@]}" "${reference[@]}" \
+  --run-id "${task}curve-$$" "${shared[@]}" "${reference[@]}" \
   --set eval_every_steps=500 --set epochs=1 --set early_stopping_patience_evals=100 \
   --set measure_train_metrics=false
 
