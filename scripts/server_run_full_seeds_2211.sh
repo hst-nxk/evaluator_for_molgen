@@ -42,6 +42,10 @@ export PYTHONUNBUFFERED=1
 
 source "$ROOT/scripts/gpu_batch_lock.sh"
 claim_gpu "$GPU" "$ROOT/.cache" "full_seeds_2211" || exit $?
+# The cap is not a reservation: on 2026-11-21 this batch was given 4.39 GiB on a card with
+# 20 MiB actually free and died at its first backward pass, 30 s and two W&B runs later.
+# Checked AFTER the lock, so two batches cannot both read "enough free" and then start.
+require_free_vram "$GPU" "${MEMORY_LIMIT:-4500}" || exit $?
 export CUDA_VISIBLE_DEVICES="$GPU"
 
 # One log holds one batch: the figure and table scripts refuse a log with two pids

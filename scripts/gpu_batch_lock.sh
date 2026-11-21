@@ -100,3 +100,46 @@ claim_gpu() {
   trap "rm -f '$PID_FILE'" EXIT
   return 0
 }
+
+# Refuses the batch when the GPU does not physically have the memory the run will ask for.
+#
+#   require_free_vram "$GPU" "${MEMORY_LIMIT:-4500}" || exit $?
+#
+# WHY. gpu_memory_limit_mib is a CAP on this process, not a reservation: the kernel hands
+# out what is there, and another user's job can take the card between the moment a GPU is
+# chosen and the moment training starts. On 2026-11-21 GPU 6 had 9,242 MiB free when it was
+# picked and 20 MiB by the time the batch ran, so two FULL seeds died at their first
+# backward pass - after 30 s, two W&B runs and a lock that then had nothing to protect.
+# Reading the free memory here costs one nvidia-smi call and fails in a second instead.
+#
+# The headroom is not decoration: the cap counts this process's allocator, while CUDA
+# context, cuBLAS workspaces and the driver itself also need room on the card, and that is
+# several hundred MiB before a single tensor exists.
+#
+# Returns 5 when the card is too full (a code no other early exit uses), 1 when nvidia-smi
+# cannot be read - unreadable is NOT treated as free.
+require_free_vram() {
+  local gpu="$1"
+  local needed="$2"
+  local headroom="${3:-1024}"
+  if ! command -v nvidia-smi > /dev/null; then
+    echo "nvidia-smi is not on PATH, so free VRAM cannot be checked; run this on the"\
+         "server" >&2
+    return 1
+  fi
+  local free
+  free="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$gpu" \
+    2> /dev/null | head -1 | tr -d ' \r')"
+  if [[ ! $free =~ ^[0-9]+$ ]]; then
+    echo "could not read the free memory of GPU $gpu (nvidia-smi said '${free}')" >&2
+    return 1
+  fi
+  if (( free < needed + headroom )); then
+    echo "GPU $gpu has ${free} MiB free; this batch needs ${needed} MiB plus ${headroom}"\
+         "MiB of headroom for the CUDA context. Another job is using the card - pick"\
+         "another GPU or wait." >&2
+    return 5
+  fi
+  echo "GPU $gpu: ${free} MiB free, batch capped at ${needed} MiB"
+  return 0
+}
