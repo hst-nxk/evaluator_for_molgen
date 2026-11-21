@@ -15,12 +15,20 @@ progress survives a missing package, a bad key, or a decision later not to use W
 
 WEIGHTS & BIASES, and what leaves the machine. `stage3.train.wandb.mode` is the only place
 this changes, and the project ships `"online"` by its owner's decision of 2026-11-20:
-metrics and the run configuration are uploaded to wandb.ai while the run proceeds, which
-is what makes the charts live. `"offline"` writes into `wandb/` and sends nothing, but it
+metrics and the run configuration are uploaded while the run proceeds, which is what
+makes the charts live (to WHICH host, see below - it is not wandb.ai on this project's
+server). `"offline"` writes into `wandb/` and sends nothing, but it
 has no viewer - offline data becomes a chart only after `wandb sync`, which is an upload
 and needs an account, so offline is a staging step and not a way to see anything.
 `"disabled"` keeps the JSON stream alone, which every figure in this project is drawn from
 anyway.
+
+WHERE IT GOES. Not necessarily wandb.ai. W&B takes its base URL from `WANDB_BASE_URL`
+or the machine's `~/.netrc`, and on this project's GPU server that resolves to the
+instance hosted by the compute provider (`api.forge.coreweave.com`), so the data stays
+with the provider already running the training rather than going to a new third party.
+The host is recorded in every run's configuration as `wandb_base_url`, because "online"
+says nothing without it.
 
 WHAT IS UPLOADED in online mode: the metrics of each measurement, the run configuration
 this module is handed (seed, learning rate, batch size, split FILE NAMES, row counts,
@@ -164,6 +172,36 @@ def file_name(value: Any) -> str:
     return PurePath(text.replace("\\", "/")).name or text
 
 
+def _reinit(wandb: Any) -> dict[str, Any]:
+    """How to ask this W&B client to end a previous run before starting one.
+
+    A batch starts nine runs in one process-per-run, but a `--mode train` and its
+    `--mode eval` half can share one, so a previous run must be finished rather than
+    inherited. `reinit=True` did that and is deprecated as of 0.31.1 ("Use
+    'return_previous' or 'finish_previous' instead"), which printed a warning on every one
+    of the nine runs of 2026-11-20.
+
+    The string form arrived in **0.19.9**, not in 0.19.0: 0.19.8 accepts the boolean only
+    and raises on a string, so the PATCH number has to be read too (a review of
+    2026-11-21 caught this; the server runs 0.31.1, so the nine runs already done were
+    never affected). A version this cannot parse gets the boolean, which every client
+    still accepts with at most a warning - the failure that matters is a crash at
+    `wandb.init`, not a warning line.
+    """
+    numbers = []
+    for part in str(getattr(wandb, "__version__", "")).split(".")[:3]:
+        digits = ""
+        for character in part:
+            if not character.isdigit():
+                break
+            digits += character
+        if not digits:
+            break
+        numbers.append(int(digits))
+    new_enough = len(numbers) == 3 and tuple(numbers) >= (0, 19, 9)
+    return {"reinit": "finish_previous"} if new_enough else {"reinit": True}
+
+
 def batch_group(stamp: str) -> str | None:
     """The batch a run belongs to, from its stamp, or None.
 
@@ -204,6 +242,10 @@ def _wandb_run(settings: Mapping[str, Any] | None, stamp: str,
     # thing this block exists to prevent; console capture would ship the training log with
     # its absolute paths. A variable that must override one of the three therefore cannot
     # be set from the config at all, which is the intended answer.
+    # An explicit host from the config, for a machine whose environment names none.
+    # Never overrides one already set: the server's own setting is the authority there.
+    if settings.get("base_url") and not os.environ.get("WANDB_BASE_URL"):
+        os.environ["WANDB_BASE_URL"] = str(settings["base_url"])
     for name, value in (settings.get("extra_environment") or {}).items():
         if str(name) in PRIVACY_ENVIRONMENT:
             LOGGER.warning("extra_environment.%s bị bỏ qua: %s là cờ riêng tư bắt buộc "
@@ -218,18 +260,28 @@ def _wandb_run(settings: Mapping[str, Any] | None, stamp: str,
     # should say which client produced it.
     config = dict(metadata or {})
     config["wandb_version"] = getattr(wandb, "__version__", "unknown")
+    # WHICH HOST this went to. The data does not necessarily go to wandb.ai: W&B reads the
+    # base URL from WANDB_BASE_URL or from the machine's ~/.netrc, and on the GPU server
+    # of this project it resolves to the instance hosted by the compute provider
+    # (api.forge.coreweave.com), not to the public service. A chart opened in a year has
+    # to say where it lives, and "online" means nothing without the host.
+    config["wandb_base_url"] = (os.environ.get("WANDB_BASE_URL")
+                                or str(settings.get("base_url") or "")
+                                or "default (from the environment or ~/.netrc)")
     try:
         run = wandb.init(project=str(settings.get("project") or "molopt-stage3"),
                          name=str(settings.get("run_name") or stamp),
                          group=str(settings.get("group") or "") or batch_group(stamp),
                          mode=mode, config=config,
                          dir=str(settings.get("dir") or "") or None,
-                         reinit=True)
+                         **_reinit(wandb))
         LOGGER.info("wandb: chế độ %s, run %s, client %s", mode,
                     getattr(run, "name", "?"), config["wandb_version"])
         if mode == ONLINE:
-            LOGGER.info("wandb ONLINE: số đo và cấu hình lần chạy được tải lên wandb.ai "
-                        "trong lúc chạy (không có dữ liệu phân tử, không có nhãn)")
+            LOGGER.info("wandb ONLINE -> %s: số đo và cấu hình lần chạy được tải lên "
+                        "trong lúc chạy (không có dữ liệu phân tử, không có nhãn). URL "
+                        "của run: %s", config["wandb_base_url"],
+                        getattr(run, "url", "?"))
         return run
     except Exception as error:   # noqa: BLE001
         # Online mode fails for ordinary reasons - no `wandb login` on this machine, no

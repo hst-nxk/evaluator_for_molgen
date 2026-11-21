@@ -454,3 +454,100 @@ def test_the_privacy_switches_cannot_be_turned_off_from_the_config(
     assert os.environ["WANDB_SILENT"] == "true"
     # Và việc bỏ qua phải được nói ra, không im lặng.
     assert any("WANDB_CONSOLE" in message for message in caplog.messages)
+
+# ------------------------------------------- host thật sự (20/11, phát hiện trên server)
+def test_the_host_is_recorded_in_the_run_configuration(fake: FakeWandb, tmp_path: Path,
+                                                       monkeypatch) -> None:
+    """"online" không nói gì nếu không kèm host.
+
+    Trên server của dự án, wandb KHÔNG trỏ về wandb.ai: nó đọc base URL từ
+    `WANDB_BASE_URL` hoặc `~/.netrc`, và ở đó nó ra instance của nhà cung cấp compute
+    (`api.forge.coreweave.com`). Một biểu đồ mở ra sau một năm phải biết nó nằm ở đâu.
+    """
+    monkeypatch.setenv("WANDB_BASE_URL", "https://api.forge.coreweave.com")
+    progress.ProgressStream.open(tmp_path, "s", {"mode": "online"}, {"seed": 1})
+    assert fake.kwargs["config"]["wandb_base_url"] == "https://api.forge.coreweave.com"
+
+
+def test_an_unset_host_is_said_to_be_unset_not_guessed(fake: FakeWandb, tmp_path: Path,
+                                                       monkeypatch) -> None:
+    # Không được điền "wandb.ai" vào chỗ mình không biết.
+    monkeypatch.delenv("WANDB_BASE_URL", raising=False)
+    progress.ProgressStream.open(tmp_path, "s", {"mode": "online"})
+    recorded = fake.kwargs["config"]["wandb_base_url"]
+    assert "default" in recorded
+    assert "wandb.ai" not in recorded
+
+
+def test_the_config_can_name_a_host_but_never_overrides_the_machine(
+        fake: FakeWandb, tmp_path: Path, monkeypatch) -> None:
+    """Máy tự đặt host thì máy thắng: credential nằm ở đó, không nằm trong config.json."""
+    import os
+    monkeypatch.delenv("WANDB_BASE_URL", raising=False)
+    progress.ProgressStream.open(tmp_path, "s",
+                                 {"mode": "online", "base_url": "https://wb.example"})
+    assert os.environ["WANDB_BASE_URL"] == "https://wb.example"
+
+    monkeypatch.setenv("WANDB_BASE_URL", "https://api.forge.coreweave.com")
+    progress.ProgressStream.open(tmp_path, "s",
+                                 {"mode": "online", "base_url": "https://wb.example"})
+    assert os.environ["WANDB_BASE_URL"] == "https://api.forge.coreweave.com"
+    assert fake.kwargs["config"]["wandb_base_url"] == "https://api.forge.coreweave.com"
+
+
+def test_the_note_names_the_real_host_and_not_only_wandb_ai() -> None:
+    config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    note = config["stage3"]["train"]["wandb_note"]
+    assert "api.forge.coreweave.com" in note
+    assert "not necessarily wandb.ai" in note
+    # Và vẫn phải giữ những gì đã hứa trước đó.
+    assert "No molecules, no labels, no SMILES" in note
+    assert "are NOT blocked" in note
+
+
+def test_a_new_client_is_asked_to_finish_the_previous_run_by_name(
+        fake: FakeWandb, tmp_path: Path) -> None:
+    """wandb 0.31.1 cảnh báo `reinit=True` đã deprecated, trên cả 9 lượt đêm 20/11."""
+    fake_module = sys.modules["wandb"]
+    fake_module.__version__ = "0.31.1"   # type: ignore[attr-defined]
+    progress.ProgressStream.open(tmp_path, "s", {"mode": "online"})
+    assert fake.kwargs["reinit"] == "finish_previous"
+
+
+def test_an_old_client_still_gets_the_boolean(fake: FakeWandb, tmp_path: Path) -> None:
+    # Dạng chuỗi chỉ có ở client mới; gửi nó cho client cũ sẽ hỏng lúc init.
+    fake_module = sys.modules["wandb"]
+    fake_module.__version__ = "0.16.2"   # type: ignore[attr-defined]
+    progress.ProgressStream.open(tmp_path, "s", {"mode": "online"})
+    assert fake.kwargs["reinit"] is True
+
+
+def test_an_unparsable_version_falls_back_to_the_boolean(fake: FakeWandb,
+                                                         tmp_path: Path) -> None:
+    fake_module = sys.modules["wandb"]
+    fake_module.__version__ = "weird-build"   # type: ignore[attr-defined]
+    progress.ProgressStream.open(tmp_path, "s", {"mode": "online"})
+    assert fake.kwargs["reinit"] is True
+
+
+def test_the_boundary_of_the_string_form_is_the_patch_number(fake: FakeWandb,
+                                                             tmp_path: Path) -> None:
+    """0.19.8 chi nhan boolean, 0.19.9 moi nhan chuoi - review 21/11.
+
+    Doc chi so minor la sai: `reinit="finish_previous"` nem loi tren 0.19.8. Bo test nay
+    di qua dung ranh gioi do, va them mot ban build co hau to.
+    """
+    fake_module = sys.modules["wandb"]
+    cases = {"0.19.8": True, "0.19.9": "finish_previous", "0.19.10": "finish_previous",
+             "0.20.0": "finish_previous", "0.18.9": True, "0.19.9rc1": "finish_previous",
+             "0.19": True}
+    for version, expected in cases.items():
+        fake_module.__version__ = version   # type: ignore[attr-defined]
+        progress.ProgressStream.open(tmp_path, "s", {"mode": "online"})
+        assert fake.kwargs["reinit"] == expected, version
+
+
+def test_the_docstring_does_not_claim_a_check_it_does_not_do() -> None:
+    # Ban dau docstring viet "hoi client, khong so sanh phien ban" trong khi no so sanh
+    # phien ban. Mot cau mo ta sai la mot cai bay cho nguoi doc sau.
+    assert "not by comparing versions" not in (progress._reinit.__doc__ or "")
