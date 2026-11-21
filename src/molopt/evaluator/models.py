@@ -593,6 +593,18 @@ class EvaluatorModel(nn.Module):
         return self.edit_encoder is not None
 
     @property
+    def shares_one_space(self) -> bool:
+        """True when every branch is projected into ONE shared width before fusion.
+
+        That is what `fusion=projector` and `fusion=attention` do, and it is the condition
+        for the alignment term of task 12 to mean anything: aligning two vectors of
+        different widths, living in spaces no projection relates, is not a constraint on
+        anything. `fusion=concat` keeps each branch at its own width, so it is refused
+        there rather than silently ignored.
+        """
+        return self.fusion != FUSION_CONCAT
+
+    @property
     def antisymmetric_by_construction(self) -> bool:
         """True when f(A, B, P) = -f(B, A, P) holds by construction, for every set of
         weights.
@@ -652,18 +664,34 @@ class EvaluatorModel(nn.Module):
 
     def representations(self, ligand_a: Tensor, ligand_b: Tensor, fragment_a: Tensor | None,
                         fragment_b: Tensor | None, protein: Tensor | None,
-                        endpoint: Tensor) -> list[Tensor]:
+                        endpoint: Tensor, parts: dict[str, Tensor] | None = None
+                        ) -> list[Tensor]:
         """The vectors that enter the prediction head: one for a joint head, two (A then B)
         for twin.
 
         These are the "post-encoder features" used for the t-SNE (task 4, 2026-11-02
         meeting): every branch encoded and fused, immediately before the final MLP. The
-        parameters are forward's.
+        other parameters are forward's.
+
+        `parts`, when a dict is passed, is filled with the single-branch tokens as they are
+        AFTER projection - `ligand_a`, `ligand_b`, and `edit_a`/`edit_b` when the
+        architecture has an edit branch. It stays empty for the `antisymmetric` head, which
+        takes its own route through forward. Nothing else about the call changes.
         """
         context = self.context_pieces(protein, endpoint)
         hidden_a = self.project(KIND_LIGAND, self.ligand_encoder(ligand_a))
         hidden_b = self.project(KIND_LIGAND, self.ligand_encoder(ligand_b))
         edit_a, edit_b = self.edit_vectors(fragment_a, fragment_b)
+        if parts is not None:
+            # The PROJECTED tokens, for the alignment term of task 12 (2026-11-09 meeting).
+            # They are handed out from here rather than recomputed by the caller, because a
+            # second pass through the encoders would double the cost of a step and, with
+            # dropout on, would not even be the same vectors the prediction was made from.
+            parts["ligand_a"] = hidden_a
+            parts["ligand_b"] = hidden_b
+            if edit_a is not None and edit_b is not None:
+                parts["edit_a"] = edit_a
+                parts["edit_b"] = edit_b
         if self.head == HEAD_ANTISYMMETRIC:
             odd, gate = self.antisymmetric_parts(hidden_a, hidden_b, edit_a, edit_b, context)
             return [torch.cat([odd, gate], dim=1)]
@@ -716,7 +744,7 @@ class EvaluatorModel(nn.Module):
 
     def forward(self, ligand_a: Tensor, ligand_b: Tensor, fragment_a: Tensor | None,
                 fragment_b: Tensor | None, protein: Tensor | None,
-                endpoint: Tensor) -> Tensor:
+                endpoint: Tensor, parts: dict[str, Tensor] | None = None) -> Tensor:
         """The predicted Δp, shape (batch,).
 
         ligand_a/ligand_b    : the 0/1 float fingerprints of the two molecules
@@ -724,6 +752,8 @@ class EvaluatorModel(nn.Module):
                                direct_no_edit)
         protein              : the protein vector, or None when protein_mode='none'
         endpoint             : the endpoint code, as long
+        parts                : an optional dict, filled with the projected branch tokens
+                               (see representations); the prediction is unchanged
         """
         if self.head == HEAD_ANTISYMMETRIC:
             context = self.context_pieces(protein, endpoint)
@@ -737,7 +767,7 @@ class EvaluatorModel(nn.Module):
             # the difference vector.
             return (odd * gate).sum(dim=1)
         vectors = self.representations(ligand_a, ligand_b, fragment_a, fragment_b, protein,
-                                       endpoint)
+                                       endpoint, parts)
         if self.predictor is None:
             raise ValueError(f"the {self.head!r} head has no prediction head")
         if self.head == HEAD_TWIN:

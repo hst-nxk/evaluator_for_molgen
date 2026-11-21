@@ -1018,6 +1018,151 @@ def loss_function(settings: Mapping[str, Any]):
     raise ValueError(f"loss lạ: {name!r}; chỉ có 'huber' hoặc 'mse'")
 
 
+def alignment_term(parts: Mapping[str, Any], temperature: float,
+                   positives: Mapping[str, Any] | None = None) -> Any:
+    """CLIP-style alignment between a molecule and ITS OWN substituent. Task 12, 09/11.
+
+    WHAT THE MEETING ASKED. Minute 12: "F_A is the part cut out of A so it has to travel
+    WITH A, F_B with B - they should not just be concatenated loosely", and the suggested
+    route was "a representation-space alignment step, CLIP-style, before predicting". This
+    is that step, as a loss rather than as an extra layer: in the shared space the
+    projected ligand token of A is pulled towards the projected edit token of A and pushed
+    away from the edit tokens of every OTHER row in the batch, and the same for B.
+
+    HOW. Radford et al. 2021 (arXiv:2103.00020), section 2.2: both vectors are
+    L2-normalised, the batch's cosine similarities are divided by `temperature`, and the
+    cross entropy is taken in BOTH directions (ligand->edit and edit->ligand), then
+    averaged. The two sides A and B are averaged as well, so the term does not grow with
+    the number of branches.
+
+    WHY NOT CLIP'S DIAGONAL. CLIP can assume one correct partner per row because its
+    batches are distinct image-caption pairs. This data is not like that: on SUB100, with
+    batch 512 and the real batching of `data.iter_batches`, **31.2 % of rows share their
+    `variable_a` with another row of the same batch** (31,219 of 100,000; 31,267 on the B
+    side) - the same substituent appears on many molecules. A diagonal loss would reward
+    matching a molecule with the F of its own row and PUNISH matching it with the same F
+    standing in another row, which contradicts the very hypothesis being tested. So the
+    positives are a MASK, not a diagonal, and several cells per row may be positive
+    (Khosla et al. 2020, arXiv:2004.11362, the supervised-contrastive form):
+
+        loss_i = - (1 / |P_i|) * sum over j in P_i of log softmax_j(similarities_i)
+
+    `positives` says which cells count. A cell (i, j) is positive when row i's molecule
+    and row j's fragment are a pair that WAS observed, which `positive_mask` derives from
+    identity: same fragment as row i, or same molecule as row i. Both are exact - no
+    unobserved pair is ever admitted - and the diagonal is always positive, so |P_i| >= 1.
+
+    WHAT IT CANNOT DO. It aligns a molecule with its own fragment; it says nothing about
+    the protein branch, which has no per-row partner to be paired with. And it is an
+    AUXILIARY term: nothing forces the aligned space to be the one the head wants, which
+    is exactly what the experiment measures. The weight is the knob; at 0 this is never
+    called.
+
+    WHAT THE VALUE IS, AND WHAT IT IS NOT. When every similarity in the batch is equal,
+    the term equals ln(batch) - with one positive per row and with several, since each
+    term is then log(1/batch). That is the only exact reading. It does NOT run backwards:
+    a value near ln(batch) does not prove the representation is flat, and a value above it
+    does not prove the pairs are systematically reversed. Several different similarity
+    structures give the same mean.
+
+    The batch must hold at least two rows, otherwise the softmax has one class and the term
+    is 0 by construction - a quiet no-op, so it is refused.
+    """
+    import torch
+
+    needed = ("ligand_a", "ligand_b", "edit_a", "edit_b")
+    missing = [name for name in needed if parts.get(name) is None]
+    if missing:
+        raise ValueError(f"alignment_weight > 0 cần nhánh edit và không gian chung; "
+                         f"thiếu {missing}")
+    if not (temperature > 0.0) or temperature == float("inf"):
+        raise ValueError(f"alignment_temperature phải là số dương hữu hạn, nhận "
+                         f"{temperature}")
+    sides = (("ligand_a", "edit_a", "a"), ("ligand_b", "edit_b", "b"))
+    terms = []
+    for ligand, edit, side in sides:
+        left = torch.nn.functional.normalize(parts[ligand], dim=1)
+        right = torch.nn.functional.normalize(parts[edit], dim=1)
+        rows = left.shape[0]
+        if rows < 2:
+            raise ValueError("alignment cần batch >= 2 dòng: với một dòng thì softmax chỉ "
+                             "có một lớp và số hạng bằng 0 do cấu tạo")
+        mask = None if positives is None else positives.get(side)
+        if mask is None:
+            # Không có mặt nạ thì mỗi dòng chỉ có đối tác của chính nó — đúng công thức
+            # đường chéo của CLIP, và SAI trên dữ liệu này (31 % dòng trùng mảnh cắt
+            # trong cùng batch). Chỉ dùng cho test và cho dữ liệu đã biết là không trùng.
+            mask = torch.eye(rows, dtype=torch.bool, device=left.device)
+        if mask.shape != (rows, rows):
+            raise ValueError(f"mặt nạ dương của vế {side!r} phải là ({rows}, {rows}), "
+                             f"nhận {tuple(mask.shape)}")
+        logits = left @ right.transpose(0, 1) / temperature
+        both = []
+        for oriented, positive in ((logits, mask), (logits.transpose(0, 1),
+                                                    mask.transpose(0, 1))):
+            # log softmax theo hàng, rồi lấy TRUNG BÌNH trên các ô dương của hàng đó:
+            # chia cho |P_i| để một dòng có nhiều đối tác đúng không nặng hơn dòng chỉ có
+            # một (nếu cộng dồn thì chính 31 % dòng trùng kia sẽ chi phối số hạng).
+            log_probability = torch.log_softmax(oriented, dim=1)
+            count = positive.sum(dim=1).clamp(min=1)
+            both.append(-((log_probability * positive).sum(dim=1) / count).mean())
+        terms.append(0.5 * (both[0] + both[1]))
+    return sum(terms) / len(terms)
+
+
+def positive_mask(molecule: Any, fragment: Any) -> Any:
+    """Which (molecule i, fragment j) cells of one batch are pairs that WERE observed.
+
+    Identity is read off the fingerprint rows themselves, with `torch.unique`: two rows
+    whose fragment fingerprints are identical are the same fragment as far as this model
+    can ever tell, so merging them is not an approximation of the loss - it is the loss the
+    model's own inputs define. (Two different substituents with one Morgan fingerprint
+    would be merged too, and they are indistinguishable to every layer downstream.)
+
+    A cell (i, j) is positive when SOME row of this batch holds the pair (M_i, F_j) - every
+    observed pair, not only those visible from row i or row j. The table `observed` is built
+    once per batch over the batch's distinct molecules and fragments, and then read at
+    (molecule of i, fragment of j), which costs one scatter and one gather.
+
+    WHY NOT THE CHEAPER RULE. An earlier version admitted only "row j has the same fragment
+    as row i" or "row j has the same molecule as row i", which misses a pair seen only
+    through a third row k (M_k = M_i, F_k = F_j, with i and j differing in both). Measured
+    on SUB100 with the model's own fingerprints, batch 512, seed 20261023: 208,960 positive
+    cells against 209,112, i.e. 152 missed (0.073 %) on the A side, and 210,226 against
+    210,482, 256 missed (0.122 %) on the B side. The count is small, but the reason to fix
+    it is not the count: under the cheap rule two cells standing for the SAME fingerprint
+    pair could get different labels, so the loss would push one and pull the other.
+
+    The diagonal is always positive, so every row has at least one.
+    """
+    import torch
+
+    molecule_id = torch.unique(molecule, dim=0, return_inverse=True)[1]
+    fragment_id = torch.unique(fragment, dim=0, return_inverse=True)[1]
+    observed = torch.zeros(int(molecule_id.max()) + 1, int(fragment_id.max()) + 1,
+                           dtype=torch.bool, device=molecule_id.device)
+    observed[molecule_id, fragment_id] = True
+    return observed[molecule_id.unsqueeze(1), fragment_id.unsqueeze(0)]
+
+
+def alignment_settings(settings: Mapping[str, Any]) -> tuple[float, float]:
+    """(weight, temperature) of the alignment term, validated.
+
+    `settings.get(name, default) or default` cannot be used for the temperature: a user who
+    passes 0 would silently get 0.07 back, and the run would report a temperature nobody
+    asked for. The default applies when the KEY IS ABSENT, and nowhere else.
+    """
+    weight = float(settings["alignment_weight"]) if "alignment_weight" in settings else 0.0
+    temperature = (float(settings["alignment_temperature"])
+                   if "alignment_temperature" in settings else 0.07)
+    if weight < 0.0 or weight != weight:
+        raise ValueError(f"alignment_weight phải >= 0, nhận {weight}")
+    if weight > 0.0 and (not (temperature > 0.0) or temperature == float("inf")):
+        raise ValueError(f"alignment_temperature phải là số dương hữu hạn khi bật "
+                         f"alignment, nhận {temperature}")
+    return weight, temperature
+
+
 def forward_mean(model: Any, arrays: data.PairArrays, rows: np.ndarray, caches: Caches,
                  protein_source: Any, device: str) -> Any:
     """Đầu ra trung bình của một batch, dựng lại batch từ đầu.
@@ -1041,7 +1186,9 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
                     group_by_protein: bool = False,
                     accumulate_steps: int = 1,
                     antisymmetry_weight: float = 0.0,
-                    stats: dict[str, float] | None = None) -> tuple[float, bool, int]:
+                    stats: dict[str, float] | None = None,
+                    alignment_weight: float = 0.0,
+                    alignment_temperature: float = 0.07) -> tuple[float, bool, int]:
     """Một epoch; trả về (mất mát trung bình theo dòng, có dừng sớm không, số bước).
 
     ``antisymmetry_weight`` > 0 thì mỗi batch chạy THÊM một lượt forward trên đầu vào đã
@@ -1097,6 +1244,7 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
         trainable += list(protein_source.parameters())
     total = 0.0
     violation_total = 0.0
+    alignment_total = 0.0
     seen = 0
     step = 0
     stopped = False
@@ -1107,8 +1255,15 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
     for rows in batches:
         batch = batch_tensors(arrays, rows, caches, protein_source, device,
                               model.uses_edit_branch)
-        prediction = model(batch["ligand_a"], batch["ligand_b"], batch["fragment_a"],
-                           batch["fragment_b"], batch["protein"], batch["endpoint"])
+        # `parts` chỉ được yêu cầu khi có số hạng alignment: không bật thì không giữ thêm
+        # tensor nào, nên lượt chạy cũ không đổi một chút nào về bộ nhớ lẫn thời gian.
+        # `parts` chỉ được truyền khi có số hạng alignment: lượt chạy không bật nó gọi
+        # model ĐÚNG NHƯ TRƯỚC, không thêm một đối số nào.
+        parts: dict[str, Any] | None = {} if alignment_weight > 0.0 else None
+        arguments = (batch["ligand_a"], batch["ligand_b"], batch["fragment_a"],
+                     batch["fragment_b"], batch["protein"], batch["endpoint"])
+        prediction = (model(*arguments) if parts is None
+                      else model(*arguments, parts=parts))
         loss = criterion(prediction, batch["target"])
         # Ghi lại mất mát DỮ LIỆU trước khi cộng số hạng phạt: cột "train loss" của log và
         # của manifest phải so được với các lần chạy không bật phạt.
@@ -1122,6 +1277,20 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
             violation = ((prediction + reverse) ** 2).mean()
             violation_total += float(violation.detach().to("cpu")) * rows.size
             loss = loss + antisymmetry_weight * violation
+        if parts is not None:
+            # Việc 12: căn chỉnh phân tử với MẢNH CẮT CỦA CHÍNH NÓ trong không gian chung.
+            # Không có lượt forward thêm — dùng đúng các token của lượt vừa rồi.
+            #
+            # MẶT NẠ DƯƠNG, không phải đường chéo: 31,2 % dòng SUB100 trùng mảnh cắt với
+            # một dòng khác trong cùng batch (31.219/100.000 ở vế A, 31.267 ở vế B, với
+            # batch 512 và seed 20261023, đo trên chính split đó). Đường chéo sẽ phạt
+            # đúng những ô đáng thưởng.
+            positives = {
+                "a": positive_mask(batch["ligand_a"], batch["fragment_a"]),
+                "b": positive_mask(batch["ligand_b"], batch["fragment_b"])}
+            alignment = alignment_term(parts, alignment_temperature, positives)
+            alignment_total += float(alignment.detach().to("cpu")) * rows.size
+            loss = loss + alignment_weight * alignment
         share = 1.0 / accumulate_steps
         if penalty is None:
             # PyTorch vốn CỘNG vào .grad, nên chia mất mát là đủ để lấy trung bình.
@@ -1158,6 +1327,12 @@ def train_one_epoch(model: Any, arrays: data.PairArrays, caches: Caches, protein
         step += 1
     if stats is not None and antisymmetry_weight > 0.0:
         stats["antisymmetry_violation"] = violation_total / max(seen, 1)
+    if stats is not None and alignment_weight > 0.0:
+        stats["alignment_loss"] = alignment_total / max(seen, 1)
+        # Phần THẬT SỰ cộng vào mất mát, để đặt cạnh mất mát dữ liệu: "w = 0,1" một mình
+        # không nói được nó nặng bao nhiêu so với Huber.
+        stats["alignment_contribution"] = alignment_weight * alignment_total / max(seen, 1)
+        stats["data_loss"] = total / max(seen, 1)
     return total / max(seen, 1), stopped, step
 
 
@@ -1469,6 +1644,25 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
                         "được lúc train (hai lượt forward lấy hai mặt nạ khác nhau); số "
                         "phản đối xứng để báo cáo là số trong asymmetry_report ở chế độ "
                         "eval.", float(config["stage3"]["model"]["dropout"]))
+
+    # Việc 12 họp 09/11/2026: căn chỉnh không gian biểu diễn kiểu CLIP. Xem alignment_term.
+    alignment_weight, alignment_temperature = alignment_settings(settings)
+    if alignment_weight > 0.0:
+        # Hai điều kiện CỨNG: từ chối ngay, thay vì chạy rồi ra một con số vô nghĩa.
+        if not model.shares_one_space:
+            raise ValueError(
+                "alignment_weight > 0 đòi fusion='projector' hoặc 'attention': với "
+                f"fusion={model.fusion!r} mỗi nhánh giữ chiều riêng, không có không gian "
+                "chung nào để căn chỉnh, nên số hạng này sẽ ép hai vector ở hai không "
+                "gian không liên quan")
+        if not model.uses_edit_branch:
+            raise ValueError(
+                f"alignment_weight > 0 đòi nhánh edit: kiến trúc {head!r} không có "
+                "F_A/F_B nên không có cặp (phân tử, mảnh cắt của chính nó) để căn chỉnh")
+        LOGGER.info("số hạng alignment kiểu CLIP: BẬT (w = %.4g, temperature = %.4g) — "
+                    "KHÔNG thêm lượt forward nào, dùng đúng token của lượt đang chạy",
+                    alignment_weight, alignment_temperature)
+
     eval_every = int(settings.get("eval_every_steps", 0) or 0)
     if smoke:
         # Smoke chỉ chạy vài nghìn dòng nên một epoch ngắn hơn eval_every rất nhiều;
@@ -1655,8 +1849,22 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
             model, train_arrays_fit, caches, protein_source, device, optimizer, criterion,
             batch_size, float(settings["grad_clip"]), rng, penalty, eval_every,
             lambda step, current=epoch: consider(current, step, None),
-            group_by_protein, accumulate_steps, antisymmetry_weight, epoch_stats)
+            group_by_protein, accumulate_steps, antisymmetry_weight, epoch_stats,
+            alignment_weight, alignment_temperature)
         LOGGER.info("epoch %s: %s bước", epoch, f"{steps:,}")
+        if "alignment_loss" in epoch_stats:
+            # Ba số cạnh nhau: mất mát DỮ LIỆU, phần alignment THẬT SỰ cộng vào, và mốc
+            # duy nhất đọc được chính xác — ln(batch) là giá trị khi mọi độ tương đồng
+            # bằng nhau. KHÔNG suy ngược từ con số này ra hình dạng của biểu diễn: nhiều
+            # cấu trúc tương đồng khác nhau cho cùng một trung bình.
+            LOGGER.info("epoch %s: data loss %.6g | alignment %.6g, góp w*align = %.6g "
+                        "(%.1f %% của data loss) | ln(batch) = %.4g", epoch,
+                        epoch_stats.get("data_loss", float("nan")),
+                        epoch_stats["alignment_loss"],
+                        epoch_stats["alignment_contribution"],
+                        100.0 * epoch_stats["alignment_contribution"]
+                        / max(epoch_stats.get("data_loss") or 1e-12, 1e-12),
+                        math.log(batch_size))
         if "antisymmetry_violation" in epoch_stats:
             # Trung bình (f(A,B) + f(B,A))^2 trên train, ở chế độ TRAIN (còn dropout).
             LOGGER.info("epoch %s: phạt phản đối xứng trung bình %.6g", epoch,
@@ -1712,6 +1920,11 @@ def run_train(config: Mapping[str, Any], root: Path, configuration: str, head: s
         # asymmetry (đo ở chế độ eval).
         "antisymmetry_penalty": antisymmetry_weight,
         "antisymmetry_violation_last_epoch": epoch_stats.get("antisymmetry_violation"),
+        # Viec 12 hop 09/11/2026: can chinh kieu CLIP (0 la tat).
+        "alignment_weight": alignment_weight,
+        "alignment_temperature": alignment_temperature if alignment_weight > 0.0 else None,
+        "alignment_loss_last_epoch": epoch_stats.get("alignment_loss"),
+        "alignment_contribution_last_epoch": epoch_stats.get("alignment_contribution"),
         "edit_filter": edit_filter,
         # Đối chứng protein (họp 18/11/2026): -1 là lần chạy bình thường, >= 0 là lần
         # chạy đã XÁO cột protein. PHẢI có trong manifest, nếu không một lần chạy đối
